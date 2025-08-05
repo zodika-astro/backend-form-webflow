@@ -60,8 +60,8 @@ app.post('/create-preference', async (req, res) => {
         email: formData.email,
       },
       back_urls: {
-      success: 'https://www.zodika.com/payment-success?redirect=true',
-      failure: 'https://www.zodika.com/payment-fail?redirect=true',
+      success: 'https://www.zodika.com.br/payment-success',
+      failure: 'https://www.zodika.com.br/payment-fail',
       },
       auto_return: 'approved',
       notification_url: 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o',
