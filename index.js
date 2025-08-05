@@ -47,6 +47,9 @@ app.post('/create-preference', async (req, res) => {
 
     console.log('Dados recebidos:', formData);
 
+    // Converte o objeto formData para uma string JSON segura
+    const encodedFormData = encodeURIComponent(JSON.stringify(formData));
+
     // Configuração da preferência de pagamento
     const paymentPreference = {
       items: [{
@@ -60,10 +63,19 @@ app.post('/create-preference', async (req, res) => {
         email: formData.email,
       },
       back_urls: {
-      success: 'https://www.zodika.com.br/payment-success',
-      failure: 'https://www.zodika.com.br/payment-fail',
+        success: 'https://www.zodika.com.br/payment-success',
+        failure: 'https://www.zodika.com.br/payment-fail',
       },
       auto_return: 'approved',
+      
+      // *** MUDANÇA PRINCIPAL ***
+      // Incluímos todos os dados do formulário como uma string JSON no campo external_reference.
+      // O Mercado Pago tem um limite de caracteres para este campo, então é bom não ter dados excessivamente longos.
+      external_reference: encodedFormData,
+      
+      // *** MUDANÇA NO WEBHHOOK ***
+      // Agora, o webhook do make.com precisa ser capaz de receber os dados do external_reference.
+      // Você precisará configurar o Make.com para extrair esses dados da notificação.
       notification_url: 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o',
     };
 
@@ -99,7 +111,7 @@ app.post('/create-preference', async (req, res) => {
   } catch (error) {
     clearTimeout(timeout);
     console.error('Erro completo:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Erro ao criar pagamento',
       details: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
