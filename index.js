@@ -5,16 +5,14 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Use CORS to allow Webflow requisitions 
+// Configuração de CORS para origens permitidas
 const allowedOrigins = ['https://zodika.com.br', 'https://www.zodika.com.br'];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Permite requisições sem origem (como de clientes REST)
     if (!origin) return callback(null, true);
-    // Verifica se a origem está na lista de origens permitidas
     if (allowedOrigins.indexOf(origin) === -1) {
-      const msg = 'A política de CORS para este site não permite acesso da origem ' + origin;
+      const msg = 'A política de CORS não permite acesso da origem ' + origin;
       return callback(new Error(msg), false);
     }
     return callback(null, true);
@@ -23,63 +21,93 @@ app.use(cors({
 
 app.use(express.json());
 
-// API to Create acess
-app.post('/create-preference', async (req, res) => {
-    try {
-        const accessToken = process.env.MERCADO_PAGO_ACCESS_TOKEN;
-        if (!accessToken) {
-            return res.status(500).send('Mercado Pago Access Token not configured.');
-        }
-
-        // form data
-        const formData = req.body;
-
-        // URL make.com webhook
-        const makeWebhookUrl = 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o';
-
-        const paymentPreference = {
-            items: [{
-                title: 'mapa natal zodika',
-                quantity: 1,
-                unit_price: 35.00,
-                currency_id: 'BRL',
-            }],
-            payer: {
-                name: formData.nome_completo,
-                email: formData.email,
-            },
-            back_urls: {
-                success: 'https://www.zodika.com/payment-success', 
-                failure: 'https://www.zodika.com/payment-fail', 
-            },
-            notification_url: `${makeWebhookUrl}?form_data=${encodeURIComponent(JSON.stringify(formData))}`,
-            auto_return: 'approved',
-        };
-
-        const mpResponse = await fetch('https://api.mercadopago.com/checkout/preferences', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${accessToken}`
-            },
-            body: JSON.stringify(paymentPreference)
-        });
-
-        const mpData = await mpResponse.json();
-
-        // Retorna a URL de checkout para o frontend
-        if (mpData.init_point) {
-            res.json({ url: mpData.init_point });
-        } else {
-            throw new Error('URL de checkout não encontrada na resposta do Mercado Pago.');
-        }
-
-    } catch (error) {
-        console.error('Erro na criação da preferência de pagamento:', error);
-        res.status(500).send('Erro ao criar preferência de pagamento.');
-    }
+// Rota de health check
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
+// Rota para criar preferência de pagamento
+app.post('/create-preference', async (req, res) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000); // Timeout de 10 segundos
+
+  try {
+    // Validação do token
+    const accessToken = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+    if (!accessToken) {
+      console.error('Access Token do Mercado Pago não configurado');
+      return res.status(500).json({ error: 'Token do Mercado Pago não configurado' });
+    }
+
+    // Validação dos dados do formulário
+    const formData = req.body;
+    if (!formData.nome_completo || !formData.email) {
+      return res.status(400).json({ error: 'Nome completo e email são obrigatórios' });
+    }
+
+    console.log('Dados recebidos:', formData);
+
+    // Configuração da preferência de pagamento
+    const paymentPreference = {
+      items: [{
+        title: 'mapa natal zodika',
+        quantity: 1,
+        unit_price: parseFloat(35.00).toFixed(2),
+        currency_id: 'BRL',
+      }],
+      payer: {
+        name: formData.nome_completo,
+        email: formData.email,
+      },
+      back_urls: {
+        success: 'https://www.zodika.com/payment-success',
+        failure: 'https://www.zodika.com/payment-fail',
+      },
+      auto_return: 'approved',
+      notification_url: 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o',
+    };
+
+    console.log('Enviando para Mercado Pago:', paymentPreference);
+
+    // Requisição para a API do Mercado Pago
+    const mpResponse = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken}`
+      },
+      body: JSON.stringify(paymentPreference),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeout);
+    const mpData = await mpResponse.json();
+    console.log('Resposta do Mercado Pago:', mpData);
+
+    // Tratamento da resposta
+    if (!mpResponse.ok) {
+      throw new Error(`Erro no Mercado Pago: ${mpData.message || JSON.stringify(mpData)}`);
+    }
+
+    const checkoutUrl = mpData.init_point || mpData.sandbox_init_point;
+    if (!checkoutUrl) {
+      throw new Error('URL de pagamento não encontrada na resposta');
+    }
+
+    res.json({ url: checkoutUrl });
+
+  } catch (error) {
+    clearTimeout(timeout);
+    console.error('Erro completo:', error);
+    res.status(500).json({ 
+      error: 'Erro ao criar pagamento',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Inicialização do servidor
 app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
