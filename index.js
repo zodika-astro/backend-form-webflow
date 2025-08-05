@@ -6,8 +6,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Use CORS to allow Webflow requisitions 
+const allowedOrigins = ['https://zodika.com.br', 'https://www.zodika.com.br'];
+
 app.use(cors({
-    origin: 'https://zodika.com.br'
+  origin: function (origin, callback) {
+    // Permite requisições sem origem (como de clientes REST)
+    if (!origin) return callback(null, true);
+    // Verifica se a origem está na lista de origens permitidas
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'A política de CORS para este site não permite acesso da origem ' + origin;
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  }
 }));
 
 app.use(express.json());
