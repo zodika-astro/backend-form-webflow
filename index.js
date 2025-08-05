@@ -47,19 +47,6 @@ app.post('/create-preference', async (req, res) => {
 
     console.log('Dados recebidos:', formData);
 
-    // Preparar metadata com todos os dados do formulário
-    const metadata = {
-      customer_data: {
-        name: formData.nome_completo,
-        "social-name": formData.nome_social,
-        email: formData.email,
-        "birth-date": formData.data_nascimento,
-        "birth-time": formData.hora_nascimento,
-        "birth-place": formData.cidade_nascimento,
-        // Adicione outros campos conforme necessário
-      }
-    };
-
     // Configuração da preferência de pagamento
     const paymentPreference = {
       items: [{
@@ -73,12 +60,11 @@ app.post('/create-preference', async (req, res) => {
         email: formData.email,
       },
       back_urls: {
-        success: 'https://www.zodika.com.br/payment-success',
-        failure: 'https://www.zodika.com.br/payment-fail',
+      success: 'https://www.zodika.com.br/payment-success',
+      failure: 'https://www.zodika.com.br/payment-fail',
       },
       auto_return: 'approved',
       notification_url: 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o',
-      metadata: metadata // Adiciona os metadados aqui
     };
 
     console.log('Enviando para Mercado Pago:', paymentPreference);
@@ -88,7 +74,7 @@ app.post('/create-preference', async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${accessToken}`
+        'Authorization': Bearer ${accessToken}
       },
       body: JSON.stringify(paymentPreference),
       signal: controller.signal
@@ -100,13 +86,25 @@ app.post('/create-preference', async (req, res) => {
 
     // Tratamento da resposta
     if (!mpResponse.ok) {
-      throw new Error(`Erro no Mercado Pago: ${mpData.message || JSON.stringify(mpData)}`);
+      throw new Error(Erro no Mercado Pago: ${mpData.message || JSON.stringify(mpData)});
     }
 
     const checkoutUrl = mpData.init_point || mpData.sandbox_init_point;
     if (!checkoutUrl) {
       throw new Error('URL de pagamento não encontrada na resposta');
     }
+
+    await fetch('https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+        },
+      body: JSON.stringify({
+      ...formData, // Dados do formulário
+      preference_id: mpData.id, // ID da preferência criada no Mercado Pago
+      payment_link: checkoutUrl  // URL do checkout
+  })
+});
 
     res.json({ url: checkoutUrl });
 
@@ -123,5 +121,5 @@ app.post('/create-preference', async (req, res) => {
 
 // Inicialização do servidor
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log(Servidor rodando na porta ${PORT});
 });
