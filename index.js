@@ -52,7 +52,7 @@ app.post('/create-preference', async (req, res) => {
       items: [{
         title: 'mapa natal zodika',
         quantity: 1,
-        unit_price: parseFloat(35.00).toFixed(2),
+        unit_price: 35.00,
         currency_id: 'BRL',
       }],
       payer: {
