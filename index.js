@@ -119,7 +119,7 @@ app.post('/create-preference', async (req, res) => {
       details: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
       });
-
+    });
 });
 
 // start server
