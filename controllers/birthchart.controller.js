@@ -1,7 +1,7 @@
 // controllers/birthchart.controller.js
 const { birthchartSchema } = require('../schemas/birthchartSchema');
 const db = require('../db/db');
-const { birthchartcreatePreference } = require('../services/mercadopago.service');
+const { birthchartcreatePreference } = require('../services/birthchartmercadopago');
 
 const BirthChartRequest = async (req, res) => {
   try {
@@ -27,7 +27,7 @@ const BirthChartRequest = async (req, res) => {
     const pedidoId = formInsert.rows[0].id;
 
     // preferense payments
-    const mpData = await createPreference(dataValidated);
+    const mpData = await birthchartcreatePreference(dataValidated);
 
     // save answer mercado pago
     await db.query(
