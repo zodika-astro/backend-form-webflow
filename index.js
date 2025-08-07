@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('./middlewares/cors');
-const birthchartlRouter = require('./routes/birthchart.route');
+const birthchartRouter = require('./routes/birthchart.route');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
