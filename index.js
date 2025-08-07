@@ -3,6 +3,7 @@
 const express = require('express');
 const cors = require('./middlewares/cors');
 const birthchartRouter = require('./routes/birthchart.route');
+const mpWebhookRouter = require('./routes/webhook/mercadopago');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
