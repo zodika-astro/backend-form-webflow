@@ -10,7 +10,7 @@ const BirthChartRequest = async (req, res) => {
 
     // create form
     const formInsert = await db.query(
-      `INSERT INTO pedidos (type, name, social_name, email, birth_date, birth_time, birth_place)
+      `INSERT INTO birthchart_request (type, name, social_name, email, birth_date, birth_time, birth_place)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id`,
       [
@@ -31,7 +31,7 @@ const BirthChartRequest = async (req, res) => {
 
     // save answer mercado pago
     await db.query(
-      `UPDATE pedidos
+      `UPDATE birthchart_request
        SET mp_preference_id = $1,
            mp_init_point = $2,
            mp_full_response = $3
