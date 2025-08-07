@@ -32,9 +32,8 @@ const birthchartcreatePreference = async (data, { requestId } = {}) => {
         failure: 'https://www.zodika.com.br/payment-fail',
       },
       auto_return: 'approved',
-
-      // você disse que vai orquestrar no Make por enquanto — mantido
-     notification_url: 'https://backend-form-webflow-production.up.railway.app/webhook/mercadopago',
+      
+      notification_url: 'https://backend-form-webflow-production.up.railway.app/webhook/mercadopago',
 
       // 🔗 vínculo forte com o seu pedido no banco
       external_reference: requestId ? String(requestId) : undefined,
