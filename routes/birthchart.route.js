@@ -4,6 +4,6 @@ const router = express.Router();
 const birthchartController = require('../controllers/birthchart.controller');
 
 // POST /birth-chartendpoint
-router.post('/', birthchartController.handleBirthChartRequest);
+router.post('/', birthchartController.BirthChartRequest);
 
 module.exports = router;
