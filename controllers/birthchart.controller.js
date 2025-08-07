@@ -1,14 +1,15 @@
 // controllers/birthchart.controller.js
+const fetch = require('node-fetch');
 const { birthchartSchema } = require('../schemas/birthchartSchema');
 const db = require('../db/db');
 const { birthchartcreatePreference } = require('../services/birthchartmercadopago');
 
 const BirthChartRequest = async (req, res) => {
   try {
-    // data validation
+    // 1) Validação
     const dataValidated = birthchartSchema.parse(req.body);
 
-    // create form
+    // 2) Salva dados do formulário
     const formInsert = await db.query(
       `INSERT INTO birthchart_request (type, name, social_name, email, birth_date, birth_time, birth_place)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -24,22 +25,56 @@ const BirthChartRequest = async (req, res) => {
       ]
     );
 
-    const pedidoId = formInsert.rows[0].id;
+    const requestId = formInsert.rows[0].id;
 
-    // preferense payments
-    const mpData = await birthchartcreatePreference(dataValidated);
+    // 3) Cria preferência no Mercado Pago (passando requestId)
+    const mpData = await birthchartcreatePreference(dataValidated, { requestId });
+    const initPoint = mpData.init_point || mpData.sandbox_init_point;
 
-    // save answer mercado pago
+    if (!mpData?.id || !initPoint) {
+      throw new Error('Mercado Pago não retornou preference_id ou init_point.');
+    }
+
+    // 4) (Opcional) GET da preferência p/ enriquecer dados
+    let fullPreferenceData = mpData;
+    try {
+      const accessToken = process.env.BIRTHMAP_ACCESS_TOKEN;
+      if (!accessToken) {
+        console.warn('BIRTHMAP_ACCESS_TOKEN ausente — usando mpData sem GET de preferência.');
+      } else {
+        const prefResp = await fetch(
+          `https://api.mercadopago.com/checkout/preferences/${mpData.id}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        // Se o GET falhar, seguimos com mpData mesmo
+        if (prefResp.ok) {
+          fullPreferenceData = await prefResp.json();
+        } else {
+          console.warn('GET /checkout/preferences falhou; usando mpData original.');
+        }
+      }
+    } catch (e) {
+      console.warn('Falha ao enriquecer preferência (GET):', e.message);
+    }
+
+    // 5) Salva a preferência (AGORA em mp_preferences, não mais em birthchart_request)
     await db.query(
-      `UPDATE birthchart_request
-       SET mp_preference_id = $1,
-           mp_init_point = $2,
-           mp_full_response = $3
-       WHERE id = $4`,
-      [mpData.id, mpData.init_point || mpData.sandbox_init_point, mpData, pedidoId]
+      `INSERT INTO mp_preferences (
+         birthchart_request_id,
+         mp_preference_id,
+         mp_init_point,
+         mp_full_response
+       ) VALUES ($1, $2, $3, $4)`,
+      [
+        requestId,
+        mpData.id,
+        initPoint,
+        fullPreferenceData
+      ]
     );
 
-    res.json({ url: mpData.init_point || mpData.sandbox_init_point });
+    // 6) Responde com a URL de checkout
+    res.json({ url: initPoint });
 
   } catch (error) {
     if (error.name === 'ZodError') {
