@@ -34,7 +34,7 @@ const birthchartcreatePreference = async (data, { requestId } = {}) => {
       auto_return: 'approved',
 
       // você disse que vai orquestrar no Make por enquanto — mantido
-      notification_url: 'https://hook.eu2.make.com/msvmg0kmbwrtqopcgm9k5utu6xdqqg2o',
+     notification_url: 'https://backend-form-webflow-production.up.railway.app/webhook/mercadopago',
 
       // 🔗 vínculo forte com o seu pedido no banco
       external_reference: requestId ? String(requestId) : undefined,
