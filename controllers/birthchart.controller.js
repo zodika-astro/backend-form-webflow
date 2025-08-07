@@ -1,12 +1,12 @@
 // controllers/birthchart.controller.js
-const { natalSchema } = require('../schemas/natalSchema');
+const { birthchartSchema } = require('../schemas/birthchartSchema');
 const db = require('../db/db');
 const { birthchartcreatePreference } = require('../services/mercadopago.service');
 
 const BirthChartRequest = async (req, res) => {
   try {
     // data validation
-    const dataValidated = natalSchema.parse(req.body);
+    const dataValidated = birthchartSchema.parse(req.body);
 
     // create form
     const formInsert = await db.query(
@@ -14,7 +14,7 @@ const BirthChartRequest = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id`,
       [
-        'mapa_natal',
+        'birth_chart',
         dataValidated.name,
         dataValidated.social_name || null,
         dataValidated.email,
