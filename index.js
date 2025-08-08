@@ -4,7 +4,6 @@ const express = require('express');
 const cors = require('./middlewares/cors');
 const birthchartRouter = require('./routes/birthchart.route');
 const mpWebhookRouter = require('./routes/webhook/mercadopago');
-const postgresEditRouter = require('./routes/postgresedit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,8 +19,6 @@ app.use('/birth-chartendpoint', birthchartRouter);
 
 // Webhook Mercado Pago
 app.use('/webhook', mpWebhookRouter);
-
-app.use('/', postgresEditRouter);
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
