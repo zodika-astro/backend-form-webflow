@@ -5,7 +5,7 @@ const cors = require('./middlewares/cors');
 const birthchartRouter = require('./routes/birthchart.route');
 const mpWebhookRouter = require('./routes/webhook/mercadopago');
 
-const db = require('../db'); // seu arquivo de conexão com o Postgres
+const db = require('./db/db'); // seu arquivo de conexão com o Postgres
 
 const app = express();
 const PORT = process.env.PORT || 3000;
