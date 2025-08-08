@@ -1,5 +1,5 @@
 // routes/postgresedit.js
-const db = require('./db/db'); // conexão com Postgres
+const db = require('../db/db');
 const express = require('express');
 const router = express.Router();
 
