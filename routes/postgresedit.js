@@ -1,9 +1,10 @@
 // routes/postgresedit.js
-const db = require('../db/db');
+const db = require('../db/db'); // caminho ajustado
 const express = require('express');
 const router = express.Router();
 
-router.post('/postgresedit', async (req, res) => {
+// provisório: GET para rodar pelo navegador
+router.get('/postgresedit', async (req, res) => {
   try {
     /** =======================
      * birthchart_requests
