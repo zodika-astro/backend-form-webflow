@@ -9,15 +9,16 @@ async function createBirthchartRequest(requestData) {
     email,
     birth_date,
     birth_time,
-    birth_place
+    birth_place,
+    product_type
   } = requestData;
 
   const query = `
-    INSERT INTO zodika_requests (name, social_name, email, birth_date, birth_time, birth_place)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO zodika_requests (name, social_name, email, birth_date, birth_time, birth_place, product_type)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING *;
   `;
-  const values = [name, social_name, email, birth_date, birth_time, birth_place];
+  const values = [name, social_name, email, birth_date, birth_time, birth_place, product_type];
 
   try {
     const { rows } = await db.query(query, values);
