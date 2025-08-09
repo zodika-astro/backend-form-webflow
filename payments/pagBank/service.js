@@ -1,4 +1,4 @@
-// modules/pagbank/service.js
+// payments/pagbank/service.js
 
 const crypto = require('crypto');
 const httpClient = require('../../utils/httpClient');
