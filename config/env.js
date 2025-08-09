@@ -1,7 +1,8 @@
 // config/env.js
 
-import dotenv from 'dotenv';
-import { cleanEnv, url, str } from 'envalid';
+const dotenv = require('dotenv');
+const envalid = require('envalid');
+const { cleanEnv, url, str, num } = envalid;
 
 dotenv.config();
 
