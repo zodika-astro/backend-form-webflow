@@ -1,31 +1,41 @@
-//index.js
+// Carrega variáveis de ambiente e configura o pool do banco de dados antes de tudo.
+require('./config/env');
+const db = require('./db/db');
 
 const express = require('express');
-const cors = require('./middlewares/cors');
-const birthchartRouter = require('./routes/birthchart.route');
-const mpWebhookRouter = require('./routes/webhook/mercadopago');
-
-// importa a rota postgresedit
-const postgresEditRoute = require('./postgresedit');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors);
+// Importa os middlewares centrais
+const corsMiddleware = require('./middlewares/cors');
+const errorHandlerMiddleware = require('./middlewares/errorHandler');
+
+// Importa os roteadores de cada módulo
+const birthchartRouter = require('./modules/birthchart/router');
+const pagbankWebhookRouter = require('./modules/pagbank/router.webhook');
+const pagbankReturnRouter = require('./modules/pagbank/router.return');
+
+// Middleware para habilitar CORS e processar JSON
+app.use(corsMiddleware);
 app.use(express.json());
 
-// Health check
+// Health check da API
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Rote birth-chart
-app.use('/birth-chartendpoint', birthchartRouter);
+// Rotas do Módulo Birthchart
+// A rota principal para o seu produto de mapa astral.
+app.use('/birthchart', birthchartRouter);
 
-// Webhook Mercado Pago
-app.use('/webhook', mpWebhookRouter);
+// Rotas do Módulo PagBank
+// Rota para o webhook do PagBank
+app.use('/pagbank', pagbankWebhookRouter);
 
-// importa a rota postgresedit
-app.use('/', postgresEditRoute);
+// Rota de retorno para o cliente após o checkout do PagBank
+app.use('/pagbank', pagbankReturnRouter);
+
+// Handler de erros centralizado (deve ser o último middleware)
+app.use(errorHandlerMiddleware);
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
