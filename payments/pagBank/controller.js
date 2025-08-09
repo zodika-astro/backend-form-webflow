@@ -1,6 +1,7 @@
 // payments/pagBank/controller.js
 const pagbankService = require('./service');
 const logger = require('../../utils/logger');
+const { validateWebhookPayload } = require('./validators');
 
 /**
  * Controller responsável por iniciar um checkout.
