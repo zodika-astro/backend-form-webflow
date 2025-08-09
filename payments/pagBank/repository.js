@@ -1,4 +1,4 @@
-// src/modules/pagbank/repository.js
+// payments/pagbank/repository.js
 const db = require('../../../db/db');
 
 /**
