@@ -1,31 +1,12 @@
 // payments/pagbank/service.js
 
-const crypto = require('crypto');
 const httpClient = require('../../utils/httpClient');
 const pagbankRepository = require('./repository');
 const logger = require('../../utils/logger');
+const { mapWebhookPayload, normalizeCustomer } = require('./mapPayload'); // Importa o novo módulo
 const { env } = require('../../../config/env');
 
 const PAGBANK_BASE = env.PAGBANK_BASE_URL || 'https://sandbox.api.pagseguro.com';
-
-function hashPayload(obj) {
-  const str = JSON.stringify(obj || {});
-  return crypto.createHash('sha256').update(str).digest('hex');
-}
-
-function normalizeCustomer(c = {}) {
-  const phone = Array.isArray(c.phones) ? c.phones[0] : undefined;
-  const address = c.address ? c.address : undefined;
-  return {
-    name: c.name || null,
-    email: c.email || null,
-    tax_id: c.tax_id || null,
-    phone_country: phone?.country || null,
-    phone_area: phone?.area || null,
-    phone_number: phone?.number || null,
-    address_json: address ? JSON.stringify(address) : null,
-  };
-}
 
 /**
  * Cria um checkout hospedado e retorna o link PAY.
@@ -38,7 +19,7 @@ async function createCheckout({
   productType,
   productValue,
   redirectUrl,
-  paymentOptions
+  paymentOptions,
 }) {
   // Validações mínimas
   if (!requestId) throw new Error('requestId é obrigatório');
@@ -67,30 +48,27 @@ async function createCheckout({
       boleto: { enabled: false }, // desativado globalmente
       credit_card: {
         enabled: paymentOptions?.allow_card !== false,
-        installments: (paymentOptions?.allow_card === false)
-          ? { enabled: false }
-          : {
-              enabled: true,
-              max: paymentOptions?.max_installments ?? 1,
-              min_installment_amount: paymentOptions?.min_installment_amount ?? 0
-            }
-      }
-    }
+        installments:
+          paymentOptions?.allow_card === false
+            ? { enabled: false }
+            : {
+                enabled: true,
+                max: paymentOptions?.max_installments ?? 1,
+                min_installment_amount: paymentOptions?.min_installment_amount ?? 0,
+              },
+      },
+    },
   };
 
-  const { data } = await httpClient.post(
-    `${PAGBANK_BASE}/checkouts`,
-    payload,
-    {
-      headers: {
-        Authorization: `Bearer ${env.PAGBANK_API_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    }
-  );
+  const { data } = await httpClient.post(`${PAGBANK_BASE}/checkouts`, payload, {
+    headers: {
+      Authorization: `Bearer ${env.PAGBANK_API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 15000,
+  });
 
-  const payLink = Array.isArray(data?.links) ? data.links.find(l => l.rel === 'PAY')?.href : null;
+  const payLink = Array.isArray(data?.links) ? data.links.find((l) => l.rel === 'PAY')?.href : null;
   if (!payLink) throw new Error('PAY link não encontrado no retorno do PagBank');
 
   await pagbankRepository.createCheckout({
@@ -101,7 +79,7 @@ async function createCheckout({
     value: valueNum,
     link: payLink || null,
     customer: { name, email }, // guarda o que você enviou (para comparar depois)
-    raw: data
+    raw: data,
   });
 
   return { url: payLink, checkoutId: data?.id || null };
@@ -120,17 +98,20 @@ async function createCheckout({
  */
 async function processWebhook(p, meta = {}) {
   try {
-    // 1) Log imutável com idempotência
-    const event_uid = p?.id ? `pg_${p.id}` : hashPayload(p);
+    // 1) Mapeia o payload para um objeto interno padrão usando o novo módulo
+    const mappedPayload = mapWebhookPayload(p);
+    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mappedPayload;
+
+    // 2) Log imutável com idempotência
     const logged = await pagbankRepository.logEvent({
-      event_uid,
+      event_uid: eventId,
       payload: p,
       headers: meta.headers || null,
       query: meta.query || null,
       topic: meta.topic || null,
       action: meta.action || null,
-      checkout_id: p?.checkout?.id || p?.id || null,
-      charge_id: p?.charges?.[0]?.id || null
+      checkout_id: checkoutId,
+      charge_id: chargeId,
     });
 
     // Se já havia um evento com esse UID, não prossiga (idempotência total)
@@ -139,16 +120,6 @@ async function processWebhook(p, meta = {}) {
       return { ok: true, duplicate: true };
     }
 
-    // 2) Identificação
-    const isCheckoutObject = p?.object === 'checkout' || (!!p?.id && !!p?.status && p?.items);
-    const checkoutId = isCheckoutObject ? p.id : p?.checkout?.id || null;
-    const firstCharge = Array.isArray(p?.charges) ? p.charges[0] : undefined;
-    const chargeId = firstCharge?.id || null;
-    const status = firstCharge?.status || p?.status || 'UPDATED';
-
-    // Consolidar reference_id com fallback
-    const referenceId = p?.reference_id || p?.checkout?.reference_id || null;
-
     // 3) Atualizações de status (checkout)
     if (checkoutId) {
       await pagbankRepository.updateCheckoutStatusById(checkoutId, status, p);
@@ -156,14 +127,13 @@ async function processWebhook(p, meta = {}) {
 
     // 4) Consolidação em pagbank_payments (status + customer mais recente)
     if (chargeId) {
-      const customerData = normalizeCustomer(p.customer || p?.checkout?.customer || {});
       await pagbankRepository.upsertPaymentByChargeId({
         charge_id: chargeId,
         checkout_id: checkoutId,
         status,
         request_ref: referenceId,
-        customer: customerData,
-        raw: p
+        customer,
+        raw: p,
       });
     }
 
@@ -171,7 +141,9 @@ async function processWebhook(p, meta = {}) {
     if (status === 'PAID') {
       const record = chargeId
         ? await pagbankRepository.findByChargeId(chargeId)
-        : (checkoutId ? await pagbankRepository.findByCheckoutId(checkoutId) : null);
+        : checkoutId
+        ? await pagbankRepository.findByCheckoutId(checkoutId)
+        : null;
 
       if (record) {
         const { request_id: requestId, product_type: productType } = record;
