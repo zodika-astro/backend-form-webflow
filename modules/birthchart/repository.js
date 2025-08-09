@@ -13,7 +13,7 @@ async function createBirthchartRequest(requestData) {
   } = requestData;
 
   const query = `
-    INSERT INTO birthchart_requests (name, social_name, email, birth_date, birth_time, birth_place)
+    INSERT INTO zodika_requests (name, social_name, email, birth_date, birth_time, birth_place)
     VALUES ($1, $2, $3, $4, $5, $6)
     RETURNING *;
   `;
