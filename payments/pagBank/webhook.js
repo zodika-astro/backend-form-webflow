@@ -1,4 +1,4 @@
-// modules/pagbank/router.webhook.js
+// payments/pagbank/router.webhook.js
 
 const express = require('express');
 const router = express.Router();
