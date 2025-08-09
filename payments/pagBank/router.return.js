@@ -1,4 +1,5 @@
-// modules/pagbank/router.return.js
+// payments/pagbank/router.return.js
+
 const express = require('express');
 const router = express.Router();
 const pagbankController = require('./controller');
