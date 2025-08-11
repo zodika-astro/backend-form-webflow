@@ -6,12 +6,8 @@ const logger = require('../../utils/logger');
 const { mapWebhookPayload, normalizeCustomer } = require('./mapPayload'); // Importa o novo módulo
 const { env } = require('../../config/env');
 
-const PAGBANK_BASE = env.PAGBANK_BASE_URL || 'https://sandbox.api.pagseguro.com';
+const PAGBANK_BASE = 'https://sandbox.api.pagseguro.com';
 
-/**
- * Cria um checkout hospedado e retorna o link PAY.
- * Proteções: validações de campos obrigatórios.
- */
 async function createCheckout({
   requestId,
   name,
@@ -20,7 +16,9 @@ async function createCheckout({
   productValue,
   redirectUrl,
   paymentOptions,
-}) {
+}) 
+
+{
   // Validações mínimas
   if (!requestId) throw new Error('requestId é obrigatório');
   const valueNum = Number(productValue);
@@ -37,11 +35,11 @@ async function createCheckout({
   const payload = {
     reference_id: String(requestId),
     items: [{ name: productType || 'Produto', quantity: 1, unit_amount: valueNum }],
-    notification_urls: [env.PAGBANK_WEBHOOK_URL],
-    payment_notification_urls: [env.PAGBANK_PAYMENT_WEBHOOK_URL || env.PAGBANK_WEBHOOK_URL],
+    notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
+    payment_notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
     customer_modifiable: true,
     customer: { name, email },
-    redirect_url: redirectUrl || undefined,
+    redirect_url: 'https://backend-form-webflow-production.up.railway.app/pagbank/return',
     // Políticas por produto
     payment_methods_configs: {
       pix: { enabled: paymentOptions?.allow_pix !== false },
