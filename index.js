@@ -12,8 +12,8 @@ const errorHandlerMiddleware = require('./middlewares/errorHandler');
 
 // Importa os roteadores de cada módulo
 const birthchartRouter = require('./modules/birthchart/router');
-const pagbankWebhookRouter = require('./modules/pagBank/router.webhook');
-const pagbankReturnRouter = require('./modules/pagBank/router.return');
+const pagbankWebhookRouter = require('./payments/pagBank/router.webhook');
+const pagbankReturnRouter = require('./payments/pagBank/router.return.js');
 
 // Middleware para habilitar CORS e processar JSON
 app.use(corsMiddleware);
