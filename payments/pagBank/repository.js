@@ -1,5 +1,5 @@
 // payments/pagbank/repository.js
-const db = require('../../../db/db');
+const db = require('../../db/db');
 
 /**
  * Cria/atualiza o registro de checkout (pagbank_request).
