@@ -4,7 +4,7 @@ const httpClient = require('../../utils/httpClient');
 const pagbankRepository = require('./repository');
 const logger = require('../../utils/logger');
 const { mapWebhookPayload, normalizeCustomer } = require('./mapPayload'); // Importa o novo módulo
-const { env } = require('../../../config/env');
+const { env } = require('../../config/env');
 
 const PAGBANK_BASE = env.PAGBANK_BASE_URL || 'https://sandbox.api.pagseguro.com';
 
