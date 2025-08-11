@@ -1,4 +1,4 @@
-middlewares/refererAuth.js
+// middlewares/refererAuth.js
 const ALLOWED_REFERER = process.env.WEBFLOW_DOMAIN; 
 
 function refererAuth(req, res, next) {
