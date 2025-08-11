@@ -1,6 +1,6 @@
 // modules/birthchart/repository.js
 
-const db = require('../../../db/db');
+const db = require('../../db/db');
 
 async function createBirthchartRequest(requestData) {
   const {
