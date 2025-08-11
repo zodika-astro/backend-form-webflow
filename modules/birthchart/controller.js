@@ -1,7 +1,7 @@
 // modules/birthchart/controller.js
 const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
-const pagbankService = require('../../payments/pagbank/service');
+const pagbankService = require('../../payments/pagBank/service');
 
 
 async function processForm(req, res, next) {
