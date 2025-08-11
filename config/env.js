@@ -1,4 +1,4 @@
-// src/config/env.js
+// config/env.js
 
 const dotenv = require('dotenv');
 const envalid = require('envalid');
