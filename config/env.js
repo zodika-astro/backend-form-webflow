@@ -13,6 +13,4 @@ module.exports = cleanEnv(process.env, {
   // Token para autenticação com a API do PagBank
   PAGBANK_API_TOKEN: str({ desc: 'PagBank API authentication token' }),
 
-  // Domínio do seu site no Webflow para validação do cabeçalho Referer
-  WEBFLOW_DOMAIN: url({ desc: 'Webflow site domain for referer validation' }),
 });
