@@ -19,7 +19,10 @@ const pagbankController    = require('./payments/pagBank/controller');
 
 // Middleware globais
 app.use(corsMiddleware);
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); }
+}));
+
 
 // Health check
 app.get('/health', (req, res) => res.status(200).send('OK'));
