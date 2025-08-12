@@ -26,8 +26,8 @@ async function processForm(req, res, next) {
       allow_pix: true,
       allow_card: true,
       max_installments: 1,
-      min_installment_amount: 3500, // R$ 35,00
     };
+
 
     // cria o checkout no PagBank
     const paymentResponse = await pagbankService.createCheckout({
