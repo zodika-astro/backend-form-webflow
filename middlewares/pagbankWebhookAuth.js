@@ -8,7 +8,7 @@ function pagbankWebhookAuth(req, res, next) {
         return res.status(401).json({ message: 'Unauthorized: Missing signature' });
     }
 
-    const rawPayload = JSON.stringify(req.body);
+    const rawPayload = req.rawBody || JSON.stringify(req.body);
 
     const stringToHash = `${PAGBANK_AUTH_TOKEN}-${rawPayload}`;
 
