@@ -3,9 +3,10 @@
 const httpClient = require('../../utils/httpClient');
 const pagbankRepository = require('./repository');
 const logger = require('../../utils/logger');
-const { mapWebhookPayload, normalizeCustomer } = require('./mapPayload'); // Importa o novo módulo
-const { env } = require('../../config/env');
+const { mapWebhookPayload } = require('./mapPayload');
+const env = require('../../config/env'); // export default do envalid
 
+// BASE fixo (sandbox)
 const PAGBANK_BASE = 'https://sandbox.api.pagseguro.com';
 
 async function createCheckout({
@@ -14,11 +15,9 @@ async function createCheckout({
   email,
   productType,
   productValue,
-  redirectUrl,
+  redirectUrl,     // deixamos disponível, mas usamos a rota padronizada abaixo
   paymentOptions,
-}) 
-
-{
+}) {
   // Validações mínimas
   if (!requestId) throw new Error('requestId é obrigatório');
   const valueNum = Number(productValue);
@@ -28,22 +27,25 @@ async function createCheckout({
   if (!name || !email) {
     logger.warn('Criando checkout sem nome/email completos — considere exigir esses campos');
   }
-  if (!redirectUrl) {
-    logger.warn('Sem redirectUrl — considere definir por produto');
-  }
 
   const payload = {
     reference_id: String(requestId),
     items: [{ name: productType || 'Produto', quantity: 1, unit_amount: valueNum }],
+
+    // Webhooks unificados (mesmo endpoint)
     notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
     payment_notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
+
     customer_modifiable: true,
     customer: { name, email },
-    redirect_url: 'https://backend-form-webflow-production.up.railway.app/pagbank/return',
+
+    // Padrão /pagBank para a rota de retorno
+    redirect_url: 'https://backend-form-webflow-production.up.railway.app/pagBank/return',
+
     // Políticas por produto
     payment_methods_configs: {
       pix: { enabled: paymentOptions?.allow_pix !== false },
-      boleto: { enabled: false }, // desativado globalmente
+      boleto: { enabled: false },
       credit_card: {
         enabled: paymentOptions?.allow_card !== false,
         installments:
@@ -76,7 +78,7 @@ async function createCheckout({
     status: data?.status || 'CREATED',
     value: valueNum,
     link: payLink || null,
-    customer: { name, email }, // guarda o que você enviou (para comparar depois)
+    customer: { name, email },
     raw: data,
   });
 
@@ -85,22 +87,16 @@ async function createCheckout({
 
 /**
  * Processa webhook do PagBank.
- * - Registra evento com headers/query (se enviados pelo controller)
- * - IDEMPOTÊNCIA: se já logado, encerra cedo
- * - Atualiza status em request/payments e consolida customer
- * - Try/catch interno para não quebrar o fluxo HTTP do controller
- *
- * @param {object} p - payload (req.body)
- * @param {object} meta - metadados opcionais do request HTTP { headers, query, topic, action }
- * @returns {object} { ok: boolean, duplicate?: boolean }
+ * - Loga headers/query
+ * - Idempotência por event_uid
+ * - Atualiza status e consolida customer
+ * - Try/catch interno (controller sempre retorna 200)
  */
 async function processWebhook(p, meta = {}) {
   try {
-    // 1) Mapeia o payload para um objeto interno padrão usando o novo módulo
-    const mappedPayload = mapWebhookPayload(p);
-    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mappedPayload;
+    const mapped = mapWebhookPayload(p);
+    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mapped;
 
-    // 2) Log imutável com idempotência
     const logged = await pagbankRepository.logEvent({
       event_uid: eventId,
       payload: p,
@@ -112,18 +108,15 @@ async function processWebhook(p, meta = {}) {
       charge_id: chargeId,
     });
 
-    // Se já havia um evento com esse UID, não prossiga (idempotência total)
     if (!logged) {
-      logger.info('Webhook duplicado — apenas logado anteriormente, ignorando processamento.');
+      logger.info('Webhook duplicado — já registrado. Encerrando sem reprocessar.');
       return { ok: true, duplicate: true };
     }
 
-    // 3) Atualizações de status (checkout)
     if (checkoutId) {
       await pagbankRepository.updateCheckoutStatusById(checkoutId, status, p);
     }
 
-    // 4) Consolidação em pagbank_payments (status + customer mais recente)
     if (chargeId) {
       await pagbankRepository.upsertPaymentByChargeId({
         charge_id: chargeId,
@@ -135,7 +128,6 @@ async function processWebhook(p, meta = {}) {
       });
     }
 
-    // 5) Se pago, despacha handler do produto (opcional, via registry)
     if (status === 'PAID') {
       const record = chargeId
         ? await pagbankRepository.findByChargeId(chargeId)
@@ -144,18 +136,18 @@ async function processWebhook(p, meta = {}) {
         : null;
 
       if (record) {
-        const { request_id: requestId, product_type: productType } = record;
-        logger.info(`Pagamento confirmado — requestId=${requestId} productType=${productType}`);
-        // await productHandlers[productType]?.onPaid?.(requestId);
+        const { request_id: reqId, product_type: prodType } = record;
+        logger.info(`Pagamento confirmado — requestId=${reqId} productType=${prodType}`);
+        // hook de produto opcional
       }
     }
 
     return { ok: true };
   } catch (err) {
-    // Nunca lança: deixa o controller responder 200 OK e só loga aqui
     logger.error('Erro ao processar webhook do PagBank:', err);
     return { ok: false, error: 'internal_error' };
   }
 }
 
 module.exports = { createCheckout, processWebhook };
+
