@@ -4,10 +4,15 @@ const httpClient = require('../../utils/httpClient');
 const pagbankRepository = require('./repository');
 const logger = require('../../utils/logger');
 const { mapWebhookPayload } = require('./mapPayload');
-const env = require('../../config/env'); // export default do envalid
+const { env } = require('../../config/env');
 
-// BASE fixo (sandbox)
+// Base fixa do PagBank (sandbox)
 const PAGBANK_BASE = 'https://sandbox.api.pagseguro.com';
+
+// URLs públicas da sua API (com prefixo /pagBank conforme opção 1)
+const PUBLIC_BASE = 'https://backend-form-webflow-production.up.railway.app';
+const WEBHOOK_PATH = '/pagBank/webhook/pagbank';
+const RETURN_PATH  = '/pagBank/pagbank/return';
 
 async function createCheckout({
   requestId,
@@ -15,11 +20,11 @@ async function createCheckout({
   email,
   productType,
   productValue,
-  redirectUrl,     // deixamos disponível, mas usamos a rota padronizada abaixo
+  redirectUrl,     // (não usado aqui; mantido por compat)
   paymentOptions,
 }) {
-  // Validações mínimas
   if (!requestId) throw new Error('requestId é obrigatório');
+
   const valueNum = Number(productValue);
   if (!Number.isFinite(valueNum) || valueNum <= 0) {
     throw new Error('productValue inválido (deve ser número em centavos > 0)');
@@ -31,18 +36,11 @@ async function createCheckout({
   const payload = {
     reference_id: String(requestId),
     items: [{ name: productType || 'Produto', quantity: 1, unit_amount: valueNum }],
-
-    // Webhooks unificados (mesmo endpoint)
-    notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
-    payment_notification_urls: 'https://backend-form-webflow-production.up.railway.app/webhook/pagbank',
-
+    notification_urls: `${PUBLIC_BASE}${WEBHOOK_PATH}`,
+    payment_notification_urls: `${PUBLIC_BASE}${WEBHOOK_PATH}`,
     customer_modifiable: true,
     customer: { name, email },
-
-    // Padrão /pagBank para a rota de retorno
-    redirect_url: 'https://backend-form-webflow-production.up.railway.app/pagBank/return',
-
-    // Políticas por produto
+    redirect_url: `${PUBLIC_BASE}${RETURN_PATH}`,
     payment_methods_configs: {
       pix: { enabled: paymentOptions?.allow_pix !== false },
       boleto: { enabled: false },
@@ -85,17 +83,9 @@ async function createCheckout({
   return { url: payLink, checkoutId: data?.id || null };
 }
 
-/**
- * Processa webhook do PagBank.
- * - Loga headers/query
- * - Idempotência por event_uid
- * - Atualiza status e consolida customer
- * - Try/catch interno (controller sempre retorna 200)
- */
 async function processWebhook(p, meta = {}) {
   try {
-    const mapped = mapWebhookPayload(p);
-    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mapped;
+    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mapWebhookPayload(p);
 
     const logged = await pagbankRepository.logEvent({
       event_uid: eventId,
@@ -109,7 +99,7 @@ async function processWebhook(p, meta = {}) {
     });
 
     if (!logged) {
-      logger.info('Webhook duplicado — já registrado. Encerrando sem reprocessar.');
+      logger.info('Webhook duplicado — ignorando processamento');
       return { ok: true, duplicate: true };
     }
 
@@ -136,9 +126,8 @@ async function processWebhook(p, meta = {}) {
         : null;
 
       if (record) {
-        const { request_id: reqId, product_type: prodType } = record;
-        logger.info(`Pagamento confirmado — requestId=${reqId} productType=${prodType}`);
-        // hook de produto opcional
+        const { request_id: requestId, product_type: productType } = record;
+        logger.info(`Pagamento confirmado — requestId=${requestId} productType=${productType}`);
       }
     }
 
@@ -150,4 +139,3 @@ async function processWebhook(p, meta = {}) {
 }
 
 module.exports = { createCheckout, processWebhook };
-
