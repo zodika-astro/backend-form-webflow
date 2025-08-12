@@ -36,7 +36,6 @@ async function processForm(req, res, next) {
       email: newRequest.email,
       productType: newRequest.product_type,     // service espera "productType"
       productValue: 3500,                       // R$ 35,00 em centavos
-      redirectUrl: `https://www.zodika.com.br/birthchart-payment-success?request=${newRequest.request_id}`,
       paymentOptions,                           // aqui vai o objeto definido acima
     });
 
