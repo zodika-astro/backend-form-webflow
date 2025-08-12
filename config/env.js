@@ -1,16 +1,13 @@
 // config/env.js
 
 const dotenv = require('dotenv');
-const envalid = require('envalid');
-const { cleanEnv, url, str, num } = envalid;
+const { cleanEnv, url, str, num } = require('envalid');
 
 dotenv.config();
 
-module.exports = cleanEnv(process.env, {
-  // Variável de ambiente para a string de conexão do banco de dados
+const env = cleanEnv(process.env, {
   DATABASE_URL: url({ desc: 'Postgres connection string' }),
-
-  // Token para autenticação com a API do PagBank
   PAGBANK_API_TOKEN: str({ desc: 'PagBank API authentication token' }),
-
 });
+
+module.exports = { env }; // ✅ agora { env } funciona
