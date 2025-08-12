@@ -20,7 +20,6 @@ async function createCheckout({
   email,
   productType,
   productValue,
-  redirectUrl,     // (não usado aqui; mantido por compat)
   paymentOptions,
 }) {
   if (!requestId) throw new Error('requestId é obrigatório');
