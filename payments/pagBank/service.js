@@ -62,7 +62,7 @@ async function createCheckout({
     ...(payment_methods_configs.length > 0 && { payment_methods_configs }),
   };
 
-  try {
+    try {
     const { data } = await httpClient.post(`${PAGBANK_BASE}/checkouts`, payload, {
       headers: {
         Authorization: `Bearer ${env.PAGBANK_API_TOKEN}`,
@@ -70,6 +70,11 @@ async function createCheckout({
       },
       timeout: 15000,
     });
+      
+      // Log da resposta completa para depuração
+      logger.info('Resposta completa do PagBank:', JSON.stringify(data, null, 2));
+
+    logger.info('Resposta completa do PagBank:', JSON.stringify(data, null, 2));
 
     const payLink = Array.isArray(data?.links) ? data.links.find((l) => l.rel === 'PAY')?.href : null;
     if (!payLink) {
@@ -94,6 +99,8 @@ async function createCheckout({
     // Relança o erro para que o controller possa tratá-lo
     throw error;
   }
+
+
 }
 
 async function processWebhook(p, meta = {}) {
