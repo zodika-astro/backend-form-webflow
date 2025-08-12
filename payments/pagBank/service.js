@@ -86,6 +86,10 @@ async function createCheckout({
     timeout: 15000,
   });
 
+    // --- ADD THIS LOGGING LINE ---
+  logger.info('PagBank API Response:', JSON.stringify(data, null, 2));
+  // --- END OF ADDITION ---
+
   const payLink = Array.isArray(data?.links) ? data.links.find((l) => l.rel === 'PAY')?.href : null;
   if (!payLink) throw new Error('PAY link não encontrado no retorno do PagBank');
 
