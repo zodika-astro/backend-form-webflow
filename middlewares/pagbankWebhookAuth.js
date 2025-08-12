@@ -1,4 +1,5 @@
-// src/middlewares/pagbankWebhookAuth.js
+// middlewares/pagbankWebhookAuth.js
+
 const crypto = require('crypto');
 const PAGBANK_API_TOKEN = process.env.PAGBANK_API_TOKEN;
 function pagbankWebhookAuth(req, res, next) {
