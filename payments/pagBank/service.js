@@ -32,29 +32,32 @@ async function createCheckout({
     logger.warn('Criando checkout sem nome/email completos — considere exigir esses campos');
   }
 
-  // Métodos de pagamento (array conforme schema do PagBank)
-  const payment_methods = [];
-  if (paymentOptions?.allow_pix !== false) payment_methods.push({ type: 'PIX' });
-  if (paymentOptions?.allow_card !== false) payment_methods.push({ type: 'CREDIT_CARD' });
+    // Métodos de pagamento (array conforme schema do PagBank)
+  const payment_methods = [];
+  if (paymentOptions?.allow_pix !== false) payment_methods.push({ type: 'PIX' });
+  if (paymentOptions?.allow_card !== false) payment_methods.push({ type: 'CREDIT_CARD' });
 
-  // Configurações de pagamento (array conforme schema do PagBank)
-  const payment_methods_configs = [];
-  if (paymentOptions?.allow_card !== false) {
-    const maxInst = paymentOptions?.max_installments ?? 1;
-    const config_options = [
-      { option: 'INSTALLMENTS_LIMIT', value: String(maxInst) },
-    ];
-  if (paymentOptions?.min_installment_amount != null) {
-    config_options.push({
-      option: 'MIN_INSTALLMENT_AMOUNT',
-      value: String(paymentOptions.min_installment_amount),
-    });
-  }
-    payment_methods_configs.push({
-      type: 'CREDIT_CARD',
-      config_options,
-    });
-  }
+  // Configurações de pagamento para cartão de crédito (se habilitado)
+  const payment_methods_configs = [];
+  if (paymentOptions?.allow_card !== false) {
+    const config_options = [];
+
+    // Adiciona a opção INSTALLMENTS_LIMIT
+    const maxInst = paymentOptions?.max_installments ?? 1;
+    config_options.push({ option: 'INSTALLMENTS_LIMIT', value: String(maxInst) });
+    
+    // A opção MIN_INSTALLMENT_AMOUNT não é suportada diretamente na API de Checkout.
+    // Se você quer assumir os juros, a opção correta é INTEREST_FREE_INSTALLMENTS.
+    // Neste exemplo, vamos remover a opção inválida para resolver o erro.
+    // Se você precisa de lógica de juros, deve usar 'INTEREST_FREE_INSTALLMENTS'.
+    
+    if (config_options.length > 0) {
+      payment_methods_configs.push({
+        type: 'CREDIT_CARD',
+        config_options,
+      });
+    }
+  }
 
   const payload = {
     reference_id: String(requestId),
