@@ -53,28 +53,25 @@ async function handleWebhook(req, res) {
   logger.info('Recebendo webhook do PagBank.');
   try {
     const payload = req.body;
+
+    try {
+      validateWebhookPayload(payload);
+    } catch (ve) {
+      logger.warn('Webhook payload inválido (Zod):', ve.message);
+      // segue o fluxo mesmo assim — seu service tem idempotência e logs
+    }
+
     const meta = {
       headers: req.headers,
       query: req.query,
-      topic: req.query.topic, // Assumindo que o tópico vem na query, conforme PagBank V4
+      topic: req.query.topic,
     };
 
-    // O service encapsula toda a lógica de processamento, idempotência e log.
     const result = await pagbankService.processWebhook(payload, meta);
-
-    if (!result.ok) {
-      // Se houver um erro de processamento, apenas o logamos.
-      logger.error('Processamento do webhook falhou, mas respondendo 200 OK para evitar re-tentativas.');
-    } else if (result.duplicate) {
-      logger.info('Webhook duplicado recebido e processado, respondendo 200 OK.');
-    } else {
-      logger.info('Webhook processado com sucesso. Respondendo 200 OK.');
-    }
+    // logs...
   } catch (err) {
-    // Este catch é uma camada de segurança extra.
     logger.error('Erro fatal e inesperado ao processar o webhook do PagBank:', err);
   } finally {
-    // A resposta 200 OK é crítica para o fluxo de webhooks do PagBank.
     res.status(200).send('OK');
   }
 }
