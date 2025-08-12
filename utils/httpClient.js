@@ -7,10 +7,10 @@ async function request(url, options = {}) {
 
   if (!res.ok) {
     const text = await res.text();
+    // Lança um erro detalhado que pode ser capturado
     throw new Error(`HTTP ${res.status} - ${text}`);
   }
 
-  // Se for JSON, tenta parsear
   const contentType = res.headers.get('content-type');
   if (contentType && contentType.includes('application/json')) {
     return res.json();
@@ -19,9 +19,10 @@ async function request(url, options = {}) {
   return res.text();
 }
 
-// Atalhos para verbos comuns
+// Atalhos para verbos comuns, usando a função `request`
 module.exports = {
   get: (url, options) => request(url, { ...options, method: 'GET' }),
+
   post: (url, body, options) =>
     request(url, {
       ...options,
@@ -32,6 +33,7 @@ module.exports = {
         ...(options?.headers || {})
       }
     }),
+
   put: (url, body, options) =>
     request(url, {
       ...options,
@@ -42,5 +44,6 @@ module.exports = {
         ...(options?.headers || {})
       }
     }),
+
   delete: (url, options) => request(url, { ...options, method: 'DELETE' })
 };
