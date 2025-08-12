@@ -29,6 +29,28 @@ async function createBirthchartRequest(requestData) {
   }
 }
 
+/**
+ * Busca uma request pelo request_id e retorna também o product_type
+ * @param {string} requestId - ID único da request
+ * @returns {Promise<{request_id: string, product_type: string} | null>}
+ */
+async function findByRequestId(requestId) {
+  const query = `
+    SELECT request_id, product_type
+    FROM zodika_requests
+    WHERE request_id = $1
+    LIMIT 1;
+  `;
+  try {
+    const { rows } = await db.query(query, [requestId]);
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Error fetching request by request_id from database:', error);
+    throw new Error('Database Error: Could not fetch request by request_id.');
+  }
+}
+
 module.exports = {
   createBirthchartRequest,
+  findByRequestId,
 };
