@@ -1,57 +1,36 @@
-const fetch = require('node-fetch');
+// utils/httpClient.js
+const axios = require('axios');
 
-// Função centralizada para fazer a requisição e tratar erros
-async function request(url, options = {}) {
-  const res = await fetch(url, options);
+const http = axios.create({
+  baseURL: process.env.PAGBANK_BASE_URL,
+  timeout: 20000,
+});
 
-  // Se a resposta não for bem-sucedida (status 4xx ou 5xx),
-  // lemos o corpo da resposta e lançamos um erro detalhado.
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HTTP ${res.status} - ${text}`);
-  }
+http.interceptors.request.use((cfg) => {
+  const { Authorization, ...safeHeaders } = cfg.headers || {};
+  console.log('[PagBank][REQ]', cfg.method?.toUpperCase(), cfg.url, {
+    headers: safeHeaders,
+    body: cfg.data,
+  });
+  return cfg;
+});
 
-  // Verificamos se a resposta é JSON para fazer o parse
-  const contentType = res.headers.get('content-type');
-  if (contentType && contentType.includes('application/json')) {
-    try {
-      return await res.json();
-    } catch (e) {
-      // Caso o parse do JSON falhe, lançamos um erro específico
-      throw new Error(`Failed to parse JSON response: ${e.message}`);
+http.interceptors.response.use(
+  (res) => {
+    console.log('[PagBank][RES]', res.status, res.config?.url, res.data);
+    return res;
+  },
+  (err) => {
+    if (err.response) {
+      console.error('[PagBank][ERR]', err.response.status, err.config?.url, {
+        data: err.response.data,
+        headers: err.response.headers,
+      });
+    } else {
+      console.error('[PagBank][ERR-NETWORK]', err.message);
     }
+    throw err;
   }
+);
 
-  // Se não for JSON, retornamos o texto bruto
-  return res.text();
-}
-
-// Exportamos helpers para cada método HTTP, garantindo que
-// todos usem a função 'request' para o tratamento de erros.
-module.exports = {
-  get: (url, options) => request(url, { ...options, method: 'GET' }),
-
-  post: (url, body, options) =>
-    request(url, {
-      ...options,
-      method: 'POST',
-      body: JSON.stringify(body),
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options?.headers || {})
-      }
-    }),
-
-  put: (url, body, options) =>
-    request(url, {
-      ...options,
-      method: 'PUT',
-      body: JSON.stringify(body),
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options?.headers || {})
-      }
-    }),
-
-  delete: (url, options) => request(url, { ...options, method: 'DELETE' })
-};
+module.exports = http;
