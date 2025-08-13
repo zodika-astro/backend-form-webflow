@@ -88,4 +88,65 @@ async function createCheckout({
   }
 }
 
+async function processWebhook(p, meta = {}) {
+  try {
+    const { mapWebhookPayload } = require('./mapPayload');
+    const pagbankRepository = require('./repository');
+    const logger = require('../../utils/logger');
+
+    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mapWebhookPayload(p);
+
+    const logged = await pagbankRepository.logEvent({
+      event_uid: eventId,
+      payload: p,
+      headers: meta.headers || null,
+      query: meta.query || null,
+      topic: meta.topic || null,
+      action: meta.action || null,
+      checkout_id: checkoutId,
+      charge_id: chargeId,
+    });
+
+    if (!logged) {
+      logger.info('Webhook duplicado — ignorando processamento');
+      return { ok: true, duplicate: true };
+    }
+
+    if (checkoutId) {
+      await pagbankRepository.updateCheckoutStatusById(checkoutId, status, p);
+    }
+
+    if (chargeId) {
+      await pagbankRepository.upsertPaymentByChargeId({
+        charge_id: chargeId,
+        checkout_id: checkoutId,
+        status,
+        request_ref: referenceId,
+        customer,
+        raw: p,
+      });
+    }
+
+    if (status === 'PAID') {
+      const record = chargeId
+        ? await pagbankRepository.findByChargeId(chargeId)
+        : checkoutId
+        ? await pagbankRepository.findByCheckoutId(checkoutId)
+        : null;
+
+      if (record) {
+        const { request_id: requestId, product_type: productType } = record;
+        logger.info(`Pagamento confirmado — requestId=${requestId} productType=${productType}`);
+      }
+    }
+
+    return { ok: true };
+  } catch (err) {
+    const logger = require('../../utils/logger');
+    logger.error('Erro ao processar webhook do PagBank:', err);
+    return { ok: false, error: 'internal_error' };
+  }
+}
+
+
 module.exports = { createCheckout, processWebhook };
