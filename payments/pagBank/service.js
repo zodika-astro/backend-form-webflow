@@ -1,7 +1,9 @@
 // payments/pagBank/service.js (substitua só a createCheckout)
 const httpClient = require('../../utils/httpClient');
 const logger = require('../../utils/logger');
-const { v4: uuid } = require('uuid');
+// substitua: const { v4: uuid } = require('uuid');
+const uuid = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+
 const { env } = require('../../config/env');
 
 async function createCheckout({
