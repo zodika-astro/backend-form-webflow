@@ -1,15 +1,34 @@
 // middlewares/refererAuth.js
 
-const ALLOWED = ['https://www.zodika.com.br', 'https://zodika.com.br'];
-const ok = referer && ALLOWED.some(base => referer.startsWith(base));
+const { URL } = require('url');
 
-function refererAuth(req, res, next) {
-    const referer = req.headers.referer;
-    
-    if (!referer || !referer.startsWith(ALLOWED_REFERER)) {
-        return res.status(403).json({ message: 'Forbidden: Invalid referer' });
-}
-    next();
+const ALLOWED = (process.env.ALLOWED_REFERERS ||
+  'https://www.zodika.com.br,https://zodika.com.br'
+)
+  .split(',')
+  .map(s => s.trim().replace(/\/+$/, '')); // strip trailing slash
+
+function isAllowedHost(val) {
+  if (!val) return false;
+  try {
+    const u = new URL(val);
+    const host = `${u.protocol}//${u.host}`; 
+    return ALLOWED.some(base => host === base);
+  } catch {
+    return false; 
+  }
 }
 
-module.exports = refererAuth;
+module.exports = function refererAuth(req, res, next) {
+  const referer = req.get('referer') || '';
+  const origin  = req.get('origin')  || '';
+
+  if (isAllowedHost(referer) || isAllowedHost(origin)) {
+    return next();
+  }
+
+  return res.status(403).json({
+    message: 'Forbidden: Invalid referer/origin',
+
+  });
+};
