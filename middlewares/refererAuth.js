@@ -2,11 +2,7 @@
 
 const { URL } = require('url');
 
-const ALLOWED = (process.env.ALLOWED_REFERERS ||
-  'https://www.zodika.com.br,https://zodika.com.br'
-)
-  .split(',')
-  .map(s => s.trim().replace(/\/+$/, '')); // strip trailing slash
+const ALLOWED = (process.env.ALLOWED_REFERERS).split(',').map(s => s.trim().replace(/\/+$/, '')); // strip trailing slash
 
 function isAllowedHost(val) {
   if (!val) return false;
