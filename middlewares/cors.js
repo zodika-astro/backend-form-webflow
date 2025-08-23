@@ -1,15 +1,15 @@
 // middlewares/cors.js
+
 const cors = require('cors');
 
-const allowedOrigins = ['https://zodika.com.br', 'https://www.zodika.com.br'];
+const allowed = (process.env.ALLOWED_ORIGINS).split(',').map(s => s.trim());
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+  origin(origin, callback) {
+    if (!origin || allowed.includes(origin)) {
       return callback(null, true);
     }
-    const msg = 'CORS policy does not allow access from origin: ' + origin;
-    return callback(new Error(msg), false);
+    return callback(new Error('CORS blocked: ' + origin));
   }
 };
 
