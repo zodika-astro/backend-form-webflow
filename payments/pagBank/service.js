@@ -6,6 +6,8 @@ const uuid = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toStr
 
 const { env } = require('../../config/env');
 
+const pagbankRepository = require('./repository');
+
 async function createCheckout({
   requestId,
   name,
@@ -69,8 +71,16 @@ async function createCheckout({
       throw new Error('PAY link não encontrado no retorno do PagBank');
     }
 
-    // (Opcional) só depois que funcionar, reative o persist:
-    // await pagbankRepository.createCheckout({ ... });
+    const record = await pagbankRepository.createCheckout({
+      request_id: String(requestId),
+      product_type: productType || 'birth_chart',
+      checkout_id: data?.id || null,
+      status: data?.status || 'CREATED',
+      value: valueNum,
+      link: payLink,
+      customer: (name && email) ? { name, email } : null,
+      raw: data
+      });
 
     return { url: payLink, checkoutId: data?.id || null };
   } catch (e) {
