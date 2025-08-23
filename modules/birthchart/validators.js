@@ -7,7 +7,15 @@ const birthchartSchema = z.object({
   birth_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date format must be YYYY-MM-DD'),
   birth_time: z.string().regex(/^\d{2}:\d{2}$/, 'time format must be HH:MM'),
   birth_place: z.string().min(2, 'birth place must have at least 2 characters'),
-  product_type: z.string()
+  product_type: z.string(),
+  birth_place_place_id: z.string().optional(),
+  birth_place_full: z.string().optional(),
+  birth_place_country: z.string().length(2).optional(),
+  birth_place_admin1: z.string().optional(),
+  birth_place_admin2: z.string().optional(),
+  birth_place_lat: z.string().optional(),
+  birth_place_lng: z.string().optional(),
+  birth_place_json: z.string().optional()
 });
 
 function validateBirthchartPayload(payload) {
@@ -17,7 +25,6 @@ function validateBirthchartPayload(payload) {
         throw new Error(`Validation Error: ${error.message}`);
     }
 }
-
 module.exports = {
   validateBirthchartPayload,
 };
