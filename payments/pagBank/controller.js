@@ -123,7 +123,7 @@ async function handleReturn(req, res) {
 
     // 3) Mapeamento centralizado product_type -> função geradora da URL
     const successUrlByProduct = {
-      birthchart: (id) => `https://www.zodika.com.br/birthchart-payment-success?request=${encodeURIComponent(id)}`,
+      birth_chart: (id) => `https://www.zodika.com.br/birthchart-payment-success?request=${encodeURIComponent(id)}`,
 
       // Exemplos futuros:
       // synastry:   (id) => `https://www.zodika.com.br/synastry-payment-success?request=${encodeURIComponent(id)}`,
