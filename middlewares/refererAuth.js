@@ -1,6 +1,7 @@
 // middlewares/refererAuth.js
 
-const ALLOWED_REFERER = 'https://www.zodika.com.br/';
+const ALLOWED = ['https://www.zodika.com.br', 'https://zodika.com.br'];
+const ok = referer && ALLOWED.some(base => referer.startsWith(base));
 
 function refererAuth(req, res, next) {
     const referer = req.headers.referer;
