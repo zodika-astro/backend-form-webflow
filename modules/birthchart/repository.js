@@ -10,15 +10,27 @@ async function createBirthchartRequest(requestData) {
     birth_date,
     birth_time,
     birth_place,
-    product_type
+    product_type,
+    birth_place_place_id,
+    birth_place_full,
+    birth_place_country,
+    birth_place_admin1,
+    birth_place_admin2,
+    birth_place_lat,
+    birth_place_lng,
+    birth_place_json
   } = requestData;
 
   const query = `
-    INSERT INTO zodika_requests (name, social_name, email, birth_date, birth_time, birth_place, product_type)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    INSERT INTO zodika_requests (name, social_name, email, birth_date, birth_time, birth_place, product_type, birth_place_place_id, 
+    birth_place_full, birth_place_country, birth_place_admin1, birth_place_admin2, birth_place_lat, birth_place_lng, birth_place_json)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::float8, $14::float8, $15::jsonb
+    )
     RETURNING *;
   `;
-  const values = [name, social_name, email, birth_date, birth_time, birth_place, product_type];
+  const values = [name, social_name, email, birth_date, birth_time, birth_place, product_type, birth_place_place_id,
+    birth_place_full, birth_place_country, birth_place_admin1, birth_place_admin2, 
+    birth_place_lat, birth_place_lng, birth_place_json ? JSON.parse(birth_place_json) : null];
 
   try {
     const { rows } = await db.query(query, values);
