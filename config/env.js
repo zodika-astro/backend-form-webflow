@@ -11,6 +11,7 @@ const env = cleanEnv(process.env, {
   PAGBANK_BASE_URL: url({ desc: 'PagBank URL' }),
   ALLOWED_REFERERS: str({ desc: ''  }),
   ALLOWED_ORIGINS:  str({ desc: ''  }),
+  PUBLIC_BASE_URL: str({ desc: 'Railway connection string'  }),
 });
 
 module.exports = { env };
