@@ -1,4 +1,5 @@
 // modules/birthchart/validators.js
+
 const { z } = require('zod');
 const birthchartSchema = z.object({
   name: z.string().min(3, 'name must have at least 3 characters'),
@@ -15,7 +16,9 @@ const birthchartSchema = z.object({
   birth_place_admin2: z.string().optional(),
   birth_place_lat: z.string().optional(),
   birth_place_lng: z.string().optional(),
-  birth_place_json: z.string().optional()
+  birth_place_json: z.string().optional(),
+  birth_timezone_id: z.string().optional(),
+  birth_utc_offset_min: z.string().or(z.number()).optional()
 });
 
 function validateBirthchartPayload(payload) {
