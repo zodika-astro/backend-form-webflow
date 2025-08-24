@@ -19,6 +19,14 @@ async function processForm(req, res, next) {
       birth_time: payload.birth_time,
       birth_place: payload.birth_place,
       product_type: payload.product_type,
+      birth_place_place_id: payload.birth_place_place_id,
+      birth_place_full:     payload.birth_place_full,
+      birth_place_country:  payload.birth_place_country,
+      birth_place_admin1:   payload.birth_place_admin1,
+      birth_place_admin2:   payload.birth_place_admin2,
+      birth_place_lat:      payload.birth_place_lat,
+      birth_place_lng:      payload.birth_place_lng,
+      birth_place_json:     payload.birth_place_json,
     });
 
     // opções de pagamento (centavos)
