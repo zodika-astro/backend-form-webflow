@@ -1,12 +1,12 @@
-// payments/pagBank/service.js (substitua só a createCheckout)
+// payments/pagBank/service.js 
+
 const httpClient = require('../../utils/httpClient');
 const logger = require('../../utils/logger');
 const crypto = require('crypto');
 const uuid = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
-
 const { env } = require('../../config/env');
-
 const pagbankRepository = require('./repository');
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL
 
 async function createCheckout({
   requestId,
@@ -33,7 +33,7 @@ async function createCheckout({
     reference_id: String(requestId),
     items: [{ name: productType || 'Produto', quantity: 1, unit_amount: valueNum }],
     checkout: {
-      redirect_url: 'https://backend-form-webflow-production.up.railway.app/pagBank/pagbank/return',
+      redirect_url: `${PUBLIC_BASE_URL}/return`,
       payment_methods: methods.length ? methods : ['PIX','CREDIT_CARD'],
     },
     // Envie customer só se realmente tiver valores válidos
