@@ -12,6 +12,7 @@ const env = cleanEnv(process.env, {
   ALLOWED_REFERERS: str({ desc: ''  }),
   ALLOWED_ORIGINS:  str({ desc: ''  }),
   PUBLIC_BASE_URL: str({ desc: 'Railway connection string'  }),
+  GOOGLE_MAPS_API_KEY: str({ desc: 'GoogleMaps API'  }),
 });
 
 module.exports = { env };
