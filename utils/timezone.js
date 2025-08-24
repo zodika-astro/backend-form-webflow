@@ -1,24 +1,23 @@
 // utils/timezone.js
-const fetch = require('node-fetch');
 
-/**
- * Retorna o fuso IANA e o offset (em minutos) no momento do nascimento,
- * usando Google Time Zone API. Se faltar algum dado ou der erro, retorna nulos.
- */
+const FALLBACK_TZ = process.env.TZ_FALLBACK_ID || null;
+const FALLBACK_OFF = Number.isFinite(Number(process.env.TZ_FALLBACK_OFFSET_MIN))
+  ? Number(process.env.TZ_FALLBACK_OFFSET_MIN)
+  : null;
+
 async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
-  // Guardas: se qualquer dado essencial faltar, não falhe o fluxo
-  if (
-    !apiKey ||
-    lat === undefined || lat === null || Number.isNaN(Number(lat)) ||
-    lng === undefined || lng === null || Number.isNaN(Number(lng)) ||
-    !birthDate ||
-    !birthTime
-  ) {
+  const canCall =
+    apiKey &&
+    lat !== undefined && lat !== null && !Number.isNaN(Number(lat)) &&
+    lng !== undefined && lng !== null && !Number.isNaN(Number(lng)) &&
+    birthDate && birthTime;
+
+  if (!canCall) {
+    if (FALLBACK_TZ && FALLBACK_OFF !== null) {
+      return { tzId: FALLBACK_TZ, offsetMin: FALLBACK_OFF };
+    }
     return { tzId: null, offsetMin: null };
   }
-
-  // Construir timestamp a partir de "YYYY-MM-DDTHH:MM:00"
-  // (O offset local será devolvido pela API)
   const dt = new Date(`${birthDate}T${birthTime}:00`);
   const timestamp = Math.floor(dt.getTime() / 1000);
 
@@ -29,19 +28,30 @@ async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
     `&key=${encodeURIComponent(apiKey)}`;
 
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) return { tzId: null, offsetMin: null };
+    const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+    const data = await resp.json().catch(() => ({}));
 
-    const data = await resp.json();
-    if (data.status !== 'OK') return { tzId: null, offsetMin: null };
+    if (!resp.ok || data.status !== 'OK') {
+      console.error('[TZ][ERR]', {
+        http: resp.status,
+        status: data.status,
+        message: data.errorMessage || data.message,
+      });
 
-    // rawOffset (padrão) + dstOffset (horário de verão) em segundos
+      if (FALLBACK_TZ && FALLBACK_OFF !== null) {
+        return { tzId: FALLBACK_TZ, offsetMin: FALLBACK_OFF };
+      }
+      return { tzId: null, offsetMin: null };
+    }
+
     const totalOffsetSec = (data.rawOffset || 0) + (data.dstOffset || 0);
     const offsetMin = Math.round(totalOffsetSec / 60);
-
     return { tzId: data.timeZoneId || null, offsetMin };
-  } catch {
-    // Não quebrar o fluxo se a API falhar
+  } catch (e) {
+    console.error('[TZ][NET-ERR]', e?.message || e);
+    if (FALLBACK_TZ && FALLBACK_OFF !== null) {
+      return { tzId: FALLBACK_TZ, offsetMin: FALLBACK_OFF };
+    }
     return { tzId: null, offsetMin: null };
   }
 }
