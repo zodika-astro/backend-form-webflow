@@ -20,6 +20,7 @@ async function processForm(req, res, next) {
       birthTime: payload.birth_time,
       apiKey: process.env.GOOGLE_MAPS_API_KEY,
     });
+    console.log('[DEBUG TZ]', { tzId, offsetMin });
 
     // 3) Inserir a request no banco (incluindo os campos novos de local e timezone)
     const newRequest = await createBirthchartRequest({
