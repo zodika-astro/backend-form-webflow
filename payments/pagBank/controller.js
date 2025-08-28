@@ -36,12 +36,19 @@ async function createCheckout(req, res) {
       returnUrl, currency
     });
 
-    return res.status(200).json({ url, checkoutId });
+    return res.status(201).json({ url, checkoutId });
   } catch (err) {
-    logger.error('[createCheckout] erro:', err);
-    return res.status(500).json({ error: 'pagbank_checkout_failed' });
+    const status = err?.response?.status && Number(err.response.status) >= 400 && Number(err.response.status) < 500
+      ? err.response.status
+      : 500;
+
+    const details = err?.response?.data || { message: 'Unexpected error' };
+    logger.error('[createCheckout] error', { status, details });
+
+    return res.status(status).json({ error: 'pagbank_checkout_failed', details });
   }
 }
+
 
 /**
  * PagBank webhook (server-to-server).
@@ -68,7 +75,6 @@ async function handleWebhook(req, res) {
   } catch (err) {
     logger.error('Fatal and unexpected error processing PagBank webhook:', err);
   } finally {
-    // always 200
     res.status(200).send('OK');
   }
 }
