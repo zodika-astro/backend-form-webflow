@@ -40,18 +40,7 @@ async function createCheckout({
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
-
   const selected = methods.length ? methods : ['PIX', 'CREDIT_CARD'];
-  const checkout = {
-    redirect_url: redirectUrl,
-    payment_methods: selected.map((t) => ({ type: t })),
-  };
-
-  if (selected.includes('CREDIT_CARD')) {
-    checkout.payment_methods_configs = [
-      { type: 'CREDIT_CARD', config_options: [{ option: 'INSTALLMENTS_LIMIT', value: '1' }] },
-    ];
-  }
 
   const webhookUrl = normalizeWebhookUrl(process.env.PAGBANK_WEBHOOK_URL);
 
@@ -64,9 +53,26 @@ async function createCheckout({
         unit_amount: valueNum,
       },
     ],
-    checkout,
-    ...(webhookUrl ? { payment_notification_urls: [webhookUrl] } : {}),
-    ...(name && email ? { customer: { name, email } } : {}),
+    checkout: {
+      redirect_url: redirectUrl,
+    },
+    payment_methods: selected.map((t) => ({ type: t })),
+    payment_methods_configs: selected.includes('CREDIT_CARD')
+      ? [
+          {
+            type: 'CREDIT_CARD',
+            config_options: [
+              {
+                option: 'INSTALLMENTS_LIMIT',
+                value: String(paymentOptions?.max_installments || '1'),
+              },
+            ],
+          },
+        ]
+      : undefined,
+    payment_notification_urls: webhookUrl ? [webhookUrl] : undefined,
+    customer: name && email ? { name, email } : undefined,
+    currency: currency || undefined,
   }));
 
   try {
