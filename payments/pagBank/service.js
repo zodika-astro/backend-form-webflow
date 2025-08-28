@@ -11,12 +11,20 @@ const { mapWebhookPayload } = require('./mapPayload');
 
 const events = new EventEmitter();
 
-const normalizeWebhookUrl = (u) => {
+const stripQuotesAndSemicolons = (u) => {
   if (!u) return null;
   let s = String(u).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
   s = s.replace(/[;\s]+$/g, '');
-  return /^https:\/\/[^\s<>"]+$/i.test(s) ? s : null;
+  return s;
+};
+
+const normalizeHttpsUrl = (u, { max = 255 } = {}) => {
+  const s = stripQuotesAndSemicolons(u);
+  if (!s) return null;
+  if (!/^https:\/\/[^\s<>"]+$/i.test(s)) return null;
+  if (s.length > max) return null;
+  return s;
 };
 
 async function createCheckout({
@@ -35,14 +43,16 @@ async function createCheckout({
   if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
-  const redirectUrl = `${PUBLIC_BASE_URL}/pagbank/return`;
+  const redirectUrlRaw = `${PUBLIC_BASE_URL}/pagbank/return`;
+  const redirect_url = normalizeHttpsUrl(redirectUrlRaw);
+  if (!redirect_url) throw new Error('invalid redirect_url');
 
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
   const selected = methods.length ? methods : ['PIX', 'CREDIT_CARD'];
 
-  const webhookUrl = normalizeWebhookUrl(process.env.PAGBANK_WEBHOOK_URL);
+  const webhookUrl = normalizeHttpsUrl(process.env.PAGBANK_WEBHOOK_URL);
 
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
@@ -53,9 +63,7 @@ async function createCheckout({
         unit_amount: valueNum,
       },
     ],
-    checkout: {
-      redirect_url: redirectUrl,
-    },
+    checkout: { redirect_url },
     payment_methods: selected.map((t) => ({ type: t })),
     payment_methods_configs: selected.includes('CREDIT_CARD')
       ? [
@@ -192,10 +200,7 @@ async function processWebhook(p, meta = {}) {
 
       if (record) {
         const { request_id: requestId, product_type: productType } = record;
-        logger.info(`[PagBank] Payment confirmed — requestId=${requestId} productType=${productType}`);
         events.emit('payment:paid', { requestId, productType, chargeId, checkoutId, raw: p });
-      } else {
-        logger.warn('[PagBank] PAID with no resolved context (neither chargeId nor checkoutId matched). Check webhook data.');
       }
     }
 
