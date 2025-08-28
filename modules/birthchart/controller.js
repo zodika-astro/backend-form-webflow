@@ -1,4 +1,5 @@
 // modules/birthchart/controller.js
+
 const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
 const { getTimezoneAtMoment } = require('../../utils/timezone');
@@ -7,12 +8,9 @@ const pagbankService = require('../../payments/pagBank/service');
 async function processForm(req, res, next) {
   try {
     const payload = req.body;
-
-    // 1) Validação do payload
     validateBirthchartPayload(payload);
 
-    // 2) (Opcional) Calcular timezone no momento do nascimento
-    //    Se faltar algo (sem lat/lng ou sem API key), a função já devolve { tzId: null, offsetMin: null }
+    // Timezone 
     const { tzId, offsetMin } = await getTimezoneAtMoment({
       lat: Number(payload.birth_place_lat),
       lng: Number(payload.birth_place_lng),
@@ -22,7 +20,7 @@ async function processForm(req, res, next) {
     });
     console.log('[DEBUG TZ]', { tzId, offsetMin });
 
-    // 3) Inserir a request no banco (incluindo os campos novos de local e timezone)
+    // Repository
     const newRequest = await createBirthchartRequest({
       name:                 payload.name,
       social_name:          payload.social_name,
@@ -45,19 +43,46 @@ async function processForm(req, res, next) {
       birth_utc_offset_min: offsetMin,
     });
 
-    // 4) Opções de pagamento e criação do checkout no PagBank
-    const paymentOptions = { allow_pix: true, allow_card: true, max_installments: 1 };
+    // Product
+    const product = {
+      productType:  newRequest.product_type, 
+      productName:  'MAPA NATAL ZODIKA',
+      priceCents:   3500,
+      currency:     'BRL',
+      payment: {
+        allow_pix: true,
+        allow_card: true,
+        max_installments: 1,
+      },
+      
+      returnUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${newRequest.request_id}`,
+    
+      metadata: {
+        source: 'webflow',
+        product_version: 'v1',
+      },
+    };
 
+    // Checkout
     const paymentResponse = await pagbankService.createCheckout({
-      requestId: newRequest.request_id,
-      name: newRequest.name,
-      email: newRequest.email,
-      productType: newRequest.product_type,
-      productValue: 3500, // R$ 35,00 em centavos
-      paymentOptions,
+      requestId:    newRequest.request_id,
+      name:         newRequest.name,
+      email:        newRequest.email,
+      productType:  product.productType,
+      productName:  product.productName,
+      productValue: product.priceCents,
+      paymentOptions: {
+        allow_pix:        product.payment.allow_pix,
+        allow_card:       product.payment.allow_card,
+        max_installments: product.payment.max_installments,
+      },
+      // extra
+      currency:   product.currency,
+      returnUrl:  product.returnUrl,
+      metadata:   product.metadata,
     });
 
-    // 5) Resposta para o front
+    // frontend
     return res.status(200).json({ url: paymentResponse.url });
   } catch (error) {
     return next(error);
