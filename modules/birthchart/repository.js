@@ -10,15 +10,17 @@ async function createBirthchartRequest(requestData) {
     birth_timezone_id, birth_utc_offset_min
   } = requestData;
 
-  // Normalizações de tipo vindas do formulário (strings -> número/JSON)
+ 
   const lat = (birth_place_lat !== undefined && birth_place_lat !== null && String(birth_place_lat).trim() !== '')
     ? Number(birth_place_lat) : null;
+  
   const lng = (birth_place_lng !== undefined && birth_place_lng !== null && String(birth_place_lng).trim() !== '')
     ? Number(birth_place_lng) : null;
+  
   const rawJson = (birth_place_json && String(birth_place_json).trim() !== '')
     ? JSON.parse(birth_place_json) : null;
 
-  // 🔥 IMPORTANTE: 17 colunas e 17 placeholders/valores, na mesma ordem
+  
   const query = `
     INSERT INTO zodika_requests (
       name,                 -- 1
@@ -68,7 +70,7 @@ async function createBirthchartRequest(requestData) {
     birth_time,
     birth_place,
     product_type,
-    birth_place_place_id,         // se sua coluna estiver NOT NULL, não pode ser undefined
+    birth_place_place_id,
     birth_place_full || null,
     birth_place_country || null,
     birth_place_admin1 || null,
