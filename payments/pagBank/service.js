@@ -11,7 +11,13 @@ const { mapWebhookPayload } = require('./mapPayload');
 
 const events = new EventEmitter();
 
-const isHttpsUrl = (u) => typeof u === 'string' && /^https:\/\/[^\s<>]+$/i.test(u);
+const normalizeWebhookUrl = (u) => {
+  if (!u) return null;
+  let s = String(u).trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
+  s = s.replace(/[;\s]+$/g, '');
+  return /^https:\/\/[^\s<>"]+$/i.test(s) ? s : null;
+};
 
 async function createCheckout({
   requestId,
@@ -26,9 +32,7 @@ async function createCheckout({
   if (!requestId) throw new Error('requestId is required');
 
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) {
-    throw new Error('invalid productValue (cents, integer > 0)');
-  }
+  if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
   const redirectUrl = `${PUBLIC_BASE_URL}/pagbank/return`;
@@ -45,21 +49,23 @@ async function createCheckout({
 
   if (selected.includes('CREDIT_CARD')) {
     checkout.payment_methods_configs = [
-      { type: 'CREDIT_CARD', config_options: [{ option: 'INSTALLMENTS_LIMIT', value: 1 }] },
+      { type: 'CREDIT_CARD', config_options: [{ option: 'INSTALLMENTS_LIMIT', value: '1' }] },
     ];
   }
 
-  const webhookUrl = process.env.PAGBANK_WEBHOOK_URL;
+  const webhookUrl = normalizeWebhookUrl(process.env.PAGBANK_WEBHOOK_URL);
 
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
-    items: [{
-      name: productName || productType || 'Produto',
-      quantity: 1,
-      unit_amount: valueNum,
-    }],
+    items: [
+      {
+        name: productName || productType || 'Produto',
+        quantity: 1,
+        unit_amount: valueNum,
+      },
+    ],
     checkout,
-    ...(isHttpsUrl(webhookUrl) ? { payment_notification_urls: [webhookUrl] } : {}),
+    ...(webhookUrl ? { payment_notification_urls: [webhookUrl] } : {}),
     ...(name && email ? { customer: { name, email } } : {}),
   }));
 
@@ -95,7 +101,7 @@ async function createCheckout({
       status: data?.status || 'CREATED',
       value: valueNum,
       link: payLink,
-      customer: (name && email) ? { name, email } : null,
+      customer: name && email ? { name, email } : null,
       raw: data,
     });
 
@@ -121,10 +127,14 @@ async function createCheckout({
         status: e.response.status,
         url: e.config?.url,
         data: e.response.data,
-        data_str: (() => { try { return JSON.stringify(e.response.data); } catch { return String(e.response.data); } })(),
+        data_str: (() => {
+          try { return JSON.stringify(e.response.data); } catch { return String(e.response.data); }
+        })(),
         headers: e.response.headers,
         sent: e.config?.data,
-        sent_str: (() => { try { return JSON.stringify(e.config?.data); } catch { return String(e.config?.data); } })(),
+        sent_str: (() => {
+          try { return JSON.stringify(e.config?.data); } catch { return String(e.config?.data); }
+        })(),
       });
     } else {
       logger.error('[PagBank][ERR-NETWORK]', e.message);
@@ -177,7 +187,6 @@ async function processWebhook(p, meta = {}) {
       if (record) {
         const { request_id: requestId, product_type: productType } = record;
         logger.info(`[PagBank] Payment confirmed — requestId=${requestId} productType=${productType}`);
-
         events.emit('payment:paid', { requestId, productType, chargeId, checkoutId, raw: p });
       } else {
         logger.warn('[PagBank] PAID with no resolved context (neither chargeId nor checkoutId matched). Check webhook data.');
