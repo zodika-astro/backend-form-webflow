@@ -3,43 +3,48 @@
 const httpClient = require('../../utils/httpClient');
 const logger = require('../../utils/logger');
 const crypto = require('crypto');
+const EventEmitter = require('events');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 const { env } = require('../../config/env');
 const pagbankRepository = require('./repository');
+const { mapWebhookPayload } = require('./mapPayload');
+
+// Event emitter to decouple product delivery
+// Ex.: in another module: pagbankService.events.on('payment:paid', ({ requestId, productType, ... }) => { ... })
+
+const events = new EventEmitter();
 
 async function createCheckout({
   requestId,
   name,
   email,
   productType,
-  productValue,
-  productName,
+  productValue,  
+  productName,   
   paymentOptions,
   returnUrl,
   currency
 }) {
-  if (!requestId) throw new Error('requestId é obrigatório');
+  if (!requestId) throw new Error('requestId is required');
 
   const valueNum = Number(productValue);
   if (!Number.isFinite(valueNum) || valueNum <= 0) {
     throw new Error('invalid productValue (cents, integer > 0)');
   }
 
-  // Allowed payment methods
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
 
-  // Redirect URL
   const redirectUrl = returnUrl;
 
-  // Payload
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
     items: [{
-      name: productName || productType || 'Produto', // usa nome do controller
+      name: productName || productType || 'Produto',
       quantity: 1,
       unit_amount: valueNum
+   
     }],
     checkout: {
       redirect_url: redirectUrl,
@@ -62,13 +67,8 @@ async function createCheckout({
     });
 
     const data = res?.data;
-    logger.info('[PagBank][RES]', {
-      status: res?.status,
-      url: res?.config?.url,
-      data,
-    });
+    logger.info('[PagBank][RES]', { status: res?.status, url: res?.config?.url, data });
 
-    // payment link
     let payLink = null;
     if (Array.isArray(data?.links)) {
       payLink =
@@ -78,17 +78,14 @@ async function createCheckout({
     }
     if (!payLink && data?.payment_url) payLink = data.payment_url;
     if (!payLink && data?.checkout?.payment_url) payLink = data.checkout.payment_url;
+    if (!payLink) throw new Error('PAY link not found in PagBank return');
 
-    if (!payLink) {
-      throw new Error('PAY link não encontrado no retorno do PagBank');
-    }
-
-    // Persists the created checkout
+    
     await pagbankRepository.createCheckout({
       request_id: String(requestId),
       product_type: productType,
       checkout_id: data?.id || null,
-      status: data?.status || 'CREATED',
+      status: 'ACTIVE',
       value: valueNum,
       link: payLink,
       customer: (name && email) ? { name, email } : null,
@@ -113,11 +110,10 @@ async function createCheckout({
 
 async function processWebhook(p, meta = {}) {
   try {
-    const { mapWebhookPayload } = require('./mapPayload');
-    const pagbankRepository = require('./repository');
-    const logger = require('../../utils/logger');
-
-    const { eventId, checkoutId, chargeId, referenceId, status, customer } = mapWebhookPayload(p);
+    const {
+      eventId, objectType, checkoutId, chargeId,
+      referenceId, status, customer
+    } = mapWebhookPayload(p);
 
     const logged = await pagbankRepository.logEvent({
       event_uid: eventId,
@@ -126,31 +122,35 @@ async function processWebhook(p, meta = {}) {
       query: meta.query || null,
       topic: meta.topic || null,
       action: meta.action || null,
-      checkout_id: checkoutId,
-      charge_id: chargeId,
+      checkout_id: checkoutId || null,
+      charge_id: chargeId || null,
     });
 
     if (!logged) {
-      logger.info('Duplicate Webhook — Skipping Processing');
-      return { ok: true, duplicate: true };
+
+      logger.info('[PagBank] Duplicate Webhook — continuing idempotent processing');
     }
+
 
     if (checkoutId) {
       await pagbankRepository.updateCheckoutStatusById(checkoutId, status, p);
     }
 
+
     if (chargeId) {
       await pagbankRepository.upsertPaymentByChargeId({
         charge_id: chargeId,
-        checkout_id: checkoutId,
+        checkout_id: checkoutId || null,
         status,
-        request_ref: referenceId,
+        request_ref: referenceId || null,
         customer,
         raw: p,
       });
     }
 
+
     if (status === 'PAID') {
+
       const record = chargeId
         ? await pagbankRepository.findByChargeId(chargeId)
         : checkoutId
@@ -158,17 +158,30 @@ async function processWebhook(p, meta = {}) {
         : null;
 
       if (record) {
-        const { request_id: requestId, product_type: productType } = record;
-        logger.info(`Pagamento confirmado — requestId=${requestId} productType=${productType}`);
+        const {
+          request_id: requestId,
+          product_type: productType
+        } = record;
+
+        logger.info(`[PagBank] Payment confirmed — requestId=${requestId} productType=${productType}`);
+
+        events.emit('payment:paid', {
+          requestId,
+          productType,
+          chargeId,
+          checkoutId,
+          raw: p
+        });
+      } else {
+        logger.warn('[PagBank] PAID with no resolved context (neither chargeId nor checkoutId matched). Check webhook data.');
       }
     }
 
     return { ok: true };
   } catch (err) {
-    const logger = require('../../utils/logger');
-    logger.error('Erro ao processar webhook do PagBank:', err);
+    logger.error('Error processing PagBank webhook:', err);
     return { ok: false, error: 'internal_error' };
   }
 }
 
-module.exports = { createCheckout, processWebhook };
+module.exports = { createCheckout, processWebhook, events };
