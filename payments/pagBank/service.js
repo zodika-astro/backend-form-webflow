@@ -29,12 +29,31 @@ async function createCheckout({
     throw new Error('invalid productValue (cents, integer > 0)');
   }
 
+  
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
   const redirectUrl = `${PUBLIC_BASE_URL}/pagbank/return`;
 
+  
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
+
+  
+  const selected = (methods.length ? methods : ['PIX', 'CREDIT_CARD']);
+  const checkout = {
+    redirect_url: redirectUrl,
+    payment_methods: selected.map(t => ({ type: t })), // objetos, não strings
+  };
+
+  
+  if (selected.includes('CREDIT_CARD')) {
+    checkout.payment_methods_configs = [
+      {
+        type: 'CREDIT_CARD',
+        config_options: [{ option: 'INSTALLMENTS_LIMIT', value: '1' }],
+      },
+    ];
+  }
 
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
@@ -43,10 +62,9 @@ async function createCheckout({
       quantity: 1,
       unit_amount: valueNum
     }],
-    checkout: {
-      redirect_url: redirectUrl,
-      payment_methods: methods.length ? methods : ['PIX', 'CREDIT_CARD'],
-    },
+    checkout,
+    
+    ...(process.env.PAGBANK_WEBHOOK_URL ? { payment_notification_urls: [process.env.PAGBANK_WEBHOOK_URL] } : {}),
     ...(process.env.PAGBANK_WEBHOOK_URL ? { notification_urls: [process.env.PAGBANK_WEBHOOK_URL] } : {}),
     ...(name && email ? { customer: { name, email } } : {}),
   }));
@@ -76,7 +94,8 @@ async function createCheckout({
     if (!payLink && data?.checkout?.payment_url) payLink = data.checkout.payment_url;
     if (!payLink) throw new Error('PAY link not found in PagBank return');
 
-    await pagbankRepository.createCheckout({
+    
+    const created = await pagbankRepository.createCheckout({
       request_id: String(requestId),
       product_type: productType,
       checkout_id: data?.id || null,
@@ -86,6 +105,22 @@ async function createCheckout({
       customer: (name && email) ? { name, email } : null,
       raw: data,
     });
+
+    
+    try {
+      await pagbankRepository.logEvent({
+        event_uid: `checkout_created_${data?.id || requestId}`,
+        payload: { request_payload: payload, response: data },
+        headers: null,
+        query: null,
+        topic: 'checkout',
+        action: 'CREATED',
+        checkout_id: data?.id || null,
+        charge_id: null,
+      });
+    } catch (logErr) {
+      logger.warn('[PagBank] could not log checkout creation event:', logErr?.message || logErr);
+    }
 
     return { url: payLink, checkoutId: data?.id || null };
   } catch (e) {
