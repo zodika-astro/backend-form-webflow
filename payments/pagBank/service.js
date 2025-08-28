@@ -1,4 +1,5 @@
 // payments/pagBank/service.js
+
 const httpClient = require('../../utils/httpClient');
 const logger = require('../../utils/logger');
 const crypto = require('crypto');
@@ -6,34 +7,44 @@ const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toSt
 const { env } = require('../../config/env');
 const pagbankRepository = require('./repository');
 
-// fallback para evitar redirect_url indefinido
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
-
 async function createCheckout({
   requestId,
   name,
   email,
   productType,
   productValue,
+  productName,
   paymentOptions,
+  returnUrl,
+  currency
 }) {
   if (!requestId) throw new Error('requestId é obrigatório');
 
   const valueNum = Number(productValue);
   if (!Number.isFinite(valueNum) || valueNum <= 0) {
-    throw new Error('productValue inválido (centavos, inteiro > 0)');
+    throw new Error('invalid productValue (cents, integer > 0)');
   }
 
+  // Allowed payment methods
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
 
+  // Redirect URL
+  const redirectUrl = returnUrl;
+
+  // Payload
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
-    items: [{ name: productType || 'Produto', quantity: 1, unit_amount: valueNum }],
+    items: [{
+      name: productName || productType || 'Produto', // usa nome do controller
+      quantity: 1,
+      unit_amount: valueNum
+    }],
     checkout: {
-      redirect_url: `${PUBLIC_BASE_URL}/pagBank/return`,
+      redirect_url: redirectUrl,
       payment_methods: methods.length ? methods : ['PIX', 'CREDIT_CARD'],
+      max_installments: Number(paymentOptions?.max_installments) || 1,
     },
     ...(name && email ? { customer: { name, email } } : {}),
   }));
@@ -56,6 +67,7 @@ async function createCheckout({
       data,
     });
 
+    // payment link
     let payLink = null;
     if (Array.isArray(data?.links)) {
       payLink =
@@ -70,9 +82,10 @@ async function createCheckout({
       throw new Error('PAY link não encontrado no retorno do PagBank');
     }
 
+    // Persists the created checkout
     await pagbankRepository.createCheckout({
       request_id: String(requestId),
-      product_type: productType || 'birth_chart',
+      product_type: productType,
       checkout_id: data?.id || null,
       status: data?.status || 'CREATED',
       value: valueNum,
@@ -117,7 +130,7 @@ async function processWebhook(p, meta = {}) {
     });
 
     if (!logged) {
-      logger.info('Webhook duplicado — ignorando processamento');
+      logger.info('Duplicate Webhook — Skipping Processing');
       return { ok: true, duplicate: true };
     }
 
@@ -158,4 +171,3 @@ async function processWebhook(p, meta = {}) {
 }
 
 module.exports = { createCheckout, processWebhook };
-
