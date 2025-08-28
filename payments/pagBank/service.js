@@ -46,6 +46,7 @@ async function createCheckout({
       payment_methods: methods.length ? methods : ['PIX', 'CREDIT_CARD'],
       max_installments: Number(paymentOptions?.max_installments) || 1,
     },
+    notification_urls: [process.env.PAGBANK_WEBHOOK_URL],
     ...(name && email ? { customer: { name, email } } : {}),
   }));
 
