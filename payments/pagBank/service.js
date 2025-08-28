@@ -10,8 +10,6 @@ const pagbankRepository = require('./repository');
 const { mapWebhookPayload } = require('./mapPayload');
 
 // Event emitter to decouple product delivery
-// Ex.: in another module: pagbankService.events.on('payment:paid', ({ requestId, productType, ... }) => { ... })
-
 const events = new EventEmitter();
 
 async function createCheckout({
@@ -19,10 +17,9 @@ async function createCheckout({
   name,
   email,
   productType,
-  productValue,  
-  productName,   
+  productValue,
+  productName,
   paymentOptions,
-  returnUrl,
   currency
 }) {
   if (!requestId) throw new Error('requestId is required');
@@ -32,11 +29,12 @@ async function createCheckout({
     throw new Error('invalid productValue (cents, integer > 0)');
   }
 
+  const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
+  const redirectUrl = `${PUBLIC_BASE_URL}/pagbank/return`;
+
   const methods = [];
   if (paymentOptions?.allow_pix !== false) methods.push('PIX');
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
-
-  const redirectUrl = returnUrl;
 
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
@@ -44,14 +42,12 @@ async function createCheckout({
       name: productName || productType || 'Produto',
       quantity: 1,
       unit_amount: valueNum
-   
     }],
     checkout: {
       redirect_url: redirectUrl,
       payment_methods: methods.length ? methods : ['PIX', 'CREDIT_CARD'],
-      max_installments: Number(paymentOptions?.max_installments) || 1,
     },
-    notification_urls: [process.env.PAGBANK_WEBHOOK_URL],
+    ...(process.env.PAGBANK_WEBHOOK_URL ? { notification_urls: [process.env.PAGBANK_WEBHOOK_URL] } : {}),
     ...(name && email ? { customer: { name, email } } : {}),
   }));
 
@@ -80,12 +76,11 @@ async function createCheckout({
     if (!payLink && data?.checkout?.payment_url) payLink = data.checkout.payment_url;
     if (!payLink) throw new Error('PAY link not found in PagBank return');
 
-    
     await pagbankRepository.createCheckout({
       request_id: String(requestId),
       product_type: productType,
       checkout_id: data?.id || null,
-      status: 'ACTIVE',
+      status: data?.status || 'CREATED',
       value: valueNum,
       link: payLink,
       customer: (name && email) ? { name, email } : null,
@@ -127,15 +122,12 @@ async function processWebhook(p, meta = {}) {
     });
 
     if (!logged) {
-
       logger.info('[PagBank] Duplicate Webhook — continuing idempotent processing');
     }
-
 
     if (checkoutId) {
       await pagbankRepository.updateCheckoutStatusById(checkoutId, status, p);
     }
-
 
     if (chargeId) {
       await pagbankRepository.upsertPaymentByChargeId({
@@ -148,9 +140,7 @@ async function processWebhook(p, meta = {}) {
       });
     }
 
-
     if (status === 'PAID') {
-
       const record = chargeId
         ? await pagbankRepository.findByChargeId(chargeId)
         : checkoutId
@@ -158,11 +148,7 @@ async function processWebhook(p, meta = {}) {
         : null;
 
       if (record) {
-        const {
-          request_id: requestId,
-          product_type: productType
-        } = record;
-
+        const { request_id: requestId, product_type: productType } = record;
         logger.info(`[PagBank] Payment confirmed — requestId=${requestId} productType=${productType}`);
 
         events.emit('payment:paid', {
