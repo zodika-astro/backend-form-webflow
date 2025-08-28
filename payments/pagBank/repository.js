@@ -2,8 +2,7 @@
 const db = require('../../db/db');
 
 /**
- * Cria/atualiza o registro de checkout (pagbank_request).
- * Use quando receber a resposta do POST /checkouts.
+ * Creates/updates the checkout record (pagbank_request).
  */
 async function createCheckout({ request_id, product_type, checkout_id, status, value, link, customer, raw }) {
   const sql = `
@@ -23,8 +22,7 @@ async function createCheckout({ request_id, product_type, checkout_id, status, v
 }
 
 /**
- * Atualiza status do checkout por checkout_id.
- * Use em webhooks de objeto "checkout".
+ * Update checkout status by checkout_id.
  */
 async function updateCheckoutStatusById(checkout_id, status, raw) {
   const sql = `
@@ -41,8 +39,7 @@ async function updateCheckoutStatusById(checkout_id, status, raw) {
 }
 
 /**
- * Log imutável de eventos (pagbank_events).
- * Utilize um event_uid (hash ou id do provedor) para idempotência.
+  * Immutable event log (pagbank_events).
  */
 async function logEvent({ event_uid, payload, headers = null, query = null, topic = null, action = null, checkout_id = null, charge_id = null }) {
   const sql = `
@@ -53,13 +50,11 @@ async function logEvent({ event_uid, payload, headers = null, query = null, topi
   `;
   const values = [event_uid, topic, action, checkout_id, charge_id, headers, query, payload];
   const { rows } = await db.query(sql, values);
-  // Quando houver conflito, RETURNING pode vir vazio — e está tudo bem.
   return rows[0] || null;
 }
 
 /**
- * Upsert do pagamento consolidado por charge_id (pagbank_payments).
- * Também consolida os dados de customer mais recentes.
+ * Upsert of consolidated payment by charge_id (pagbank_payments).
  */
 async function upsertPaymentByChargeId({ charge_id, checkout_id, status, request_ref, customer, raw }) {
   const sql = `
@@ -99,13 +94,17 @@ async function upsertPaymentByChargeId({ charge_id, checkout_id, status, request
 }
 
 /**
- * Busca consolidação por charge_id (une com request para pegar product_type e request_id).
- */
+* Searches for consolidation by charge_id (joins with request to get product_type and request_id).
+* More robust: tries to match by checkout_id OR by request_ref -> request_id.
+*/
 async function findByChargeId(charge_id) {
   const sql = `
-    SELECT p.*, r.request_id, r.product_type
+    SELECT p.*,
+           COALESCE(r1.request_id, r2.request_id) AS request_id,
+           COALESCE(r1.product_type, r2.product_type) AS product_type
       FROM pagbank_payments p
-      LEFT JOIN pagbank_request r ON r.checkout_id = p.checkout_id
+      LEFT JOIN pagbank_request r1 ON r1.checkout_id = p.checkout_id
+      LEFT JOIN pagbank_request r2 ON r2.request_id = p.request_ref
      WHERE p.charge_id = $1
      LIMIT 1;
   `;
@@ -114,7 +113,7 @@ async function findByChargeId(charge_id) {
 }
 
 /**
- * Busca registro de checkout (pagbank_request) por checkout_id.
+ * Search checkout record (pagbank_request) by checkout_id.
  */
 async function findByCheckoutId(checkout_id) {
   const sql = `
@@ -128,7 +127,7 @@ async function findByCheckoutId(checkout_id) {
 }
 
 /**
- * (Opcional, legado do seu fluxo do produto) – mantém se você usa em outros pontos.
+ * Legacy (if used on return).
  */
 async function findBirthchartRequestById(requestId) {
   const sql = 'SELECT * FROM birthchart_requests WHERE request_id = $1';
@@ -143,6 +142,6 @@ module.exports = {
   upsertPaymentByChargeId,
   findByChargeId,
   findByCheckoutId,
-  // legado
+
   findBirthchartRequestById,
 };
