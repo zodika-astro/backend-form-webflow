@@ -4,6 +4,7 @@ const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
 const { getTimezoneAtMoment } = require('../../utils/timezone');
 const pagbankService = require('../../payments/pagBank/service');
+const PRODUCT_IMAGE_URL = 'https://backend-form-webflow-production.up.railway.app/assets/birthchart-productimage.png';
 
 async function processForm(req, res, next) {
   try {
@@ -77,6 +78,7 @@ async function processForm(req, res, next) {
         max_installments: product.payment.max_installments,
       },
       // extra
+      productImageUrl: PRODUCT_IMAGE_URL,
       currency:   product.currency,
       returnUrl:  product.returnUrl,
       metadata:   product.metadata,
