@@ -36,6 +36,7 @@ async function createCheckout({
   productName,
   paymentOptions,
   currency,
+  productImageUrl,
 }) {
   if (!requestId) throw new Error('requestId is required');
 
@@ -53,6 +54,7 @@ async function createCheckout({
   const selected = methods.length ? methods : ['PIX', 'CREDIT_CARD'];
 
   const webhookUrl = normalizeHttpsUrl(process.env.PAGBANK_WEBHOOK_URL);
+  const imageUrl = normalizeHttpsUrl(productImageUrl, { max: 512 }) || normalizeHttpsUrl(process.env.PAGBANK_PRODUCT_IMAGE_URL, { max: 512 });
 
   const payload = JSON.parse(JSON.stringify({
     reference_id: String(requestId),
@@ -62,6 +64,7 @@ async function createCheckout({
         quantity: 1,
         unit_amount: valueNum,
       },
+      if (imageUrl) item.image_url = imageUrl;
     ],
     checkout: { redirect_url },
     payment_methods: selected.map((t) => ({ type: t })),
