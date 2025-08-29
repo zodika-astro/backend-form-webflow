@@ -63,8 +63,8 @@ async function createCheckout({
         name: productName || productType || 'Produto',
         quantity: 1,
         unit_amount: valueNum,
+        ...(imageUrl ? { image_url: imageUrl } : {})
       },
-      if (imageUrl) item.image_url = imageUrl;
     ],
     checkout: { redirect_url },
     payment_methods: selected.map((t) => ({ type: t })),
