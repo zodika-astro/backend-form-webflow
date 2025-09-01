@@ -7,13 +7,6 @@ const logger = require('../../utils/logger');
 
 /**
  * Starts checkout creation in Mercado Pago (dynamic productName).
- * Expected body (example):
- * {
- *   requestId, name, email,
- *   productType, productValue, productName, // productValue in cents
- *   paymentOptions: { allow_pix: true, allow_card: true, max_installments: 1 },
- *   returnUrl, currency
- * }
  */
 async function createCheckout(req, res) {
   try {
@@ -55,7 +48,6 @@ async function handleWebhook(req, res) {
   try {
     const payload = req.body;
 
-    // (Se quiser Zod aqui no futuro, seguimos o mesmo padrão do PagBank)
     const meta = {
       headers: req.headers,
       query: req.query,
@@ -72,25 +64,75 @@ async function handleWebhook(req, res) {
   }
 }
 
+/** Normaliza status vindo no return do MP */
+function normalizeReturnStatus(qs = {}) {
+  const raw =
+    qs.status ||
+    qs.collection_status ||      // MP usa muito este
+    qs.collectionStatus ||
+    '';
+
+  const up = String(raw).trim().toUpperCase();
+
+  if (!up) return 'PENDING'; // ausência de status não é sucesso
+
+  const map = {
+    APPROVED: 'APPROVED',
+    SUCCESS: 'APPROVED',
+    PAID: 'APPROVED',
+
+    PENDING: 'PENDING',
+    IN_PROCESS: 'PENDING',
+    IN_MEDIATION: 'PENDING',
+
+    REJECTED: 'REJECTED',
+    REFUSED: 'REJECTED',
+
+    CANCELLED: 'CANCELED',
+    CANCELED: 'CANCELED',
+
+    REFUNDED: 'REFUNDED',
+    CHARGED_BACK: 'CHARGED_BACK',
+    FAILED: 'FAILED',
+    EXPIRED: 'EXPIRED',
+  };
+
+  return map[up] || 'PENDING';
+}
+
 /**
  * Customer return after checkout.
- * (via back_urls ou manual /return)
+ * (via back_urls do MP)
+ *
+ * Regras:
+ *  - Só redireciona para sucesso se:
+ *     a) status do query == APPROVED, ou
+ *     b) o registro em mp_request (preference_id) já estiver APPROVED.
+ *  - Em qualquer outro caso, redireciona para FAIL com o status conhecido (ou PENDING).
  */
 async function handleReturn(req, res) {
   logger.info('Receiving feedback from customer after Mercado Pago checkout.');
 
   const preferenceId = req.query.preference_id || req.query.preferenceId || null;
-  const status = (req.query.status || '').toUpperCase();
   let requestId = req.query.external_reference || req.query.request_id || req.query.requestId || null;
 
-  const failedStatuses = new Set(['CANCELED', 'FAILED', 'EXPIRED', 'REFUSED', 'REJECTED']);
+  // 1) Tentar inferir status pelo querystring do MP
+  let retStatus = normalizeReturnStatus(req.query); // APPROVED | PENDING | REJECTED | CANCELED | ...
 
   try {
+    // 2) Completar requestId via banco, se não veio no query
     if (!requestId && preferenceId && typeof mpRepository.findByPreferenceId === 'function') {
       const rec = await mpRepository.findByPreferenceId(preferenceId);
       requestId = rec?.request_id || requestId;
+
+      // 3) Se o banco já marcou APPROVED, consideramos sucesso mesmo que o query esteja vazio/ambíguo
+      if (rec?.status && typeof rec.status === 'string') {
+        const dbStatus = rec.status.toUpperCase();
+        if (dbStatus === 'APPROVED') retStatus = 'APPROVED';
+      }
     }
 
+    // 4) Descobrir productType para montar URL final
     let productType = null;
     if (requestId && typeof birthchartRepository.findByRequestId === 'function') {
       const r = await birthchartRepository.findByRequestId(requestId);
@@ -105,23 +147,35 @@ async function handleReturn(req, res) {
         `https://www.zodika.com.br/birthchart-payment-fail?ref=${encodeURIComponent(id || '')}&status=${encodeURIComponent(st || '')}`,
     };
 
-    if (failedStatuses.has(status)) {
+    // 5) Decisão final
+    const isApproved = retStatus === 'APPROVED';
+
+    if (!isApproved) {
+      // Falha, rejeição ou pendência → ir para FAIL (você pode criar uma página "pending" futuramente)
       const failResolver = failUrlByProduct[productType] || failUrlByProduct.birth_chart;
-      const failUrl = failResolver(requestId, status);
-      logger.warn(`Payment failed (status=${status || 'UNKNOWN'}). Redirecting to: ${failUrl}`);
+
+      // Se não temos requestId, mandar para fail genérico
+      if (!requestId) {
+        const genericFail = `https://www.zodika.com.br/payment-fail`;
+        logger.warn(`[MP][return] Non-approved status (${retStatus}) and no requestId. Redirecting to generic fail: ${genericFail}`);
+        return res.redirect(genericFail);
+      }
+
+      const failUrl = failResolver(requestId, retStatus);
+      logger.warn(`[MP][return] Non-approved status (${retStatus}). Redirecting to: ${failUrl}`);
       return res.redirect(failUrl);
     }
 
+    // Sucesso
     if (!requestId) {
-      const genericFail = `https://www.zodika.com.br/payment-fail`;
-      logger.warn('Returns no requestId — redirecting to generic failure.');
-      return res.redirect(genericFail);
+      const genericSuccess = `https://www.zodika.com.br/payment-success`; // fallback raro
+      logger.info(`[MP][return] Approved but no requestId. Redirecting to generic success: ${genericSuccess}`);
+      return res.redirect(genericSuccess);
     }
 
     const successResolver = successUrlByProduct[productType] || successUrlByProduct.birth_chart;
     const finalUrl = successResolver(requestId);
-
-    logger.info(`Redirecting client to success URL: ${finalUrl}`);
+    logger.info(`[MP][return] Redirecting client to success URL: ${finalUrl}`);
     return res.redirect(finalUrl);
   } catch (err) {
     logger.error('[MP] Error assembling redirect URL:', err);
