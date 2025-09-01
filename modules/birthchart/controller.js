@@ -3,7 +3,10 @@
 const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
 const { getTimezoneAtMoment } = require('../../utils/timezone');
-const pagbankService = require('../../payments/pagBank/service');
+
+// 🔁 Troca PagBank -> Mercado Pago
+const mpService = require('../../payments/mercadoPago/service');
+
 const PRODUCT_IMAGE_URL = 'https://backend-form-webflow-production.up.railway.app/assets/birthchart-productimage.png';
 
 async function processForm(req, res, next) {
@@ -11,7 +14,7 @@ async function processForm(req, res, next) {
     const payload = req.body;
     validateBirthchartPayload(payload);
 
-    // Timezone 
+    // Timezone
     const { tzId, offsetMin } = await getTimezoneAtMoment({
       lat: Number(payload.birth_place_lat),
       lng: Number(payload.birth_place_lng),
@@ -46,7 +49,7 @@ async function processForm(req, res, next) {
 
     // Product
     const product = {
-      productType:  newRequest.product_type, 
+      productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
       priceCents:   3500,
       currency:     'BRL',
@@ -55,17 +58,16 @@ async function processForm(req, res, next) {
         allow_card: true,
         max_installments: 1,
       },
-      
+      // Usado nas back_urls do MP (success)
       returnUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${newRequest.request_id}`,
-    
       metadata: {
         source: 'webflow',
         product_version: 'v1',
       },
     };
 
-    // Checkout
-    const paymentResponse = await pagbankService.createCheckout({
+    // ✅ Checkout (Mercado Pago)
+    const paymentResponse = await mpService.createCheckout({
       requestId:    newRequest.request_id,
       name:         newRequest.name,
       email:        newRequest.email,
@@ -84,7 +86,7 @@ async function processForm(req, res, next) {
       metadata:   product.metadata,
     });
 
-    // frontend
+    // Frontend (mantém o mesmo contrato do PagBank)
     return res.status(200).json({ url: paymentResponse.url });
   } catch (error) {
     return next(error);
