@@ -1,9 +1,11 @@
 // payments/mercadoPago/repository.js
+
 const db = require('../../db/db');
 
 /**
  * Creates/updates the checkout record (mp_request).
  */
+
 async function createCheckout({
   request_id,
   product_type,
@@ -57,7 +59,7 @@ async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
 }
 
 /**
- * NEW: Update checkout status by request_id (fallback quando não há preference_id).
+ * Update checkout status by request_id.
  */
 async function updateRequestStatusByRequestId(request_id, status, raw) {
   const sql = `
@@ -73,14 +75,12 @@ async function updateRequestStatusByRequestId(request_id, status, raw) {
   return rows[0] || null;
 }
 
-/** Busca mp_request por preference_id */
 async function findByPreferenceId(preference_id) {
   const sql = `SELECT * FROM mp_request WHERE preference_id = $1 LIMIT 1;`;
   const { rows } = await db.query(sql, [preference_id]);
   return rows[0] || null;
 }
 
-/** NEW: Busca mp_request por request_id (external_reference) */
 async function findByRequestId(request_id) {
   const sql = `SELECT * FROM mp_request WHERE request_id = $1 LIMIT 1;`;
   const { rows } = await db.query(sql, [request_id]);
@@ -134,19 +134,17 @@ async function upsertPaymentByPaymentId({
   raw,
 }) {
   const sql = `
-    INSERT INTO mp_payments
-      (payment_id, preference_id, status, status_detail, external_reference,
-       customer_name, customer_email, customer_tax_id,
+    INSERT INTO mp_payments (payment_id, preference_id, status, status_detail, external_reference, customer_name, customer_email, customer_tax_id,
        customer_phone_country, customer_phone_area, customer_phone_number,
-       customer_address_json, transaction_amount, raw)
+       customer_address_json, transaction_amount, date_created, date_approved, date_last_updated, raw)
     VALUES
       ($1,$2,$3,$4,$5,
        $6,$7,$8,
-       $9,$10,$11,
-       $12,$13,$14)
-    ON CONFLICT (payment_id) DO UPDATE
-      SET status                 = EXCLUDED.status,
-          status_detail          = EXCLUDED.status_detail,
+       $9,$10,$11,$12,$13,$14,$15,$16,$17)
+    ON CONFLICT (payment_id) DO UPDATE SET status = EXCLUDED.status, status_detail = EXCLUDED.status_detail,
+          date_created = COALESCE(EXCLUDED.date_created, mp_payments.date_created),
+          date_approved = COALESCE(EXCLUDED.date_approved, mp_payments.date_approved),
+          date_last_updated = COALESCE(EXCLUDED.date_last_updated, mp_payments.date_last_updated),
           preference_id          = COALESCE(EXCLUDED.preference_id, mp_payments.preference_id),
           external_reference     = COALESCE(EXCLUDED.external_reference, mp_payments.external_reference),
           customer_name          = COALESCE(EXCLUDED.customer_name, mp_payments.customer_name),
@@ -184,7 +182,6 @@ async function upsertPaymentByPaymentId({
   return rows[0];
 }
 
-/** Busca consolidado por payment_id juntando request (por preference_id OU external_reference->request_id) */
 async function findByPaymentId(payment_id) {
   const sql = `
     SELECT p.*,
@@ -200,7 +197,6 @@ async function findByPaymentId(payment_id) {
   return rows[0] || null;
 }
 
-/** NEW: anexa preference_id ao pagamento já inserido (consistência futura) */
 async function attachPaymentToPreference(payment_id, preference_id) {
   const sql = `
     UPDATE mp_payments
@@ -216,11 +212,11 @@ async function attachPaymentToPreference(payment_id, preference_id) {
 module.exports = {
   createCheckout,
   updateRequestStatusByPreferenceId,
-  updateRequestStatusByRequestId,   // NEW
+  updateRequestStatusByRequestId,
   findByPreferenceId,
-  findByRequestId,                  // NEW
+  findByRequestId,
   logEvent,
   upsertPaymentByPaymentId,
   findByPaymentId,
-  attachPaymentToPreference,        // NEW
+  attachPaymentToPreference,
 };
