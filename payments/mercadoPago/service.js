@@ -1,29 +1,17 @@
 // payments/mercadoPago/service.js
 
-const axios = require('axios');
+const httpClient = require('../../utils/httpClient');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const logger = require('../../utils/logger');
 const { env } = require('../../config/env');
-const mpRepository = require('./repository'); // precisa ter métodos análogos ao pagbankRepository
-//   - createCheckout({ request_id, product_type, preference_id, status, value, link, customer, raw })
-//   - logEvent({ event_uid, payload, headers, query, topic, action, preference_id, payment_id })
-//   - updateRequestStatusByPreferenceId(preference_id, status, raw)
-//   - upsertPaymentByPaymentId({...})
-//   - findByPaymentId(payment_id)
-//   - findByPreferenceId(preference_id)
+const mpRepository = require('./repository');
 
 const events = new EventEmitter();
 const uuid = () =>
   (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
-/** Axios cliente Mercado Pago */
-const mpClient = axios.create({
-  baseURL: 'https://api.mercadopago.com',
-  timeout: 20000,
-});
-
-/** Helpers de URL (mesmos do PagBank para manter consistência) */
+/** Helpers de URL (mesmos do PagBank) */
 const stripQuotesAndSemicolons = (u) => {
   if (!u) return null;
   let s = String(u).trim();
@@ -40,7 +28,7 @@ const normalizeHttpsUrl = (u, { max = 255 } = {}) => {
   return s;
 };
 
-/** Mapeamento simples de status MP -> status interno do seu mp_request */
+/** Status do request (mp_request) derivado do status do payment */
 const mapPreferenceStatusFromPayment = (paymentStatus) => {
   switch ((paymentStatus || '').toLowerCase()) {
     case 'approved':
@@ -54,7 +42,8 @@ const mapPreferenceStatusFromPayment = (paymentStatus) => {
     case 'charged_back':
       return 'REFUNDED';
     case 'cancelled':
-      return 'CANCELLED';
+    case 'canceled':
+      return 'CANCELED';
     default:
       return 'UPDATED';
   }
@@ -68,11 +57,11 @@ async function createCheckout({
   productType,
   productValue,
   productName,
-  paymentOptions,
+  paymentOptions, // ignorado pelo MP, mantido por compatibilidade
   currency,
   productImageUrl,
-  returnUrl,     // opcional (para sua página de sucesso)
-  metadata = {}, // opcional
+  returnUrl,
+  metadata = {},
 }) {
   if (!requestId) throw new Error('requestId is required');
 
@@ -85,22 +74,19 @@ async function createCheckout({
     process.env.PUBLIC_BASE_URL ||
     'https://backend-form-webflow-production.up.railway.app';
 
-  // back_urls do MP são opcionais; se não vier returnUrl, usamos uma genérica
   const success = normalizeHttpsUrl(returnUrl) ||
     normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
   const failure = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/failure`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
 
   const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
-  const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) ||
-    null;
+  const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
 
-  // MP trabalha com valores em reais (ex.: 35.00). Como você usa "cents",
-  // convertemos: 3500 -> 35.00
+  // 3500 (cents) -> 35.00
   const amount = Math.round(valueNum) / 100;
 
   const preferencePayload = {
-    external_reference: String(requestId),      // seu request_ref
+    external_reference: String(requestId),
     items: [
       {
         title: productName || productType || 'Produto',
@@ -111,34 +97,34 @@ async function createCheckout({
       },
     ],
     payer: (name || email) ? { name, email } : undefined,
-    back_urls: (success && failure && pending)
-      ? { success, failure, pending }
-      : undefined,
-    auto_return: success ? 'approved' : undefined, // retorna para success quando aprovado
+    back_urls: (success && failure && pending) ? { success, failure, pending } : undefined,
+    auto_return: success ? 'approved' : undefined,
     notification_url: notification_url || undefined,
     metadata: { source: 'backend', ...metadata },
   };
 
   try {
-    const res = await mpClient.post('/checkout/preferences', preferencePayload, {
-      headers: {
-        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'X-Idempotency-Key': uuid(),
-      },
-    });
+    const res = await httpClient.post(
+      'https://api.mercadopago.com/checkout/preferences',
+      preferencePayload,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-Idempotency-Key': uuid(),
+        },
+        timeout: 20000,
+      }
+    );
 
     const data = res?.data;
     logger.info('[MP][RES create preference]', { status: res?.status, data });
 
     const preferenceId = data?.id || null;
     const initPoint = data?.init_point || data?.sandbox_init_point || null;
-    if (!initPoint) {
-      throw new Error('init_point not found in Mercado Pago response');
-    }
+    if (!initPoint) throw new Error('init_point not found in Mercado Pago response');
 
-    // grava em mp_request
     await mpRepository.createCheckout({
       request_id: String(requestId),
       product_type: productType,
@@ -150,7 +136,6 @@ async function createCheckout({
       raw: data,
     });
 
-    // log no mp_events
     try {
       await mpRepository.logEvent({
         event_uid: `preference_created_${preferenceId || requestId}`,
@@ -182,21 +167,20 @@ async function createCheckout({
   }
 }
 
-/**
- * Resolve e carrega detalhes de pagamento no MP.
- * É usado para processar webhooks de topic/type "payment".
- */
+/** Busca detalhes do pagamento */
 async function fetchPayment(paymentId) {
   if (!paymentId) return null;
-
   try {
-    const res = await mpClient.get(`/v1/payments/${paymentId}`, {
-      headers: {
-        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
-        Accept: 'application/json',
-      },
-      timeout: 15000,
-    });
+    const res = await httpClient.get(
+      `https://api.mercadopago.com/v1/payments/${paymentId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+          Accept: 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
     return res?.data || null;
   } catch (e) {
     const status = e?.response?.status;
@@ -205,36 +189,21 @@ async function fetchPayment(paymentId) {
   }
 }
 
-/**
- * Processa webhook do Mercado Pago:
- * - salva em mp_events (auditoria)
- * - quando for payment, carrega detalhes e faz upsert em mp_payments
- * - atualiza status do mp_request pela preference_id
- * - emite "payment:paid" quando approved
- */
+/** Processa webhook: loga, consolida pagamento e atualiza request */
 async function processWebhook(body, meta = {}) {
   try {
-    // Estruturas típicas do MP:
-    // 1) { "type": "payment", "data": { "id": "123" } }
-    // 2) { "action": "payment.created", "data": { "id": "123" } } (outras variações)
-    // 3) Querystring às vezes contém ?type=payment&id=123
-    const type = meta?.query?.type || body?.type || null;
+    // Aceitar tanto ?type=payment ou ?topic=payment, quanto body.type/action
+    const type = meta?.query?.type || meta?.query?.topic || meta?.topic || body?.type || null;
     const action = body?.action || null;
-    const dataId = meta?.query?.id || body?.data?.id || null;
+    const dataId = meta?.query?.id || body?.data?.id || body?.id || null;
+    const topic = (type || (action ? action.split('.')[0] : '') || '').toLowerCase();
 
-    // Heurísticas específicas
-    const topic = type || (action ? action.split('.')[0] : null); // "payment", "merchant_order", etc.
-
-    // Para criar um "uid" idempotente do evento
     const providerEventUid =
       (meta?.headers && (meta.headers['x-request-id'] || meta.headers['x-correlation-id'])) ||
       `${topic || 'event'}_${dataId || uuid()}_${Date.now()}`;
 
-    // Extra (quando o MP envia já o payment no corpo — menos comum)
-    const hintedPaymentId =
-      dataId || body?.id || body?.payment_id || null;
+    const hintedPaymentId = dataId || body?.payment_id || null;
 
-    // Log do evento cru
     await mpRepository.logEvent({
       event_uid: providerEventUid,
       payload: body,
@@ -246,15 +215,13 @@ async function processWebhook(body, meta = {}) {
       payment_id: hintedPaymentId || null,
     });
 
-    // Processamento por tipo
-    if ((topic || '').toLowerCase() === 'payment' && hintedPaymentId) {
+    if (topic === 'payment' && hintedPaymentId) {
       const payment = await fetchPayment(hintedPaymentId);
       if (!payment) return { ok: true, note: 'payment details not found' };
 
-      // Campos úteis do pagamento
       const payment_id = String(payment.id);
-      const status = payment.status;                 // approved|pending|rejected|refunded|cancelled|in_process
-      const status_detail = payment.status_detail;   // accredited, cc_rejected_*, etc.
+      const status = payment.status;               // approved|pending|rejected|refunded|cancelled|in_process
+      const status_detail = payment.status_detail; // accredited, cc_rejected_*, etc.
       const external_reference = payment.external_reference || null;
       const preference_id = payment.preference_id || null;
       const amount = Number(payment.transaction_amount || 0);
@@ -262,7 +229,6 @@ async function processWebhook(body, meta = {}) {
       const payer = payment.payer || {};
       const billing = payment.additional_info?.payer?.address || null;
 
-      // upsert em mp_payments
       await mpRepository.upsertPaymentByPaymentId({
         payment_id,
         preference_id,
@@ -273,7 +239,7 @@ async function processWebhook(body, meta = {}) {
           name: payer?.first_name || payer?.name || null,
           email: payer?.email || null,
           tax_id: payer?.identification?.number || null,
-          phone_country: payer?.phone?.area_code ? null : null, // MP não separa DDI/DDD de forma padrão aqui
+          phone_country: null,
           phone_area: null,
           phone_number: payer?.phone?.number || null,
           address_json: billing ? billing : null,
@@ -282,15 +248,12 @@ async function processWebhook(body, meta = {}) {
         raw: payment,
       });
 
-      // atualiza mp_request pelo preference_id (quando existir)
       if (preference_id) {
         const reqStatus = mapPreferenceStatusFromPayment(status);
         await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
       }
 
-      // evento de aprovação
       if ((status || '').toLowerCase() === 'approved') {
-        // tentar resgatar o request para emitir contexto
         const record = (payment_id
           ? await mpRepository.findByPaymentId(payment_id)
           : preference_id
@@ -310,7 +273,6 @@ async function processWebhook(body, meta = {}) {
       }
     }
 
-    // Você pode adicionar o ramo "merchant_order" futuramente se precisar.
     return { ok: true };
   } catch (err) {
     logger.error('[MP] Error processing webhook:', err?.message || err);
@@ -319,4 +281,3 @@ async function processWebhook(body, meta = {}) {
 }
 
 module.exports = { createCheckout, processWebhook, events };
-
