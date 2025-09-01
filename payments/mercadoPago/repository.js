@@ -1,10 +1,8 @@
 // payments/mercadoPago/repository.js
-
 const db = require('../../db/db');
 
 /**
  * Creates/updates the checkout record (mp_request).
- * Equivalente ao pagbank_request.createCheckout
  */
 async function createCheckout({
   request_id,
@@ -43,7 +41,6 @@ async function createCheckout({
 
 /**
  * Update checkout status by preference_id (mp_request).
- * Equivalente ao updateCheckoutStatusById do PagBank
  */
 async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
   const sql = `
@@ -56,12 +53,42 @@ async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
   `;
   const values = [preference_id, status, raw || null];
   const { rows } = await db.query(sql, values);
-  return rows[0];
+  return rows[0] || null;
+}
+
+/**
+ * NEW: Update checkout status by request_id (fallback quando não há preference_id).
+ */
+async function updateRequestStatusByRequestId(request_id, status, raw) {
+  const sql = `
+    UPDATE mp_request
+       SET status = $2,
+           raw    = COALESCE(raw, '{}'::jsonb) || $3::jsonb,
+           updated_at = NOW()
+     WHERE request_id = $1
+    RETURNING *;
+  `;
+  const values = [request_id, status, raw ? JSON.stringify(raw) : JSON.stringify({})];
+  const { rows } = await db.query(sql, values);
+  return rows[0] || null;
+}
+
+/** Busca mp_request por preference_id */
+async function findByPreferenceId(preference_id) {
+  const sql = `SELECT * FROM mp_request WHERE preference_id = $1 LIMIT 1;`;
+  const { rows } = await db.query(sql, [preference_id]);
+  return rows[0] || null;
+}
+
+/** NEW: Busca mp_request por request_id (external_reference) */
+async function findByRequestId(request_id) {
+  const sql = `SELECT * FROM mp_request WHERE request_id = $1 LIMIT 1;`;
+  const { rows } = await db.query(sql, [request_id]);
+  return rows[0] || null;
 }
 
 /**
  * Immutable event log (mp_events).
- * Equivalente ao pagbank_events.logEvent
  */
 async function logEvent({
   event_uid,
@@ -90,12 +117,11 @@ async function logEvent({
     payload,
   ];
   const { rows } = await db.query(sql, values);
-  return rows[0] || null; // null => duplicado (idempotência ok)
+  return rows[0] || null;
 }
 
 /**
  * Upsert of consolidated payment by payment_id (mp_payments).
- * Equivalente ao upsertPaymentByChargeId do PagBank
  */
 async function upsertPaymentByPaymentId({
   payment_id,
@@ -158,16 +184,11 @@ async function upsertPaymentByPaymentId({
   return rows[0];
 }
 
-/**
- * Busca consolidado por payment_id juntando request
- * (equivalente ao findByChargeId do PagBank, com os dois caminhos de join)
- * - join 1: mp_payments.preference_id -> mp_request.preference_id
- * - join 2: mp_payments.external_reference -> mp_request.request_id
- */
+/** Busca consolidado por payment_id juntando request (por preference_id OU external_reference->request_id) */
 async function findByPaymentId(payment_id) {
   const sql = `
     SELECT p.*,
-           COALESCE(r1.request_id, r2.request_id)   AS request_id,
+           COALESCE(r1.request_id, r2.request_id)     AS request_id,
            COALESCE(r1.product_type, r2.product_type) AS product_type
       FROM mp_payments p
       LEFT JOIN mp_request r1 ON r1.preference_id = p.preference_id
@@ -179,25 +200,27 @@ async function findByPaymentId(payment_id) {
   return rows[0] || null;
 }
 
-/**
- * Busca mp_request por preference_id (usado pelo service ao atualizar status)
- */
-async function findByPreferenceId(preference_id) {
+/** NEW: anexa preference_id ao pagamento já inserido (consistência futura) */
+async function attachPaymentToPreference(payment_id, preference_id) {
   const sql = `
-    SELECT *
-      FROM mp_request
-     WHERE preference_id = $1
-     LIMIT 1;
+    UPDATE mp_payments
+       SET preference_id = $2,
+           updated_at = NOW()
+     WHERE payment_id = $1
+    RETURNING *;
   `;
-  const { rows } = await db.query(sql, [preference_id]);
+  const { rows } = await db.query(sql, [payment_id, preference_id]);
   return rows[0] || null;
 }
 
 module.exports = {
   createCheckout,
   updateRequestStatusByPreferenceId,
+  updateRequestStatusByRequestId,   // NEW
+  findByPreferenceId,
+  findByRequestId,                  // NEW
   logEvent,
   upsertPaymentByPaymentId,
   findByPaymentId,
-  findByPreferenceId,
+  attachPaymentToPreference,        // NEW
 };
