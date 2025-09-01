@@ -52,8 +52,9 @@ async function createCheckout({
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
-  const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
-  const failure = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/failure`);
+  const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
+const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
+  const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
 
   const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
@@ -61,7 +62,22 @@ async function createCheckout({
 
   const amount = Math.round(valueNum) / 100;
 
-  const preferencePayload = {
+  // Map per-product payment options into Mercado Pago preference
+  const allowPix  = !!(paymentOptions && paymentOptions.allow_pix);
+  const allowCard = !!(paymentOptions && paymentOptions.allow_card);
+  const maxInst   = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
+  const excluded_payment_types = [{ id: 'ticket' }]; // block boleto
+  if (!allowCard) excluded_payment_types.push({ id: 'credit_card' });
+  const excluded_payment_methods = [];
+  if (!allowPix) excluded_payment_methods.push({ id: 'pix' });
+  const payment_methods = {
+    excluded_payment_types,
+    excluded_payment_methods,
+    installments: maxInst,
+    default_installments: Math.min(Math.max(1, maxInst), 12),
+  };
+
+const preferencePayload = {
     external_reference: String(requestId),
     items: [{
       title: productName || productType || 'Produto',
@@ -123,7 +139,6 @@ async function createCheckout({
   return { url: initPoint, preferenceId };
 }
 
-/** Busca detalhes do pagamento */
 async function fetchPayment(paymentId) {
   if (!paymentId) return null;
   try {
@@ -141,7 +156,6 @@ async function fetchPayment(paymentId) {
   }
 }
 
-/** Processa webhook: loga, consolida pagamento e atualiza request (com fallback por request_id) */
 async function processWebhook(body, meta = {}) {
   try {
     const type = meta?.query?.type || meta?.query?.topic || meta?.topic || body?.type || null;
@@ -180,7 +194,7 @@ async function processWebhook(body, meta = {}) {
       const payer = payment.payer || {};
       const billing = payment.additional_info?.payer?.address || null;
 
-      // upsert pagamento
+      // upsert payment
       await mpRepository.upsertPaymentByPaymentId({
         payment_id,
         preference_id,
@@ -200,9 +214,6 @@ async function processWebhook(body, meta = {}) {
         raw: payment,
       });
 
-      // 🔁 Atualiza mp_request.status:
-      // 1) se tiver preference_id, atualiza por ele
-      // 2) senão, tenta por external_reference (request_id)
       const reqStatus = mapPreferenceStatusFromPayment(status);
 
       let updatedReq = null;
@@ -210,14 +221,12 @@ async function processWebhook(body, meta = {}) {
         updatedReq = await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
       } else if (external_reference) {
         updatedReq = await mpRepository.updateRequestStatusByRequestId(external_reference, reqStatus, payment);
-        // se achou o request, e ele tem preference_id, anexar no pagamento p/ consistência
         if (updatedReq?.preference_id) {
           preference_id = updatedReq.preference_id;
           await mpRepository.attachPaymentToPreference(payment_id, preference_id);
         }
       }
 
-      // ✅ evento de aprovação
       if ((status || '').toLowerCase() === 'approved') {
         const record = (payment_id
           ? await mpRepository.findByPaymentId(payment_id)
