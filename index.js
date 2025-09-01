@@ -20,7 +20,7 @@ const pagbankWebhookRouter  = require('./payments/pagBank/router.webhook');
 const pagbankReturnRouter   = require('./payments/pagBank/router.return.js');
 const pagbankController     = require('./payments/pagBank/controller');
 
-// ✅ Mercado Pago
+// Mercado Pago
 const mpWebhookRouter       = require('./payments/mercadoPago/router.webhook');
 const mpReturnRouter        = require('./payments/mercadoPago/router.return');
 const mpController          = require('./payments/mercadoPago/controller');
@@ -42,9 +42,11 @@ app.use('/birthchart', birthchartRouter);
 
 // payments modules (PagBank)
 app.use('/pagBank', pagbankWebhookRouter);
-app.use('/pagBank', pagbankReturnRouter);
-app.use('/', pagbankWebhookRouter);
-app.get('/pagBank/return', pagbankController.handleReturn);
+if (process.env.PAGBANK_ENABLED === 'true') {
+  app.use('/pagBank', pagbankReturnRouter);
+  app.use('/', pagbankWebhookRouter);
+  app.get('/pagBank/return', pagbankController.handleReturn);
+}
 
 // payments modules (Mercado Pago)
 app.use('/mercadoPago', mpReturnRouter); // /mercadoPago/return[/*]
