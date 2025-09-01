@@ -8,15 +8,13 @@ const { env } = require('../../config/env');
 const mpRepository = require('./repository');
 
 const events = new EventEmitter();
-const uuid = () =>
-  (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
-/** Helpers de URL (mesmos do PagBank) */
 const stripQuotesAndSemicolons = (u) => {
   if (!u) return null;
   let s = String(u).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
-  s = s.replace(/[;\s]+$/g, '');
+  s = s.replace(/[.;\s]+$/g, '');
   return s;
 };
 
@@ -28,171 +26,124 @@ const normalizeHttpsUrl = (u, { max = 255 } = {}) => {
   return s;
 };
 
-/** Status do request (mp_request) derivado do status do payment */
 const mapPreferenceStatusFromPayment = (paymentStatus) => {
   switch ((paymentStatus || '').toLowerCase()) {
-    case 'approved':
-      return 'APPROVED';
+    case 'approved': return 'APPROVED';
     case 'in_process':
-    case 'pending':
-      return 'PENDING';
-    case 'rejected':
-      return 'REJECTED';
+    case 'pending':  return 'PENDING';
+    case 'rejected': return 'REJECTED';
     case 'refunded':
-    case 'charged_back':
-      return 'REFUNDED';
+    case 'charged_back': return 'REFUNDED';
     case 'cancelled':
-    case 'canceled':
-      return 'CANCELED';
-    default:
-      return 'UPDATED';
+    case 'canceled': return 'CANCELED';
+    default: return 'UPDATED';
   }
 };
 
-/** Cria a preference (Checkout Pro) e grava em mp_request */
 async function createCheckout({
-  requestId,
-  name,
-  email,
-  productType,
-  productValue,
-  productName,
-  paymentOptions, // ignorado pelo MP, mantido por compatibilidade
-  currency,
-  productImageUrl,
-  returnUrl,
-  metadata = {},
+  requestId, name, email, productType,
+  productValue, productName, paymentOptions,
+  currency, productImageUrl, returnUrl, metadata = {},
 }) {
   if (!requestId) throw new Error('requestId is required');
 
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) {
-    throw new Error('invalid productValue (cents, integer > 0)');
-  }
+  if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
 
-  const PUBLIC_BASE_URL =
-    process.env.PUBLIC_BASE_URL ||
-    'https://backend-form-webflow-production.up.railway.app';
+  const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
-  const success = normalizeHttpsUrl(returnUrl) ||
-    normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
+  const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
   const failure = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/failure`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
 
   const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
   const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
 
-  // 3500 (cents) -> 35.00
   const amount = Math.round(valueNum) / 100;
 
   const preferencePayload = {
     external_reference: String(requestId),
-    items: [
-      {
-        title: productName || productType || 'Produto',
-        quantity: 1,
-        unit_price: amount,
-        currency_id: currency || 'BRL',
-        ...(picture_url ? { picture_url } : {}),
-      },
-    ],
+    items: [{
+      title: productName || productType || 'Produto',
+      quantity: 1,
+      unit_price: amount,
+      currency_id: currency || 'BRL',
+      ...(picture_url ? { picture_url } : {}),
+    }],
     payer: (name || email) ? { name, email } : undefined,
     back_urls: (success && failure && pending) ? { success, failure, pending } : undefined,
     auto_return: success ? 'approved' : undefined,
     notification_url: notification_url || undefined,
-    metadata: { source: 'backend', ...metadata },
+    metadata: { source: 'webflow', ...metadata },
   };
 
+  const res = await httpClient.post('https://api.mercadopago.com/checkout/preferences', preferencePayload, {
+    headers: {
+      Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Idempotency-Key': uuid(),
+    },
+    timeout: 20000,
+  });
+
+  const data = res?.data;
+  logger.info('[MP][RES create preference]', { status: res?.status, data });
+
+  const preferenceId = data?.id || null;
+  const initPoint = data?.init_point || data?.sandbox_init_point || null;
+  if (!initPoint) throw new Error('init_point not found in Mercado Pago response');
+
+  await mpRepository.createCheckout({
+    request_id: String(requestId),
+    product_type: productType,
+    preference_id: preferenceId,
+    status: 'CREATED',
+    value: valueNum,
+    link: initPoint,
+    customer: (name || email) ? { name, email } : null,
+    raw: data,
+  });
+
   try {
-    const res = await httpClient.post(
-      'https://api.mercadopago.com/checkout/preferences',
-      preferencePayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'X-Idempotency-Key': uuid(),
-        },
-        timeout: 20000,
-      }
-    );
-
-    const data = res?.data;
-    logger.info('[MP][RES create preference]', { status: res?.status, data });
-
-    const preferenceId = data?.id || null;
-    const initPoint = data?.init_point || data?.sandbox_init_point || null;
-    if (!initPoint) throw new Error('init_point not found in Mercado Pago response');
-
-    await mpRepository.createCheckout({
-      request_id: String(requestId),
-      product_type: productType,
+    await mpRepository.logEvent({
+      event_uid: `preference_created_${preferenceId || requestId}`,
+      payload: { request_payload: preferencePayload, response: data },
+      headers: null,
+      query: null,
+      topic: 'preference',
+      action: 'CREATED',
       preference_id: preferenceId,
-      status: 'CREATED',
-      value: valueNum,
-      link: initPoint,
-      customer: (name || email) ? { name, email } : null,
-      raw: data,
+      payment_id: null,
     });
-
-    try {
-      await mpRepository.logEvent({
-        event_uid: `preference_created_${preferenceId || requestId}`,
-        payload: { request_payload: preferencePayload, response: data },
-        headers: null,
-        query: null,
-        topic: 'preference',
-        action: 'CREATED',
-        preference_id: preferenceId,
-        payment_id: null,
-      });
-    } catch (logErr) {
-      logger.warn('[MP] could not log preference creation event:', logErr?.message || logErr);
-    }
-
-    return { url: initPoint, preferenceId };
-  } catch (e) {
-    if (e.response) {
-      logger.error('[MP][ERR create preference]', {
-        status: e.response.status,
-        data: e.response.data,
-        data_str: (() => { try { return JSON.stringify(e.response.data); } catch { return String(e.response.data); } })(),
-        sent_str: (() => { try { return JSON.stringify(preferencePayload); } catch { return '<<payload>>'; } })(),
-      });
-    } else {
-      logger.error('[MP][ERR-NETWORK create preference]', e.message);
-    }
-    throw e;
+  } catch (logErr) {
+    logger.warn('[MP] could not log preference creation event:', logErr?.message || logErr);
   }
+
+  return { url: initPoint, preferenceId };
 }
 
 /** Busca detalhes do pagamento */
 async function fetchPayment(paymentId) {
   if (!paymentId) return null;
   try {
-    const res = await httpClient.get(
-      `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
-          Accept: 'application/json',
-        },
-        timeout: 15000,
-      }
-    );
+    const res = await httpClient.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+        Accept: 'application/json',
+      },
+      timeout: 15000,
+    });
     return res?.data || null;
   } catch (e) {
-    const status = e?.response?.status;
-    logger.error('[MP][ERR fetchPayment]', { paymentId, status, msg: e?.message, data: e?.response?.data });
+    logger.error('[MP][ERR fetchPayment]', { paymentId, status: e?.response?.status, msg: e?.message, data: e?.response?.data });
     return null;
   }
 }
 
-/** Processa webhook: loga, consolida pagamento e atualiza request */
+/** Processa webhook: loga, consolida pagamento e atualiza request (com fallback por request_id) */
 async function processWebhook(body, meta = {}) {
   try {
-    // Aceitar tanto ?type=payment ou ?topic=payment, quanto body.type/action
     const type = meta?.query?.type || meta?.query?.topic || meta?.topic || body?.type || null;
     const action = body?.action || null;
     const dataId = meta?.query?.id || body?.data?.id || body?.id || null;
@@ -220,15 +171,16 @@ async function processWebhook(body, meta = {}) {
       if (!payment) return { ok: true, note: 'payment details not found' };
 
       const payment_id = String(payment.id);
-      const status = payment.status;               // approved|pending|rejected|refunded|cancelled|in_process
-      const status_detail = payment.status_detail; // accredited, cc_rejected_*, etc.
-      const external_reference = payment.external_reference || null;
-      const preference_id = payment.preference_id || null;
+      const status = payment.status;               // approved|pending|...
+      const status_detail = payment.status_detail; // accredited, cc_rejected_*, ...
+      const external_reference = payment.external_reference || null; // == request_id
+      let   preference_id = payment.preference_id || null;
       const amount = Number(payment.transaction_amount || 0);
 
       const payer = payment.payer || {};
       const billing = payment.additional_info?.payer?.address || null;
 
+      // upsert pagamento
       await mpRepository.upsertPaymentByPaymentId({
         payment_id,
         preference_id,
@@ -248,16 +200,31 @@ async function processWebhook(body, meta = {}) {
         raw: payment,
       });
 
+      // 🔁 Atualiza mp_request.status:
+      // 1) se tiver preference_id, atualiza por ele
+      // 2) senão, tenta por external_reference (request_id)
+      const reqStatus = mapPreferenceStatusFromPayment(status);
+
+      let updatedReq = null;
       if (preference_id) {
-        const reqStatus = mapPreferenceStatusFromPayment(status);
-        await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
+        updatedReq = await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
+      } else if (external_reference) {
+        updatedReq = await mpRepository.updateRequestStatusByRequestId(external_reference, reqStatus, payment);
+        // se achou o request, e ele tem preference_id, anexar no pagamento p/ consistência
+        if (updatedReq?.preference_id) {
+          preference_id = updatedReq.preference_id;
+          await mpRepository.attachPaymentToPreference(payment_id, preference_id);
+        }
       }
 
+      // ✅ evento de aprovação
       if ((status || '').toLowerCase() === 'approved') {
         const record = (payment_id
           ? await mpRepository.findByPaymentId(payment_id)
           : preference_id
           ? await mpRepository.findByPreferenceId(preference_id)
+          : external_reference
+          ? await mpRepository.findByRequestId(external_reference)
           : null);
 
         if (record) {
@@ -266,7 +233,7 @@ async function processWebhook(body, meta = {}) {
             requestId,
             productType,
             paymentId: payment_id,
-            preferenceId: preference_id,
+            preferenceId: preference_id || record?.preference_id || null,
             raw: payment,
           });
         }
