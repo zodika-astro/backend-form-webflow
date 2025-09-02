@@ -1,10 +1,187 @@
 // payments/mercadoPago/repository.js
+'use strict';
+
 const db = require('../../db/db');
 
 /**
- * mp_request: cria/atualiza o registro da preferência criada
- * Campos esperados:
- *  - request_id (string/int em texto), product_type, preference_id, status, value (centavos), link, customer (json), raw (json)
+ * Security-first sanitization helpers
+ * ----------------------------------
+ * We must never persist sensitive data (secrets, tokens, auth headers, full cookies)
+ * into event/failure tables or "raw" JSON columns. The functions below:
+ *  - redact sensitive HTTP headers (Authorization, Cookie, Set-Cookie, API keys, signatures)
+ *  - scrub sensitive keys inside arbitrary JSON payloads (tokens, secrets, card data, passwords)
+ *  - lightly mask common PII fields (email, tax_id/CPF/CNPJ, phone), keeping enough signal for debugging
+ *
+ * Notes:
+ * - Keep canonical business fields (e.g., customer name/email on mp_payments) in their dedicated columns.
+ *   The "raw" columns and event tables are NOT a place to store full PII or secrets.
+ * - These utilities avoid mutating the original objects by cloning during traversal.
+ */
+
+// Case-insensitive header names that must be redacted
+const SENSITIVE_HEADER_SET = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-access-token',
+  'x-client-secret',
+  'x-signature', // HMAC/signature headers should not be stored in full
+]);
+
+/** Redact sensitive HTTP headers. Keeps non-sensitive headers as-is. */
+function sanitizeHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return null;
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = String(k).toLowerCase();
+    if (SENSITIVE_HEADER_SET.has(key)) {
+      out[k] = '[REDACTED]';
+    } else {
+      out[k] = typeof v === 'string' ? v : safeJsonStringify(v);
+    }
+  }
+  return out;
+}
+
+// Keys inside JSON payloads that should be fully redacted (case-insensitive match)
+const SENSITIVE_JSON_KEYS = [
+  'authorization',
+  'access_token',
+  'refresh_token',
+  'id_token',
+  'token',
+  'secret',
+  'client_secret',
+  'api_key',
+  'apikey',
+  'password',
+  'pwd',
+  'signature',
+  'hmac',
+  'security_code',
+  'cvv',
+  'cvc',
+  'card_number',
+  'pan',
+  'card',
+];
+
+// Keys that carry PII we want to softly mask
+const PII_KEYS = [
+  'email',
+  'e-mail',
+  'mail',
+  'tax_id',
+  'document',
+  'cpf',
+  'cnpj',
+  'phone',
+  'phone_number',
+  'mobile',
+  'whatsapp',
+];
+
+/** Mask helpers for PII (keep minimal debugging signal) */
+function maskEmail(value) {
+  const s = String(value || '');
+  const [user, domain] = s.split('@');
+  if (!domain) return '[REDACTED_EMAIL]';
+  const u = user.length <= 2 ? '*'.repeat(user.length) : user[0] + '*'.repeat(user.length - 2) + user[user.length - 1];
+  const d = domain.replace(/^[^.]*/, m => (m.length <= 2 ? '*'.repeat(m.length) : m[0] + '*'.repeat(m.length - 2) + m[m.length - 1]));
+  return `${u}@${d}`;
+}
+
+function maskDigits(value, visible = 2) {
+  const s = String(value || '').replace(/\D+/g, '');
+  if (!s) return '[REDACTED_DIGITS]';
+  const keep = Math.min(visible, s.length);
+  return '*'.repeat(s.length - keep) + s.slice(-keep);
+}
+
+function maskPhone(value) {
+  return maskDigits(value, 4);
+}
+
+function maskTaxId(value) {
+  // CPF/CNPJ: keep last 3 digits
+  return maskDigits(value, 3);
+}
+
+// Decide how to mask a value based on the key semantics
+function maskValueByKey(key, value) {
+  const k = String(key).toLowerCase();
+
+  if (SENSITIVE_JSON_KEYS.includes(k)) {
+    return '[REDACTED]';
+  }
+
+  if (PII_KEYS.includes(k)) {
+    if (k.includes('email') || k === 'mail' || k === 'e-mail') return maskEmail(value);
+    if (k.includes('phone') || k === 'mobile' || k === 'whatsapp') return maskPhone(value);
+    if (k === 'tax_id' || k === 'document' || k === 'cpf' || k === 'cnpj') return maskTaxId(value);
+    return '[REDACTED_PII]';
+  }
+
+  return value;
+}
+
+/**
+ * Recursively sanitize an arbitrary JSON-like structure.
+ * - Redacts sensitive keys entirely
+ * - Masks PII fields
+ * - Limits depth to avoid pathological objects
+ */
+function sanitizeJson(value, depth = 0) {
+  if (value == null) return value;
+  if (depth > 8) return '[TRUNCATED_DEPTH]';
+
+  // Primitives
+  if (typeof value !== 'object') return value;
+
+  // Arrays
+  if (Array.isArray(value)) {
+    return value.map(v => sanitizeJson(v, depth + 1));
+  }
+
+  // Plain objects
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    const masked = maskValueByKey(k, v);
+    out[k] = typeof masked === 'object' && masked !== null
+      ? sanitizeJson(masked, depth + 1)
+      : masked;
+  }
+  return out;
+}
+
+/** Safe stringify for diagnostic storage (never throws) */
+function safeJsonStringify(obj) {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return String(obj);
+  }
+}
+
+/** Public sanitizers used by the repository functions */
+function sanitizeForStorage(obj) {
+  return sanitizeJson(obj);
+}
+function sanitizeQuery(obj) {
+  return sanitizeJson(obj);
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Repository functions (Mercado Pago)
+ * All raw/header/payload fields pass through sanitization BEFORE persistence.
+ * ------------------------------------------------------------------------------------------------ */
+
+/**
+ * mp_request: create/update the created preference record
+ * Expected fields:
+ *  - request_id (string/int as text), product_type, preference_id, status, value (in cents),
+ *    link, customer (json), raw (json)
  */
 async function createCheckout({
   request_id,
@@ -31,6 +208,11 @@ async function createCheckout({
       updated_at  = NOW()
     RETURNING *;
   `;
+
+  // Only sanitize structures that might contain secrets/PII beyond canonical columns
+  const safeCustomer = customer ? sanitizeForStorage(customer) : null;
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+
   const params = [
     request_id,
     product_type,
@@ -38,16 +220,16 @@ async function createCheckout({
     status,
     value,
     link,
-    customer || null,
-    raw || null,
+    safeCustomer,
+    safeRaw,
   ];
   const { rows } = await db.query(sql, params);
   return rows[0];
 }
 
 /**
- * mp_events: loga o evento recebido (append-only)
- * Se o provider_event_uid já existir, ignora (idempotente)
+ * mp_events: append-only record of received events
+ * If provider_event_uid already exists, ignore (idempotent)
  */
 async function logEvent({
   event_uid,
@@ -68,22 +250,27 @@ async function logEvent({
     ON CONFLICT (provider_event_uid) DO NOTHING
     RETURNING *;
   `;
+
+  const safeHeaders = sanitizeHeaders(headers);
+  const safeQuery = sanitizeQuery(query);
+  const safePayload = sanitizeForStorage(payload);
+
   const params = [
     event_uid,
     topic || null,
     action || null,
     preference_id || null,
     payment_id || null,
-    headers || null,
-    query || null,
-    payload || null,
+    safeHeaders || null,
+    safeQuery || null,
+    safePayload || null,
   ];
   const { rows } = await db.query(sql, params);
   return rows[0] || null;
 }
 
 /**
- * Atualiza status do request via preference_id
+ * Update request status by preference_id
  */
 async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
   const sql = `
@@ -94,12 +281,13 @@ async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
      WHERE preference_id = $1
     RETURNING *;
   `;
-  const { rows } = await db.query(sql, [preference_id, status, raw || null]);
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+  const { rows } = await db.query(sql, [preference_id, status, safeRaw]);
   return rows[0] || null;
 }
 
 /**
- * Atualiza status do request via request_id (external_reference)
+ * Update request status by request_id (external_reference)
  */
 async function updateRequestStatusByRequestId(request_id, status, raw) {
   const sql = `
@@ -110,13 +298,14 @@ async function updateRequestStatusByRequestId(request_id, status, raw) {
      WHERE request_id = $1
     RETURNING *;
   `;
-  const { rows } = await db.query(sql, [String(request_id), status, raw || null]);
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+  const { rows } = await db.query(sql, [String(request_id), status, safeRaw]);
   return rows[0] || null;
 }
 
 /**
- * mp_payments: upsert por payment_id
- * IMPORTANTE: mantém ordem dos 17 parâmetros exatamente como no INSERT
+ * mp_payments: upsert by payment_id
+ * IMPORTANT: keep the exact order of the 17 parameters as in the INSERT
  */
 async function upsertPaymentByPaymentId({
   payment_id,
@@ -126,9 +315,9 @@ async function upsertPaymentByPaymentId({
   external_reference,
   customer = {},
   transaction_amount,
-  date_created,       // string ISO ou Date
-  date_approved,      // string ISO ou Date
-  date_last_updated,  // string ISO ou Date
+  date_created,       // string ISO or Date
+  date_approved,      // string ISO or Date
+  date_last_updated,  // string ISO or Date
   raw,
 }) {
   const sql = `
@@ -166,6 +355,10 @@ async function upsertPaymentByPaymentId({
     RETURNING *;
   `;
 
+  // Keep canonical columns explicit; sanitize only the "raw" and nested address JSON
+  const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+
   const values = [
     payment_id,
     preference_id ?? null,
@@ -181,14 +374,14 @@ async function upsertPaymentByPaymentId({
     customer?.phone_area ?? null,
     customer?.phone_number ?? null,
 
-    customer?.address_json ?? null,
+    safeAddress,
     transaction_amount != null ? Number(transaction_amount) : null,
 
     date_created ?? null,
     date_approved ?? null,
     date_last_updated ?? null,
 
-    raw ?? null,
+    safeRaw,
   ];
 
   const { rows } = await db.query(sql, values);
@@ -196,7 +389,7 @@ async function upsertPaymentByPaymentId({
 }
 
 /**
- * Busca pagamento (com request_id/product_type) via payment_id
+ * Find payment (with request_id/product_type) by payment_id
  */
 async function findByPaymentId(payment_id) {
   const sql = `
@@ -214,7 +407,7 @@ async function findByPaymentId(payment_id) {
 }
 
 /**
- * Busca request via preference_id
+ * Find request by preference_id
  */
 async function findByPreferenceId(preference_id) {
   const sql = `
@@ -228,7 +421,7 @@ async function findByPreferenceId(preference_id) {
 }
 
 /**
- * Busca request via request_id (external_reference)
+ * Find request by request_id (external_reference)
  */
 async function findByRequestId(request_id) {
   const sql = `
@@ -242,7 +435,7 @@ async function findByRequestId(request_id) {
 }
 
 /**
- * Anexa payment a uma preferência (caso o webhook chegue sem preferId e descubramos depois)
+ * Attach payment to a preference (when webhook arrives without preferId and we discover later)
  */
 async function attachPaymentToPreference(payment_id, preference_id) {
   const sql = `
