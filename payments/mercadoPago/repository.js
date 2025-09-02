@@ -10,15 +10,13 @@ const db = require('../../db/db');
  * into event/failure tables or "raw" JSON columns. The functions below:
  *  - redact sensitive HTTP headers (Authorization, Cookie, Set-Cookie, API keys, signatures)
  *  - scrub sensitive keys inside arbitrary JSON payloads (tokens, secrets, card data, passwords)
- *  - lightly mask common PII fields (email, tax_id/CPF/CNPJ, phone), keeping enough signal for debugging
+ *  - lightly mask common PII fields (email, tax_id/CPF/CNPJ, phone), keeping enough signal
  *
  * Notes:
- * - Keep canonical business fields (e.g., customer name/email on mp_payments) in their dedicated columns.
- *   The "raw" columns and event tables are NOT a place to store full PII or secrets.
+ * - Keep canonical business fields (e.g., customer name/email on mp_payments) in dedicated columns.
  * - These utilities avoid mutating the original objects by cloning during traversal.
  */
 
-// Case-insensitive header names that must be redacted
 const SENSITIVE_HEADER_SET = new Set([
   'authorization',
   'cookie',
@@ -26,25 +24,19 @@ const SENSITIVE_HEADER_SET = new Set([
   'x-api-key',
   'x-access-token',
   'x-client-secret',
-  'x-signature', // HMAC/signature headers should not be stored in full
+  'x-signature',
 ]);
 
-/** Redact sensitive HTTP headers. Keeps non-sensitive headers as-is. */
 function sanitizeHeaders(headers) {
   if (!headers || typeof headers !== 'object') return null;
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase();
-    if (SENSITIVE_HEADER_SET.has(key)) {
-      out[k] = '[REDACTED]';
-    } else {
-      out[k] = typeof v === 'string' ? v : safeJsonStringify(v);
-    }
+    out[k] = SENSITIVE_HEADER_SET.has(key) ? '[REDACTED]' : (typeof v === 'string' ? v : safeJsonStringify(v));
   }
   return out;
 }
 
-// Keys inside JSON payloads that should be fully redacted (case-insensitive match)
 const SENSITIVE_JSON_KEYS = [
   'authorization',
   'access_token',
@@ -67,7 +59,6 @@ const SENSITIVE_JSON_KEYS = [
   'card',
 ];
 
-// Keys that carry PII we want to softly mask
 const PII_KEYS = [
   'email',
   'e-mail',
@@ -82,7 +73,6 @@ const PII_KEYS = [
   'whatsapp',
 ];
 
-/** Mask helpers for PII (keep minimal debugging signal) */
 function maskEmail(value) {
   const s = String(value || '');
   const [user, domain] = s.split('@');
@@ -91,100 +81,67 @@ function maskEmail(value) {
   const d = domain.replace(/^[^.]*/, m => (m.length <= 2 ? '*'.repeat(m.length) : m[0] + '*'.repeat(m.length - 2) + m[m.length - 1]));
   return `${u}@${d}`;
 }
-
 function maskDigits(value, visible = 2) {
   const s = String(value || '').replace(/\D+/g, '');
   if (!s) return '[REDACTED_DIGITS]';
   const keep = Math.min(visible, s.length);
   return '*'.repeat(s.length - keep) + s.slice(-keep);
 }
+function maskPhone(value) { return maskDigits(value, 4); }
+function maskTaxId(value) { return maskDigits(value, 3); }
 
-function maskPhone(value) {
-  return maskDigits(value, 4);
-}
-
-function maskTaxId(value) {
-  // CPF/CNPJ: keep last 3 digits
-  return maskDigits(value, 3);
-}
-
-// Decide how to mask a value based on the key semantics
 function maskValueByKey(key, value) {
   const k = String(key).toLowerCase();
-
-  if (SENSITIVE_JSON_KEYS.includes(k)) {
-    return '[REDACTED]';
-  }
-
+  if (SENSITIVE_JSON_KEYS.includes(k)) return '[REDACTED]';
   if (PII_KEYS.includes(k)) {
     if (k.includes('email') || k === 'mail' || k === 'e-mail') return maskEmail(value);
     if (k.includes('phone') || k === 'mobile' || k === 'whatsapp') return maskPhone(value);
     if (k === 'tax_id' || k === 'document' || k === 'cpf' || k === 'cnpj') return maskTaxId(value);
     return '[REDACTED_PII]';
   }
-
   return value;
 }
 
-/**
- * Recursively sanitize an arbitrary JSON-like structure.
- * - Redacts sensitive keys entirely
- * - Masks PII fields
- * - Limits depth to avoid pathological objects
- */
 function sanitizeJson(value, depth = 0) {
   if (value == null) return value;
   if (depth > 8) return '[TRUNCATED_DEPTH]';
-
-  // Primitives
   if (typeof value !== 'object') return value;
-
-  // Arrays
-  if (Array.isArray(value)) {
-    return value.map(v => sanitizeJson(v, depth + 1));
-  }
-
-  // Plain objects
+  if (Array.isArray(value)) return value.map(v => sanitizeJson(v, depth + 1));
   const out = {};
   for (const [k, v] of Object.entries(value)) {
     const masked = maskValueByKey(k, v);
-    out[k] = typeof masked === 'object' && masked !== null
-      ? sanitizeJson(masked, depth + 1)
-      : masked;
+    out[k] = (typeof masked === 'object' && masked !== null) ? sanitizeJson(masked, depth + 1) : masked;
   }
   return out;
 }
 
-/** Safe stringify for diagnostic storage (never throws) */
 function safeJsonStringify(obj) {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return String(obj);
-  }
+  try { return JSON.stringify(obj); } catch { return String(obj); }
 }
-
-/** Public sanitizers used by the repository functions */
-function sanitizeForStorage(obj) {
-  return sanitizeJson(obj);
-}
-function sanitizeQuery(obj) {
-  return sanitizeJson(obj);
-}
+function sanitizeForStorage(obj) { return sanitizeJson(obj); }
+function sanitizeQuery(obj) { return sanitizeJson(obj); }
 
 /* ------------------------------------------------------------------------------------------------
  * Repository functions (Mercado Pago)
  * All raw/header/payload fields pass through sanitization BEFORE persistence.
+ * Also, joins now rely on mp_request.external_reference (TEXT) to match MP semantics.
  * ------------------------------------------------------------------------------------------------ */
 
 /**
  * mp_request: create/update the created preference record
  * Expected fields:
- *  - request_id (string/int as text), product_type, preference_id, status, value (in cents),
- *    link, customer (json), raw (json)
+ *  - request_id (int, internal FK to your zodika_requests)
+ *  - external_reference (string from Mercado Pago preference)
+ *  - product_type, preference_id, status, value (in cents), link, customer (json), raw (json)
+ *
+ * Notes:
+ * - external_reference comes from MP and is TEXT by nature; do not coerce to int.
+ * - If external_reference is not provided, we DO NOT infer it from request_id here
+ *   (keep data truthful; migration already backfilled legacy rows).
  */
 async function createCheckout({
   request_id,
+  external_reference,
   product_type,
   preference_id,
   status,
@@ -195,26 +152,27 @@ async function createCheckout({
 }) {
   const sql = `
     INSERT INTO mp_request (
-      request_id, product_type, preference_id, status, value, link, customer, raw
+      request_id, external_reference, product_type, preference_id, status, value, link, customer, raw
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8
+      $1,$2,$3,$4,$5,$6,$7,$8,$9
     )
     ON CONFLICT (preference_id) DO UPDATE SET
-      status      = EXCLUDED.status,
-      value       = EXCLUDED.value,
-      link        = EXCLUDED.link,
-      customer    = COALESCE(EXCLUDED.customer, mp_request.customer),
-      raw         = EXCLUDED.raw,
-      updated_at  = NOW()
+      status            = EXCLUDED.status,
+      value             = EXCLUDED.value,
+      link              = EXCLUDED.link,
+      external_reference= COALESCE(EXCLUDED.external_reference, mp_request.external_reference),
+      customer          = COALESCE(EXCLUDED.customer, mp_request.customer),
+      raw               = EXCLUDED.raw,
+      updated_at        = NOW()
     RETURNING *;
   `;
 
-  // Only sanitize structures that might contain secrets/PII beyond canonical columns
   const safeCustomer = customer ? sanitizeForStorage(customer) : null;
   const safeRaw = raw ? sanitizeForStorage(raw) : null;
 
   const params = [
-    request_id,
+    request_id ?? null,
+    external_reference ?? null,
     product_type,
     preference_id,
     status,
@@ -243,9 +201,9 @@ async function logEvent({
 }) {
   const sql = `
     INSERT INTO mp_events (
-      provider_event_uid, topic, action, preference_id, payment_id, headers, query, raw_json
+      provider_event_uid, topic, action, preference_id, payment_id, merchant_order_id, headers, query, raw_json
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8
+      $1,$2,$3,$4,$5,$6,$7,$8,$9
     )
     ON CONFLICT (provider_event_uid) DO NOTHING
     RETURNING *;
@@ -261,6 +219,7 @@ async function logEvent({
     action || null,
     preference_id || null,
     payment_id || null,
+    null, // merchant_order_id not used for payment webhooks; keep null for schema compatibility
     safeHeaders || null,
     safeQuery || null,
     safePayload || null,
@@ -287,7 +246,9 @@ async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
 }
 
 /**
- * Update request status by request_id (external_reference)
+ * Update request status by INTERNAL request_id (int FK)
+ * - Kept for backwards compatibility with internal flows.
+ * - Prefer using updateRequestStatusByExternalReference for MP-facing updates.
  */
 async function updateRequestStatusByRequestId(request_id, status, raw) {
   const sql = `
@@ -299,7 +260,25 @@ async function updateRequestStatusByRequestId(request_id, status, raw) {
     RETURNING *;
   `;
   const safeRaw = raw ? sanitizeForStorage(raw) : null;
-  const { rows } = await db.query(sql, [String(request_id), status, safeRaw]);
+  const { rows } = await db.query(sql, [request_id, status, safeRaw]);
+  return rows[0] || null;
+}
+
+/**
+ * Update request status by EXTERNAL reference (TEXT from MP)
+ * - This is the preferred method to align with Mercado Pago semantics.
+ */
+async function updateRequestStatusByExternalReference(external_reference, status, raw) {
+  const sql = `
+    UPDATE mp_request
+       SET status = $2,
+           raw = COALESCE($3, mp_request.raw),
+           updated_at = NOW()
+     WHERE external_reference = $1
+    RETURNING *;
+  `;
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+  const { rows } = await db.query(sql, [external_reference, status, safeRaw]);
   return rows[0] || null;
 }
 
@@ -355,7 +334,6 @@ async function upsertPaymentByPaymentId({
     RETURNING *;
   `;
 
-  // Keep canonical columns explicit; sanitize only the "raw" and nested address JSON
   const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
   const safeRaw = raw ? sanitizeForStorage(raw) : null;
 
@@ -390,6 +368,8 @@ async function upsertPaymentByPaymentId({
 
 /**
  * Find payment (with request_id/product_type) by payment_id
+ * - Now joins using mp_request.external_reference (TEXT) to avoid int/text casts.
+ * - Still left-joins by preference_id as primary linkage.
  */
 async function findByPaymentId(payment_id) {
   const sql = `
@@ -398,7 +378,7 @@ async function findByPaymentId(payment_id) {
            COALESCE(r1.product_type, r2.product_type) AS product_type
       FROM mp_payments p
       LEFT JOIN mp_request r1 ON r1.preference_id = p.preference_id
-      LEFT JOIN mp_request r2 ON r2.request_id     = p.external_reference
+      LEFT JOIN mp_request r2 ON r2.external_reference = p.external_reference
      WHERE p.payment_id = $1
      LIMIT 1;
   `;
@@ -421,7 +401,7 @@ async function findByPreferenceId(preference_id) {
 }
 
 /**
- * Find request by request_id (external_reference)
+ * Find request by INTERNAL request_id (int FK)
  */
 async function findByRequestId(request_id) {
   const sql = `
@@ -430,7 +410,21 @@ async function findByRequestId(request_id) {
      WHERE request_id = $1
      LIMIT 1;
   `;
-  const { rows } = await db.query(sql, [String(request_id)]);
+  const { rows } = await db.query(sql, [request_id]);
+  return rows[0] || null;
+}
+
+/**
+ * Find request by EXTERNAL reference (TEXT from MP)
+ */
+async function findByExternalReference(external_reference) {
+  const sql = `
+    SELECT *
+      FROM mp_request
+     WHERE external_reference = $1
+     LIMIT 1;
+  `;
+  const { rows } = await db.query(sql, [external_reference]);
   return rows[0] || null;
 }
 
@@ -454,7 +448,9 @@ module.exports = {
   createCheckout,
   logEvent,
   updateRequestStatusByPreferenceId,
-  updateRequestStatusByRequestId,
+  updateRequestStatusByRequestId,          // legacy/internal
+  updateRequestStatusByExternalReference,  // preferred for MP
+  findByExternalReference,
 
   // payments
   upsertPaymentByPaymentId,
