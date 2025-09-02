@@ -52,24 +52,31 @@ async function createCheckout({
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
+  // ===== URLs de retorno (com fallback coerente) =====
   const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
-const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
+  const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
   const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
 
+  // webhook e imagem do produto
   const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
   const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
 
+  // valor em BRL (inteiro de centavos -> reais com 2 casas)
   const amount = Math.round(valueNum) / 100;
 
-  // Map per-product payment options into Mercado Pago preference
+  // ===== Regras por produto (PIX + Cartão; SEM boleto) =====
   const allowPix  = !!(paymentOptions && paymentOptions.allow_pix);
   const allowCard = !!(paymentOptions && paymentOptions.allow_card);
   const maxInst   = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
-  const excluded_payment_types = [{ id: 'ticket' }]; // block boleto
+
+  // SEM BOLETO
+  const excluded_payment_types = [{ id: 'ticket' }];
   if (!allowCard) excluded_payment_types.push({ id: 'credit_card' });
+
   const excluded_payment_methods = [];
   if (!allowPix) excluded_payment_methods.push({ id: 'pix' });
+
   const payment_methods = {
     excluded_payment_types,
     excluded_payment_methods,
@@ -77,7 +84,8 @@ const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE
     default_installments: Math.min(Math.max(1, maxInst), 12),
   };
 
-const preferencePayload = {
+  // ===== Payload da preferência (com payment_methods aplicado) =====
+  const preferencePayload = {
     external_reference: String(requestId),
     items: [{
       title: productName || productType || 'Produto',
@@ -86,12 +94,24 @@ const preferencePayload = {
       currency_id: currency || 'BRL',
       ...(picture_url ? { picture_url } : {}),
     }],
+
     payer: (name || email) ? { name, email } : undefined,
-    back_urls: (success && failure && pending) ? { success, failure, pending } : undefined,
-    auto_return: success ? 'approved' : undefined,
+
+    back_urls: { success, failure, pending },
+    auto_return: 'approved',
+
     notification_url: notification_url || undefined,
+
     metadata: { source: 'webflow', ...metadata },
+
+    payment_methods,
+
+    // Se quiser eliminar o estado "pending", descomente:
+    // binary_mode: true,
   };
+
+  // Opcional: debug do payload
+  // logger.info('[MP] preference payload', preferencePayload);
 
   const res = await httpClient.post('https://api.mercadopago.com/checkout/preferences', preferencePayload, {
     headers: {
@@ -194,7 +214,7 @@ async function processWebhook(body, meta = {}) {
       const payer = payment.payer || {};
       const billing = payment.additional_info?.payer?.address || null;
 
-      // upsert payment
+      // ===== upsert payment (com datas do MP) =====
       await mpRepository.upsertPaymentByPaymentId({
         payment_id,
         preference_id,
@@ -211,6 +231,12 @@ async function processWebhook(body, meta = {}) {
           address_json: billing ? billing : null,
         },
         transaction_amount: amount,
+
+        // Novos campos para ordenar/consistir atualizações
+        date_created: payment?.date_created || null,
+        date_approved: payment?.date_approved || null,
+        date_last_updated: payment?.date_last_updated || payment?.last_updated || null,
+
         raw: payment,
       });
 
