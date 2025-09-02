@@ -1,272 +1,285 @@
-// payments/mercadoPago/repository.js
-const db = require('../../db/db');
+// payments/mercadoPago/service.js
 
-/**
- * mp_request: cria/atualiza o registro da preferência criada
- * Campos esperados:
- *  - request_id (string/int em texto), product_type, preference_id, status, value (centavos), link, customer (json), raw (json)
- */
-async function createCheckout({
-  request_id,
-  product_type,
-  preference_id,
-  status,
-  value,
-  link,
-  customer,
-  raw,
-}) {
-  const sql = `
-    INSERT INTO mp_request (
-      request_id, product_type, preference_id, status, value, link, customer, raw
-    ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8
-    )
-    ON CONFLICT (preference_id) DO UPDATE SET
-      status      = EXCLUDED.status,
-      value       = EXCLUDED.value,
-      link        = EXCLUDED.link,
-      customer    = COALESCE(EXCLUDED.customer, mp_request.customer),
-      raw         = EXCLUDED.raw,
-      updated_at  = NOW()
-    RETURNING *;
-  `;
-  const params = [
-    request_id,
-    product_type,
-    preference_id,
-    status,
-    value,
-    link,
-    customer || null,
-    raw || null,
-  ];
-  const { rows } = await db.query(sql, params);
-  return rows[0];
-}
+const httpClient = require('../../utils/httpClient');
+const crypto = require('crypto');
+const EventEmitter = require('events');
+const logger = require('../../utils/logger');
+const { env } = require('../../config/env');
+const mpRepository = require('./repository');
 
-/**
- * mp_events: loga o evento recebido (append-only)
- * Se o provider_event_uid já existir, ignora (idempotente)
- */
-async function logEvent({
-  event_uid,
-  topic,
-  action,
-  preference_id,
-  payment_id,
-  headers,
-  query,
-  payload,
-}) {
-  const sql = `
-    INSERT INTO mp_events (
-      provider_event_uid, topic, action, preference_id, payment_id, headers, query, raw_json
-    ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8
-    )
-    ON CONFLICT (provider_event_uid) DO NOTHING
-    RETURNING *;
-  `;
-  const params = [
-    event_uid,
-    topic || null,
-    action || null,
-    preference_id || null,
-    payment_id || null,
-    headers || null,
-    query || null,
-    payload || null,
-  ];
-  const { rows } = await db.query(sql, params);
-  return rows[0] || null;
-}
+const events = new EventEmitter();
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
-/**
- * Atualiza status do request via preference_id
- */
-async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
-  const sql = `
-    UPDATE mp_request
-       SET status = $2,
-           raw = COALESCE($3, mp_request.raw),
-           updated_at = NOW()
-     WHERE preference_id = $1
-    RETURNING *;
-  `;
-  const { rows } = await db.query(sql, [preference_id, status, raw || null]);
-  return rows[0] || null;
-}
-
-/**
- * Atualiza status do request via request_id (external_reference)
- */
-async function updateRequestStatusByRequestId(request_id, status, raw) {
-  const sql = `
-    UPDATE mp_request
-       SET status = $2,
-           raw = COALESCE($3, mp_request.raw),
-           updated_at = NOW()
-     WHERE request_id = $1
-    RETURNING *;
-  `;
-  const { rows } = await db.query(sql, [String(request_id), status, raw || null]);
-  return rows[0] || null;
-}
-
-/**
- * mp_payments: upsert por payment_id
- * IMPORTANTE: mantém ordem dos 17 parâmetros exatamente como no INSERT
- */
-async function upsertPaymentByPaymentId({
-  payment_id,
-  preference_id,
-  status,
-  status_detail,
-  external_reference,
-  customer = {},
-  transaction_amount,
-  date_created,       // string ISO ou Date
-  date_approved,      // string ISO ou Date
-  date_last_updated,  // string ISO ou Date
-  raw,
-}) {
-  const sql = `
-    INSERT INTO mp_payments (
-      payment_id, preference_id, status, status_detail, external_reference,
-      customer_name, customer_email, customer_tax_id,
-      customer_phone_country, customer_phone_area, customer_phone_number,
-      customer_address_json, transaction_amount,
-      date_created, date_approved, date_last_updated, raw
-    ) VALUES (
-      $1,$2,$3,$4,$5,
-      $6,$7,$8,
-      $9,$10,$11,
-      $12,$13,
-      $14,$15,$16,$17
-    )
-    ON CONFLICT (payment_id) DO UPDATE SET
-      status                 = EXCLUDED.status,
-      status_detail          = EXCLUDED.status_detail,
-      date_created           = COALESCE(EXCLUDED.date_created, mp_payments.date_created),
-      date_approved          = COALESCE(EXCLUDED.date_approved, mp_payments.date_approved),
-      date_last_updated      = COALESCE(EXCLUDED.date_last_updated, mp_payments.date_last_updated),
-      preference_id          = COALESCE(EXCLUDED.preference_id, mp_payments.preference_id),
-      external_reference     = COALESCE(EXCLUDED.external_reference, mp_payments.external_reference),
-      customer_name          = COALESCE(EXCLUDED.customer_name, mp_payments.customer_name),
-      customer_email         = COALESCE(EXCLUDED.customer_email, mp_payments.customer_email),
-      customer_tax_id        = COALESCE(EXCLUDED.customer_tax_id, mp_payments.customer_tax_id),
-      customer_phone_country = COALESCE(EXCLUDED.customer_phone_country, mp_payments.customer_phone_country),
-      customer_phone_area    = COALESCE(EXCLUDED.customer_phone_area, mp_payments.customer_phone_area),
-      customer_phone_number  = COALESCE(EXCLUDED.customer_phone_number, mp_payments.customer_phone_number),
-      customer_address_json  = COALESCE(EXCLUDED.customer_address_json, mp_payments.customer_address_json),
-      transaction_amount     = COALESCE(EXCLUDED.transaction_amount, mp_payments.transaction_amount),
-      raw                    = EXCLUDED.raw,
-      updated_at             = NOW()
-    RETURNING *;
-  `;
-
-  const values = [
-    payment_id,
-    preference_id ?? null,
-    status ?? null,
-    status_detail ?? null,
-    external_reference ?? null,
-
-    customer?.name ?? null,
-    customer?.email ?? null,
-    customer?.tax_id ?? null,
-
-    customer?.phone_country ?? null,
-    customer?.phone_area ?? null,
-    customer?.phone_number ?? null,
-
-    customer?.address_json ?? null,
-    transaction_amount != null ? Number(transaction_amount) : null,
-
-    date_created ?? null,
-    date_approved ?? null,
-    date_last_updated ?? null,
-
-    raw ?? null,
-  ];
-
-  const { rows } = await db.query(sql, values);
-  return rows[0];
-}
-
-/**
- * Busca pagamento (com request_id/product_type) via payment_id
- */
-async function findByPaymentId(payment_id) {
-  const sql = `
-    SELECT p.*,
-           COALESCE(r1.request_id, r2.request_id)     AS request_id,
-           COALESCE(r1.product_type, r2.product_type) AS product_type
-      FROM mp_payments p
-      LEFT JOIN mp_request r1 ON r1.preference_id = p.preference_id
-      LEFT JOIN mp_request r2 ON r2.request_id     = p.external_reference
-     WHERE p.payment_id = $1
-     LIMIT 1;
-  `;
-  const { rows } = await db.query(sql, [payment_id]);
-  return rows[0] || null;
-}
-
-/**
- * Busca request via preference_id
- */
-async function findByPreferenceId(preference_id) {
-  const sql = `
-    SELECT *
-      FROM mp_request
-     WHERE preference_id = $1
-     LIMIT 1;
-  `;
-  const { rows } = await db.query(sql, [preference_id]);
-  return rows[0] || null;
-}
-
-/**
- * Busca request via request_id (external_reference)
- */
-async function findByRequestId(request_id) {
-  const sql = `
-    SELECT *
-      FROM mp_request
-     WHERE request_id = $1
-     LIMIT 1;
-  `;
-  const { rows } = await db.query(sql, [String(request_id)]);
-  return rows[0] || null;
-}
-
-/**
- * Anexa payment a uma preferência (caso o webhook chegue sem preferId e descubramos depois)
- */
-async function attachPaymentToPreference(payment_id, preference_id) {
-  const sql = `
-    UPDATE mp_payments
-       SET preference_id = $2,
-           updated_at = NOW()
-     WHERE payment_id = $1
-    RETURNING *;
-  `;
-  const { rows } = await db.query(sql, [payment_id, preference_id]);
-  return rows[0] || null;
-}
-
-module.exports = {
-  // requests / events
-  createCheckout,
-  logEvent,
-  updateRequestStatusByPreferenceId,
-  updateRequestStatusByRequestId,
-
-  // payments
-  upsertPaymentByPaymentId,
-  findByPaymentId,
-  findByPreferenceId,
-  findByRequestId,
-  attachPaymentToPreference,
+const stripQuotesAndSemicolons = (u) => {
+  if (!u) return null;
+  let s = String(u).trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
+  s = s.replace(/[.;\s]+$/g, '');
+  return s;
 };
+
+const normalizeHttpsUrl = (u, { max = 255 } = {}) => {
+  const s = stripQuotesAndSemicolons(u);
+  if (!s) return null;
+  if (!/^https:\/\/[^\s<>"]+$/i.test(s)) return null;
+  if (s.length > max) return null;
+  return s;
+};
+
+const mapPreferenceStatusFromPayment = (paymentStatus) => {
+  switch ((paymentStatus || '').toLowerCase()) {
+    case 'approved': return 'APPROVED';
+    case 'in_process':
+    case 'pending':  return 'PENDING';
+    case 'rejected': return 'REJECTED';
+    case 'refunded':
+    case 'charged_back': return 'REFUNDED';
+    case 'cancelled':
+    case 'canceled': return 'CANCELED';
+    default: return 'UPDATED';
+  }
+};
+
+async function createCheckout({
+  requestId, name, email, productType,
+  productValue, productName, paymentOptions,
+  currency, productImageUrl, returnUrl, metadata = {},
+}) {
+  if (!requestId) throw new Error('requestId is required');
+
+  const valueNum = Number(productValue);
+  if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
+
+  const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
+
+  // ===== URLs de retorno (com fallback coerente) =====
+  const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
+  const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
+  const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
+  const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
+
+  // webhook e imagem do produto
+  const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
+  const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
+
+  // valor em BRL (inteiro de centavos -> reais com 2 casas)
+  const amount = Math.round(valueNum) / 100;
+
+  // ===== Regras por produto (PIX + Cartão; SEM boleto) =====
+  const allowPix  = !!(paymentOptions && paymentOptions.allow_pix);
+  const allowCard = !!(paymentOptions && paymentOptions.allow_card);
+  const maxInst   = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
+
+  // SEM BOLETO
+  const excluded_payment_types = [{ id: 'ticket' }];
+  if (!allowCard) excluded_payment_types.push({ id: 'credit_card' });
+
+  const excluded_payment_methods = [];
+  if (!allowPix) excluded_payment_methods.push({ id: 'pix' });
+
+  const payment_methods = {
+    excluded_payment_types,
+    excluded_payment_methods,
+    installments: maxInst,
+    default_installments: Math.min(Math.max(1, maxInst), 12),
+  };
+
+  // ===== Payload da preferência (com payment_methods aplicado) =====
+  const preferencePayload = {
+    external_reference: String(requestId),
+    items: [{
+      title: productName || productType || 'Produto',
+      quantity: 1,
+      unit_price: amount,
+      currency_id: currency || 'BRL',
+      ...(picture_url ? { picture_url } : {}),
+    }],
+
+    payer: (name || email) ? { name, email } : undefined,
+
+    back_urls: { success, failure, pending },
+    auto_return: 'approved',
+
+    notification_url: notification_url || undefined,
+
+    metadata: { source: 'webflow', ...metadata },
+
+    payment_methods,
+
+    // Se quiser eliminar o estado "pending", descomente:
+    // binary_mode: true,
+  };
+
+  // Opcional: debug do payload
+  // logger.info('[MP] preference payload', preferencePayload);
+
+  const res = await httpClient.post('https://api.mercadopago.com/checkout/preferences', preferencePayload, {
+    headers: {
+      Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Idempotency-Key': uuid(),
+    },
+    timeout: 20000,
+  });
+
+  const data = res?.data;
+  logger.info('[MP][RES create preference]', { status: res?.status, data });
+
+  const preferenceId = data?.id || null;
+  const initPoint = data?.init_point || data?.sandbox_init_point || null;
+  if (!initPoint) throw new Error('init_point not found in Mercado Pago response');
+
+  await mpRepository.createCheckout({
+    request_id: String(requestId),
+    product_type: productType,
+    preference_id: preferenceId,
+    status: 'CREATED',
+    value: valueNum,
+    link: initPoint,
+    customer: (name || email) ? { name, email } : null,
+    raw: data,
+  });
+
+  try {
+    await mpRepository.logEvent({
+      event_uid: `preference_created_${preferenceId || requestId}`,
+      payload: { request_payload: preferencePayload, response: data },
+      headers: null,
+      query: null,
+      topic: 'preference',
+      action: 'CREATED',
+      preference_id: preferenceId,
+      payment_id: null,
+    });
+  } catch (logErr) {
+    logger.warn('[MP] could not log preference creation event:', logErr?.message || logErr);
+  }
+
+  return { url: initPoint, preferenceId };
+}
+
+async function fetchPayment(paymentId) {
+  if (!paymentId) return null;
+  try {
+    const res = await httpClient.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+        Accept: 'application/json',
+      },
+      timeout: 15000,
+    });
+    return res?.data || null;
+  } catch (e) {
+    logger.error('[MP][ERR fetchPayment]', { paymentId, status: e?.response?.status, msg: e?.message, data: e?.response?.data });
+    return null;
+  }
+}
+
+async function processWebhook(body, meta = {}) {
+  try {
+    const type = meta?.query?.type || meta?.query?.topic || meta?.topic || body?.type || null;
+    const action = body?.action || null;
+    const dataId = meta?.query?.id || body?.data?.id || body?.id || null;
+    const topic = (type || (action ? action.split('.')[0] : '') || '').toLowerCase();
+
+    const providerEventUid =
+      (meta?.headers && (meta.headers['x-request-id'] || meta.headers['x-correlation-id'])) ||
+      `${topic || 'event'}_${dataId || uuid()}_${Date.now()}`;
+
+    const hintedPaymentId = dataId || body?.payment_id || null;
+
+    await mpRepository.logEvent({
+      event_uid: providerEventUid,
+      payload: body,
+      headers: meta.headers || null,
+      query: meta.query || null,
+      topic: topic || null,
+      action: action || null,
+      preference_id: null,
+      payment_id: hintedPaymentId || null,
+    });
+
+    if (topic === 'payment' && hintedPaymentId) {
+      const payment = await fetchPayment(hintedPaymentId);
+      if (!payment) return { ok: true, note: 'payment details not found' };
+
+      const payment_id = String(payment.id);
+      const status = payment.status;               // approved|pending|...
+      const status_detail = payment.status_detail; // accredited, cc_rejected_*, ...
+      const external_reference = payment.external_reference || null; // == request_id
+      let   preference_id = payment.preference_id || null;
+      const amount = Number(payment.transaction_amount || 0);
+
+      const payer = payment.payer || {};
+      const billing = payment.additional_info?.payer?.address || null;
+
+      // ===== upsert payment (com datas do MP) =====
+      await mpRepository.upsertPaymentByPaymentId({
+        payment_id,
+        preference_id,
+        status,
+        status_detail,
+        external_reference,
+        customer: {
+          name: payer?.first_name || payer?.name || null,
+          email: payer?.email || null,
+          tax_id: payer?.identification?.number || null,
+          phone_country: null,
+          phone_area: null,
+          phone_number: payer?.phone?.number || null,
+          address_json: billing ? billing : null,
+        },
+        transaction_amount: amount,
+
+        // Novos campos para ordenar/consistir atualizações
+        date_created: payment?.date_created || null,
+        date_approved: payment?.date_approved || null,
+        date_last_updated: payment?.date_last_updated || payment?.last_updated || null,
+
+        raw: payment,
+      });
+
+      const reqStatus = mapPreferenceStatusFromPayment(status);
+
+      let updatedReq = null;
+      if (preference_id) {
+        updatedReq = await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
+      } else if (external_reference) {
+        updatedReq = await mpRepository.updateRequestStatusByRequestId(external_reference, reqStatus, payment);
+        if (updatedReq?.preference_id) {
+          preference_id = updatedReq.preference_id;
+          await mpRepository.attachPaymentToPreference(payment_id, preference_id);
+        }
+      }
+
+      if ((status || '').toLowerCase() === 'approved') {
+        const record = (payment_id
+          ? await mpRepository.findByPaymentId(payment_id)
+          : preference_id
+          ? await mpRepository.findByPreferenceId(preference_id)
+          : external_reference
+          ? await mpRepository.findByRequestId(external_reference)
+          : null);
+
+        if (record) {
+          const { request_id: requestId, product_type: productType } = record;
+          events.emit('payment:paid', {
+            requestId,
+            productType,
+            paymentId: payment_id,
+            preferenceId: preference_id || record?.preference_id || null,
+            raw: payment,
+          });
+        }
+      }
+    }
+
+    return { ok: true };
+  } catch (err) {
+    logger.error('[MP] Error processing webhook:', err?.message || err);
+    return { ok: false, error: 'internal_error' };
+  }
+}
+
+module.exports = { createCheckout, processWebhook, events };
