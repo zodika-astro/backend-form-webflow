@@ -132,6 +132,16 @@ app.use(express.json({
 // Health check (skip limiters)
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+// metrics
+const { metricsMiddleware, metricsRouter } = require('./middlewares/metrics');
+app.use(metricsMiddleware);
+app.use('/metrics', metricsRouter);
+
+// healthcheck
+const healthzRouter = require('./observability/healthz');
+app.use('/healthz', healthzRouter);
+
+
 // Public assets
 app.use('/assets', express.static(path.join(__dirname, 'public'), { maxAge: '30d', etag: true }));
 
