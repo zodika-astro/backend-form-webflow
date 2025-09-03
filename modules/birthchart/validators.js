@@ -65,10 +65,20 @@ const NameSchema = z
   .min(3, 'name must have at least 3 characters');
 
 const OptionalSocialNameSchema = z
-  .string({ invalid_type_error: 'social_name must be a string' })
-  .trim()
-  .min(1, 'social_name must have at least 1 character')
-  .optional();
+  .union([
+    z.string().trim(), // will be checked for length right after transform
+    z.literal(''),
+    z.null(),
+    z.undefined(),
+  ])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || v.length <= 20, {
+    message: 'social_name must have at most 20 characters',
+  });
 
 const EmailSchema = z
   .string({ required_error: 'email is required', invalid_type_error: 'email must be a string' })
