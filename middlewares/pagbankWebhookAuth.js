@@ -3,6 +3,7 @@
 
 const crypto = require('crypto');
 const db = require('../db/db');
+const { get: getSecret } = require('../config/secretProvider');
 
 /**
  * PagBank webhook authentication & best-effort anti-replay middleware
@@ -15,8 +16,10 @@ const db = require('../db/db');
  *   (Your index.js already registers `express.raw()` for `/webhook/pagbank*`.)
  *
  * Security steps:
+ *  - Obtain the PagBank token via the pluggable secret provider (`get('PAGBANK_API_TOKEN')`).
+ *    *No direct process.env access for secrets in app code.*
  *  - Use the *exact* raw bytes for hashing (no string re-encoding).
- *  - Compare digests using `crypto.timingSafeEqual`.
+ *  - Compare digests using `crypto.timingSafeEqual` (constant-time).
  *  - Provide sandbox escape hatch via `ALLOW_UNSIGNED_WEBHOOKS=true` (dev only).
  *  - Best-effort anti-replay: maintain an in-memory cache of recent request identifiers
  *    (prefer `x-request-id` if present; otherwise fall back to the received signature),
@@ -28,10 +31,8 @@ const db = require('../db/db');
  *  - `req.headers['x-zodika-verified'] = 'true'` for downstream auditing (non-sensitive)
  */
 
-const TOKEN = process.env.PAGBANK_API_TOKEN || '';
+// Non-secret toggles (ok to read from env directly)
 const ALLOW_UNSIGNED = process.env.ALLOW_UNSIGNED_WEBHOOKS === 'true'; // sandbox/dev only
-
-// Anti-replay configuration (short TTL since PagBank may retry on transient 5xx)
 const DEFAULT_DEDUP_TTL_SEC = Number(process.env.PAGBANK_WEBHOOK_DEDUP_TTL_SECONDS || 300); // 5 minutes
 const REJECT_DUP = process.env.PAGBANK_REJECT_DUP_REQUEST_ID === 'true'; // if true, 409 on duplicate within TTL
 
@@ -169,11 +170,19 @@ async function logFailure(reason, req, parsedBody = null) {
 
 /* -------------------------------------- Middleware -------------------------------------------- */
 
-module.exports = function pagbankWebhookAuth(req, res, next) {
+module.exports = async function pagbankWebhookAuth(req, res, next) {
   try {
-    // Basic config guardrails
-    if (!TOKEN && !ALLOW_UNSIGNED) {
-      return res.status(500).json({ message: 'Misconfigured: PAGBANK_API_TOKEN is missing' });
+    // Retrieve secret via secret provider (cached with TTL internally)
+    let TOKEN = '';
+    try {
+      TOKEN = await getSecret('PAGBANK_API_TOKEN'); // required in production
+    } catch (e) {
+      if (!ALLOW_UNSIGNED) {
+        await logFailure('secret_missing', req).catch(() => {});
+        return res.status(500).json({ message: 'Misconfigured: PAGBANK_API_TOKEN is missing' });
+      }
+      // In dev ALLOW_UNSIGNED=true we can proceed (explicitly insecure)
+      TOKEN = '';
     }
 
     // Raw body must be a Buffer (due to express.raw() on this route)
@@ -239,7 +248,7 @@ module.exports = function pagbankWebhookAuth(req, res, next) {
     // Expose verification context (non-sensitive) for downstream handlers/logging
     req.headers['x-zodika-verified'] = 'true';
     req.pagbankSig = {
-      received,         // hex signature from header (not sensitive)
+      received,          // hex signature from header (not sensitive)
       digest: digestHex, // computed hex (not sensitive)
       dedupKey,
       isDuplicate: dup,

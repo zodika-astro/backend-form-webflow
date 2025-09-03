@@ -1,30 +1,51 @@
 // modules/birthchart/controller.js
+'use strict';
 
 const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
 const { getTimezoneAtMoment } = require('../../utils/timezone');
+const { get: getSecret } = require('../../config/secretProvider'); // secure secret retrieval
+const { env } = require('../../config/env'); // runtime feature flags / non-secret config
 
-// 🔁 Troca PagBank -> Mercado Pago
+// Payment providers
 const mpService = require('../../payments/mercadoPago/service');
+const pagbankService = require('../../payments/pagBank/service');
 
 const PRODUCT_IMAGE_URL = 'https://backend-form-webflow-production.up.railway.app/assets/birthchart-productimage.png';
 
+/**
+ * Controller: Birthchart
+ * ----------------------
+ * - Validates and normalizes payload from the public form.
+ * - Resolves timezone using Google Time Zone API (API key via secret provider).
+ * - Creates a checkout using the selected PSP:
+ *     - If env.PAGBANK_ENABLED === true → PagBank
+ *     - Otherwise → Mercado Pago (default)
+ *
+ * Security notes:
+ * - Do not read secrets directly from process.env in controllers.
+ * - Keep logs minimal; do not log PII or tokens.
+ */
 async function processForm(req, res, next) {
   try {
     const payload = req.body;
     validateBirthchartPayload(payload);
 
-    // Timezone
+    // Obtain Google Maps API key via the secret provider (cached).
+    const googleApiKey = await getSecret('GOOGLE_MAPS_API_KEY');
+
+    // Timezone resolution at the birth moment
     const { tzId, offsetMin } = await getTimezoneAtMoment({
       lat: Number(payload.birth_place_lat),
       lng: Number(payload.birth_place_lng),
       birthDate: payload.birth_date,
       birthTime: payload.birth_time,
-      apiKey: process.env.GOOGLE_MAPS_API_KEY,
+      apiKey: googleApiKey,
     });
-    console.log('[DEBUG TZ]', { tzId, offsetMin });
+    // Debug-only: no sensitive data is logged
+    console.debug('[Birthchart][TZ]', { tzId, offsetMin });
 
-    // Repository
+    // Persist the request in the repository
     const newRequest = await createBirthchartRequest({
       name:                 payload.name,
       social_name:          payload.social_name,
@@ -47,7 +68,7 @@ async function processForm(req, res, next) {
       birth_utc_offset_min: offsetMin,
     });
 
-    // Product
+    // Product definition for checkout
     const product = {
       productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
@@ -58,7 +79,7 @@ async function processForm(req, res, next) {
         allow_card: true,
         max_installments: 1,
       },
-      // Usado nas back_urls do MP (success)
+      // Used by Mercado Pago back_urls (success)
       returnUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${newRequest.request_id}`,
       metadata: {
         source: 'webflow',
@@ -66,27 +87,49 @@ async function processForm(req, res, next) {
       },
     };
 
-    // ✅ Checkout (Mercado Pago)
-    const paymentResponse = await mpService.createCheckout({
-      requestId:    newRequest.request_id,
-      name:         newRequest.name,
-      email:        newRequest.email,
-      productType:  product.productType,
-      productName:  product.productName,
-      productValue: product.priceCents,
-      paymentOptions: {
-        allow_pix:        product.payment.allow_pix,
-        allow_card:       product.payment.allow_card,
-        max_installments: product.payment.max_installments,
-      },
-      // extra
-      productImageUrl: PRODUCT_IMAGE_URL,
-      currency:   product.currency,
-      returnUrl:  product.returnUrl,
-      metadata:   product.metadata,
-    });
+    // Choose PSP based on feature flag (bool validated by envalid)
+    const usePagBank = env.PAGBANK_ENABLED === true;
 
-    // Frontend (mantém o mesmo contrato do PagBank)
+    let paymentResponse;
+    if (usePagBank) {
+      // PagBank: `createCheckout` does not consume returnUrl/metadata; omit them for clarity.
+      paymentResponse = await pagbankService.createCheckout({
+        requestId:    newRequest.request_id,
+        name:         newRequest.name,
+        email:        newRequest.email,
+        productType:  product.productType,
+        productName:  product.productName,
+        productValue: product.priceCents,
+        paymentOptions: {
+          allow_pix:        product.payment.allow_pix,
+          allow_card:       product.payment.allow_card,
+          max_installments: product.payment.max_installments,
+        },
+        productImageUrl: PRODUCT_IMAGE_URL,
+        currency:   product.currency,
+      });
+    } else {
+      // Mercado Pago (default)
+      paymentResponse = await mpService.createCheckout({
+        requestId:    newRequest.request_id,
+        name:         newRequest.name,
+        email:        newRequest.email,
+        productType:  product.productType,
+        productName:  product.productName,
+        productValue: product.priceCents,
+        paymentOptions: {
+          allow_pix:        product.payment.allow_pix,
+          allow_card:       product.payment.allow_card,
+          max_installments: product.payment.max_installments,
+        },
+        productImageUrl: PRODUCT_IMAGE_URL,
+        currency:   product.currency,
+        returnUrl:  product.returnUrl,
+        metadata:   product.metadata,
+      });
+    }
+
+    // Keep the same contract expected by the frontend
     return res.status(200).json({ url: paymentResponse.url });
   } catch (error) {
     return next(error);
