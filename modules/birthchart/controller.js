@@ -7,6 +7,9 @@ const { getTimezoneAtMoment } = require('../../utils/timezone');
 const { get: getSecret } = require('../../config/secretProvider'); // secure secret retrieval
 const { env } = require('../../config/env'); // runtime feature flags / non-secret config
 
+// Logger (namespaced) — preserva correlação via req.log quando disponível
+const baseLogger = require('../../utils/logger').child('form.birthchart');
+
 // Payment providers
 const mpService = require('../../payments/mercadoPago/service');
 const pagbankService = require('../../payments/pagBank/service');
@@ -23,18 +26,28 @@ const PRODUCT_IMAGE_URL = 'https://backend-form-webflow-production.up.railway.ap
  *     - Otherwise → Mercado Pago (default)
  *
  * Security notes:
- * - Do not read secrets directly from process.env in controllers.
- * - Keep logs minimal; do not log PII or tokens.
+ * - Do not log PII or tokens; keep logs minimal and structured.
+ * - Secrets must be retrieved via secretProvider (never directly from process.env here).
  */
+
+function safeHost(u) {
+  try { return new URL(u).host; } catch { return undefined; }
+}
+
 async function processForm(req, res, next) {
+  // Derive a request-scoped logger (keeps requestId/correlation from middleware)
+  const logger = (req.log || baseLogger).child('processForm');
+
   try {
+    logger.info('received submission');
+
     const payload = req.body;
     validateBirthchartPayload(payload);
 
     // Obtain Google Maps API key via the secret provider (cached).
     const googleApiKey = await getSecret('GOOGLE_MAPS_API_KEY');
 
-    // Timezone resolution at the birth moment
+    // Timezone resolution at the birth moment (no PII in logs)
     const { tzId, offsetMin } = await getTimezoneAtMoment({
       lat: Number(payload.birth_place_lat),
       lng: Number(payload.birth_place_lng),
@@ -42,8 +55,7 @@ async function processForm(req, res, next) {
       birthTime: payload.birth_time,
       apiKey: googleApiKey,
     });
-    // Debug-only: no sensitive data is logged
-    console.debug('[Birthchart][TZ]', { tzId, offsetMin });
+    logger.info({ tzId, offsetMin }, 'timezone resolved');
 
     // Persist the request in the repository
     const newRequest = await createBirthchartRequest({
@@ -67,6 +79,7 @@ async function processForm(req, res, next) {
       birth_timezone_id:    tzId,
       birth_utc_offset_min: offsetMin,
     });
+    logger.info({ requestId: newRequest.request_id, productType: newRequest.product_type }, 'request persisted');
 
     // Product definition for checkout
     const product = {
@@ -89,10 +102,12 @@ async function processForm(req, res, next) {
 
     // Choose PSP based on feature flag (bool validated by envalid)
     const usePagBank = env.PAGBANK_ENABLED === true;
+    logger.info({ provider: usePagBank ? 'pagbank' : 'mercadopago' }, 'selecting PSP');
 
     let paymentResponse;
+
     if (usePagBank) {
-      // PagBank: `createCheckout` does not consume returnUrl/metadata; omit them for clarity.
+      // PagBank: returnUrl/metadata não são usados aqui
       paymentResponse = await pagbankService.createCheckout({
         requestId:    newRequest.request_id,
         name:         newRequest.name,
@@ -108,6 +123,11 @@ async function processForm(req, res, next) {
         productImageUrl: PRODUCT_IMAGE_URL,
         currency:   product.currency,
       });
+
+      logger.info(
+        { checkoutId: paymentResponse.checkoutId || null, host: safeHost(paymentResponse.url) },
+        'pagbank checkout created'
+      );
     } else {
       // Mercado Pago (default)
       paymentResponse = await mpService.createCheckout({
@@ -127,11 +147,21 @@ async function processForm(req, res, next) {
         returnUrl:  product.returnUrl,
         metadata:   product.metadata,
       });
+
+      logger.info(
+        { preferenceId: paymentResponse.preferenceId || null, host: safeHost(paymentResponse.url) },
+        'mercadopago preference created'
+      );
     }
 
     // Keep the same contract expected by the frontend
     return res.status(200).json({ url: paymentResponse.url });
   } catch (error) {
+    // Log structured error (stack é manejada pelo error handler em produção)
+    const msg = error?.message || 'unknown_error';
+    const code = error?.status || 500;
+    // Não incluir payload/PII aqui
+    (req.log || baseLogger).error({ err: msg, status: code }, 'failed to process form');
     return next(error);
   }
 }
