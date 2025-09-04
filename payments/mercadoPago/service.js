@@ -3,15 +3,21 @@
 /**
  * Mercado Pago Service
  * --------------------
- * - Create checkout preferences (hosted checkout).
- * - Process webhooks e upsert normalizado.
- * - Emite "payment:paid" para downstream.
+ * Responsibilities
+ *   - Create checkout preferences (hosted checkout).
+ *   - Process webhooks and upsert normalized records.
+ *   - Emit domain events ("payment:paid") on APPROVED.
  *
- * Extras:
- * - URLs seguras (HTTPS + tamanho).
- * - Timeouts/retries pelo utils/httpClient.
- * - Logger estruturado por contexto (ctx.log) com correlação.
- * - Métricas Prometheus opcionais (sem hard dep).
+ * Non-functional
+ *   - Exponential backoff (utils/httpClient) + explicit timeouts.
+ *   - HTTPS URL normalization and length bounds for safety.
+ *   - Structured logging with request correlation (no PII).
+ *   - Optional Prometheus metrics (gracefully disabled if abscent).
+ *
+ * API
+ *   - createCheckout(input, ctx?) -> { url, preferenceId }
+ *   - processWebhook(body, meta, ctx?) -> { ok, ... }
+ *   - events (EventEmitter)
  */
 
 const httpClient = require('../../utils/httpClient');
@@ -24,9 +30,9 @@ const mpRepository = require('./repository');
 const events = new EventEmitter();
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
-/* --------------------------- Métricas (opcional) --------------------------- */
+/* ------------------------------- Metrics (optional) -------------------------------- */
 let prom = null;
-try { prom = require('prom-client'); } catch (_) { /* metrics disabled */ }
+try { prom = require('prom-client'); } catch { /* metrics disabled */ }
 
 const mpHistogram = prom
   ? new prom.Histogram({
@@ -43,24 +49,33 @@ function observe(op, status, startNs) {
   mpHistogram.labels(op, String(status || 'ERR')).observe(Number(dur));
 }
 
-/* -------------------------------- Helpers --------------------------------- */
-const stripQuotesAndSemicolons = (u) => {
+/* --------------------------------- Helpers ----------------------------------------- */
+
+/** Trim quotes and dangling separators that might sneak in via CMS/spreadsheets. */
+function stripQuotesAndSemicolons(u) {
   if (!u) return null;
   let s = String(u).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
   s = s.replace(/[.;\s]+$/g, '');
   return s;
-};
+}
 
-const normalizeHttpsUrl = (u, { max = 255 } = {}) => {
+/** Accept only well-formed HTTPS URLs with bounded length; return null if invalid. */
+function normalizeHttpsUrl(u, { max = 255 } = {}) {
   const s = stripQuotesAndSemicolons(u);
   if (!s) return null;
   if (!/^https:\/\/[^\s<>"]+$/i.test(s)) return null;
   if (s.length > max) return null;
   return s;
-};
+}
 
-const mapPreferenceStatusFromPayment = (paymentStatus) => {
+/** Safe host extraction for logs (never log full URLs to avoid query/PII leaks). */
+function safeHost(u) {
+  try { return new URL(u).host; } catch { return undefined; }
+}
+
+/** Map Mercado Pago payment.status → internal request status. */
+function mapPreferenceStatusFromPayment(paymentStatus) {
   switch ((paymentStatus || '').toLowerCase()) {
     case 'approved': return 'APPROVED';
     case 'in_process':
@@ -72,42 +87,52 @@ const mapPreferenceStatusFromPayment = (paymentStatus) => {
     case 'canceled': return 'CANCELED';
     default: return 'UPDATED';
   }
-};
+}
 
-/* ------------------------------- API calls ------------------------------- */
+/* --------------------------------- API calls --------------------------------------- */
 
 /**
- * Cria uma preference (hosted checkout) no MP.
+ * Create a hosted checkout preference on Mercado Pago.
+ * Notes:
+ *   - Amount is provided in cents; we convert to BRL with 2 decimals.
+ *   - Boleto is excluded by default (only PIX + credit card).
+ *   - Idempotency via `X-Idempotency-Key` to avoid duplicate preferences.
  */
-async function createCheckout({
-  requestId, name, email, productType,
-  productValue, productName, paymentOptions,
-  currency, productImageUrl, returnUrl, metadata = {},
-}, ctx = {}) {
-  const log = (ctx?.log || baseLogger).child('createCheckout');
+async function createCheckout(input, ctx = {}) {
+  const {
+    requestId, name, email, productType,
+    productValue, productName, paymentOptions,
+    currency, productImageUrl, returnUrl, metadata = {},
+  } = input || {};
+
+  const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
+
   if (!requestId) throw new Error('requestId is required');
 
-  // productValue em centavos
   const valueNum = Number(productValue);
   if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
+  // back_urls (validated) + notification target
   const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
   const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
   const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
-
   const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
+
+  // product image for MP UI (optional)
   const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
 
+  // cents → reais
   const amount = Math.round(valueNum) / 100;
 
+  // Accept PIX and/or Credit Card; explicitly exclude boleto.
   const allowPix  = !!(paymentOptions && paymentOptions.allow_pix);
   const allowCard = !!(paymentOptions && paymentOptions.allow_card);
   const maxInst   = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
 
-  const excluded_payment_types = [{ id: 'ticket' }]; // nunca boleto
+  const excluded_payment_types = [{ id: 'ticket' }];
   if (!allowCard) excluded_payment_types.push({ id: 'credit_card' });
 
   const excluded_payment_methods = [];
@@ -134,26 +159,21 @@ async function createCheckout({
     auto_return: 'approved',
     notification_url: notification_url || undefined,
     metadata: { source: 'webflow', ...metadata },
+    // binary_mode: true, // optional: skip intermediate "pending"
     payment_methods,
-    // binary_mode: true, // para eliminar "pending"
   };
 
   const op = 'create_preference';
   const t0 = process.hrtime.bigint();
   const url = 'https://api.mercadopago.com/checkout/preferences';
 
-  const corrHeaders = ctx?.requestId
-    ? { 'X-Request-Id': String(ctx.requestId), 'X-Correlation-Id': String(ctx.requestId) }
-    : {};
-
   try {
     const res = await httpClient.post(url, preferencePayload, {
       headers: {
         Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
         Accept: 'application/json',
+        'Content-Type': 'application/json',
         'X-Idempotency-Key': uuid(),
-        ...corrHeaders,
       },
       timeout: 20_000,
       retries: 2,
@@ -179,6 +199,7 @@ async function createCheckout({
       raw: data,
     });
 
+    // Best-effort audit trail
     try {
       await mpRepository.logEvent({
         event_uid: `preference_created_${preferenceId || requestId}`,
@@ -190,39 +211,33 @@ async function createCheckout({
         preference_id: preferenceId,
         payment_id: null,
       });
-    } catch (logErr) {
-      log.warn({ err: logErr?.message }, 'could not log preference creation event');
+    } catch (e) {
+      log.warn({ msg: e?.message }, 'could not log preference creation event');
     }
 
+    log.info({ preferenceId, host: safeHost(initPoint) }, 'checkout ready');
     return { url: initPoint, preferenceId };
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
-    log.error({ status: e?.response?.status, msg: e?.message }, 'createPreference error');
+    log.error({ status: e?.response?.status, msg: e?.message }, 'create preference failed');
     throw e;
   }
 }
 
-/**
- * Busca o pagamento completo por paymentId.
- */
+/** Fetch full payment details; used by webhook reconciliation. */
 async function fetchPayment(paymentId, ctx = {}) {
-  const log = (ctx?.log || baseLogger).child('fetchPayment');
+  const log = (ctx.log || baseLogger).child('fetch', { rid: ctx.requestId });
   if (!paymentId) return null;
 
   const op = 'get_payment';
   const t0 = process.hrtime.bigint();
   const url = `https://api.mercadopago.com/v1/payments/${paymentId}`;
 
-  const corrHeaders = ctx?.requestId
-    ? { 'X-Request-Id': String(ctx.requestId), 'X-Correlation-Id': String(ctx.requestId) }
-    : {};
-
   try {
     const res = await httpClient.get(url, {
       headers: {
         Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
         Accept: 'application/json',
-        ...corrHeaders,
       },
       timeout: 15_000,
       retries: 3,
@@ -232,22 +247,31 @@ async function fetchPayment(paymentId, ctx = {}) {
     return res?.data || null;
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
-    log.error({ paymentId, status: e?.response?.status, msg: e?.message }, 'fetchPayment error');
+    log.error({ paymentId, status: e?.response?.status, msg: e?.message }, 'fetch payment failed');
     return null;
   }
 }
 
-/* --------------------------- Webhook processing --------------------------- */
+/* -------------------------------- Webhook handler ---------------------------------- */
 
+/**
+ * Process an authenticated webhook (idempotent).
+ *   1) Persist raw event for audit (headers/query/body).
+ *   2) If topic=payment, fetch full payment and upsert normalized row.
+ *   3) Update request status (approved/pending/rejected/…).
+ *   4) Emit "payment:paid" on APPROVED.
+ */
 async function processWebhook(body, meta = {}, ctx = {}) {
-  const log = (ctx?.log || baseLogger).child('processWebhook');
+  const log = (ctx.log || baseLogger).child('webhook', { rid: ctx.requestId });
 
   try {
+    // Normalize v1/v2 feed shapes
     const type = meta?.query?.type || meta?.query?.topic || meta?.topic || body?.type || null;
     const action = body?.action || null;
     const dataId = meta?.query?.id || body?.data?.id || body?.id || null;
     const topic = (type || (action ? action.split('.')[0] : '') || '').toLowerCase();
 
+    // Stable event UID for dedupe/audit
     const providerEventUid =
       (meta?.headers && (meta.headers['x-request-id'] || meta.headers['x-correlation-id'])) ||
       `${topic || 'event'}_${dataId || uuid()}_${Date.now()}`;
@@ -302,8 +326,8 @@ async function processWebhook(body, meta = {}, ctx = {}) {
       });
 
       const reqStatus = mapPreferenceStatusFromPayment(status);
-
       let updatedReq = null;
+
       if (preference_id) {
         updatedReq = await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
       } else if (external_reference) {
@@ -332,13 +356,14 @@ async function processWebhook(body, meta = {}, ctx = {}) {
             preferenceId: preference_id || record?.preference_id || null,
             raw: payment,
           });
+          log.info({ paymentId: payment_id, preferenceId: preference_id || undefined }, 'payment approved');
         }
       }
     }
 
     return { ok: true };
   } catch (err) {
-    log.error({ msg: err?.message }, 'webhook processing error');
+    log.error({ msg: err?.message }, 'webhook processing failed');
     return { ok: false, error: 'internal_error' };
   }
 }
