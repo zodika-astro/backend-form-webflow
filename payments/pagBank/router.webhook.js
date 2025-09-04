@@ -1,35 +1,48 @@
-// payments/pagbank/router.webhook.js
 'use strict';
-
-const express = require('express');
-const router = express.Router();
-const pagbankWebhookAuth = require('../../middlewares/pagbankWebhookAuth');
-const pagbankController = require('./controller');
 
 /**
  * PagBank Webhook Router
  * ----------------------
- * - Path supports an optional secret suffix for obscurity-through-URL. This is NOT a substitute
- *   for signature verification — `pagbankWebhookAuth` is mandatory.
- * - The application (index.js) must register `express.raw()` for the `/webhook/pagbank*` prefix
- *   *before* any JSON parsers, so `req.rawBody` remains an exact Buffer of the incoming payload.
- * - This router does not attach any body parsers to avoid double-parsing.
+ * Responsibilities:
+ *   - Receive & authenticate webhooks (raw body configured at app level).
+ *   - Soft-fail on signature/timestamp issues (never drop the request).
+ *   - Pass normalized `meta` and a correlation `ctx` to the service layer.
+ *   - Respond 200 to avoid unnecessary provider retries; processing is idempotent.
  */
 
-const secret = process.env.WEBHOOK_PATH_SECRET || '';
-const path = secret ? `/webhook/pagbank/${secret}` : '/webhook/pagbank';
+const express = require('express');
+const router = express.Router();
 
-// Lightweight liveness endpoint for monitors (does not validate signatures)
-router.get(path, (req, res) => res.status(200).send('OK'));
+const service = require('./service');
+const pagbankWebhookAuth = require('../../middlewares/pagbankWebhookAuth');
 
-// Optional: HEAD for health checks behind certain load balancers
-router.head(path, (req, res) => res.sendStatus(200));
+function correlationHeaders(req) {
+  const rid = req.requestId || req.get('x-request-id') || req.get('x-correlation-id');
+  return {
+    'x-request-id': rid || undefined,
+    'x-correlation-id': rid || undefined,
+  };
+}
 
-// Webhook receiver (POST only): signature/anti-replay enforced by `pagbankWebhookAuth`.
-// The controller should return quickly (200/204) so the PSP does not redeliver excessively.
-router.post(path, pagbankWebhookAuth, pagbankController.handleWebhook);
+router.post('/webhook/pagbank/:secret?', pagbankWebhookAuth, async (req, res, next) => {
+  const rid = req.requestId || req.get('x-request-id');
+  if (rid) res.set('X-Request-Id', String(rid));
 
-// Fail closed for any other method to reduce the attack surface
-router.all(path, (req, res) => res.status(405).json({ message: 'Method Not Allowed' }));
+  try {
+    const body = req.body || {};
+    const meta = {
+      headers: correlationHeaders(req),
+      query:   req.query || {},
+      topic:   body?.type || req.query?.topic || undefined,
+      action:  body?.action || undefined,
+    };
+    const ctx = { requestId: req.requestId, log: req.log };
+
+    const out = await service.processWebhook(body, meta, ctx);
+    res.status(200).json(out || { ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = router;
