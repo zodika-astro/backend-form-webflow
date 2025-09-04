@@ -32,7 +32,7 @@
 const httpClient = require('../../utils/httpClient');
 const crypto = require('crypto');
 const EventEmitter = require('events');
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child('payments.mp');
 const { env } = require('../../config/env');
 const mpRepository = require('./repository');
 
