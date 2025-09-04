@@ -238,20 +238,6 @@ app.use('/', mpWebhookRouter);
  */
 app.use(errorHandlerMiddleware);
 
-/**
- * Startup
- * -------
- * Export the app for tests and start the server when run directly.
- */
-if (require.main === module) {
-  app.listen(PORT, () => {
-    // Keep startup log minimal; never print sensitive env values.
-    // Note: TRUST_PROXY_SETTING may be boolean or number.
-    // eslint-disable-next-line no-console
-    console.log(`Server running on port ${PORT} (trust proxy = ${String(TRUST_PROXY_SETTING)})`);
-  });
-}
-
 module.exports = app;
 
 app.listen(PORT, () => {
