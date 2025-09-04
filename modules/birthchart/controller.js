@@ -103,9 +103,10 @@ async function processForm(req, res, next) {
     // Choose PSP based on feature flag (bool validated by envalid)
     const usePagBank = env.PAGBANK_ENABLED === true;
     logger.info({ provider: usePagBank ? 'pagbank' : 'mercadopago' }, 'selecting PSP');
-
+    
     let paymentResponse;
-
+    
+    const ctx = { requestId: req.requestId, log: req.log || baseLogger };
     if (usePagBank) {
       // PagBank: returnUrl/metadata não são usados aqui
       paymentResponse = await pagbankService.createCheckout({
@@ -122,7 +123,7 @@ async function processForm(req, res, next) {
         },
         productImageUrl: PRODUCT_IMAGE_URL,
         currency:   product.currency,
-      });
+      }, ctx);
 
       logger.info(
         { checkoutId: paymentResponse.checkoutId || null, host: safeHost(paymentResponse.url) },
@@ -146,7 +147,7 @@ async function processForm(req, res, next) {
         currency:   product.currency,
         returnUrl:  product.returnUrl,
         metadata:   product.metadata,
-      });
+      }, ctx);
 
       logger.info(
         { preferenceId: paymentResponse.preferenceId || null, host: safeHost(paymentResponse.url) },
