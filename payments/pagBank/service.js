@@ -1,4 +1,6 @@
-    'use strict';
+// payments/pagBank/service.js
+
+'use strict';
 
 /**
  * PagBank Service
@@ -22,6 +24,7 @@
 
 const httpClient = require('../../utils/httpClient');
 const baseLogger = require('../../utils/logger').child('payments.pagbank');
+const { AppError } = require('../../utils/appError');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
@@ -98,15 +101,19 @@ async function createCheckout(input, ctx = {}) {
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
 
-  if (!requestId) throw new Error('requestId is required');
+  if (!requestId) throw AppError.fromUnexpected('pagbank_checkout_failed', 'requestId is required', { status: 400 });
 
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
+  if (!Number.isFinite(valueNum) || valueNum <= 0) {
+    throw AppError.fromUnexpected('pagbank_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
+  }
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
   const redirectUrlRaw = `${PUBLIC_BASE_URL}/pagbank/return`;
   const redirect_url = normalizeHttpsUrl(redirectUrlRaw);
-  if (!redirect_url) throw new Error('invalid redirect_url');
+  if (!redirect_url) {
+    throw AppError.fromUnexpected('pagbank_checkout_failed', 'invalid redirect_url', { status: 400 });
+  }
 
   // Payment methods (PIX + CARD unless disabled)
   const methods = [];
@@ -184,7 +191,9 @@ async function createCheckout(input, ctx = {}) {
     }
     if (!payLink && data.payment_url) payLink = data.payment_url;
     if (!payLink && data.checkout?.payment_url) payLink = data.checkout.payment_url;
-    if (!payLink) throw new Error('PAY link not found in PagBank return');
+    if (!payLink) {
+      throw AppError.fromUnexpected('pagbank_checkout_failed', 'PAY link not found in PagBank return');
+    }
 
     await pagbankRepository.createCheckout({
       request_id: String(requestId),
@@ -222,7 +231,13 @@ async function createCheckout(input, ctx = {}) {
     } else {
       log.error({ msg: e.message }, 'create checkout network error');
     }
-    throw e;
+    // Normalize upstream error into AppError with standardized code
+    throw AppError.fromUpstream(
+      'pagbank_checkout_failed',
+      'Failed to create checkout with PagBank',
+      e,
+      { provider: 'pagbank', endpoint: url }
+    );
   }
 }
 
@@ -235,6 +250,8 @@ async function createCheckout(input, ctx = {}) {
  *   2) Update checkout status if present.
  *   3) Upsert payment by chargeId with normalized customer fields.
  *   4) Emit "payment:paid" for status === 'PAID'.
+ *
+ * Note: tolerant behavior; returns {ok:false} instead of throwing to keep 2xx at the edge.
  */
 async function processWebhook(p, meta = {}, ctx = {}) {
   const log = (ctx.log || baseLogger).child('webhook', { rid: ctx.requestId });
@@ -288,8 +305,9 @@ async function processWebhook(p, meta = {}, ctx = {}) {
 
     return { ok: true };
   } catch (err) {
-    log.error({ msg: err?.message }, 'webhook processing failed');
-    return { ok: false, error: 'internal_error' };
+    const wrapped = AppError.fromUnexpected('pagbank_webhook_failed', 'Error processing PagBank webhook', { cause: err });
+    log.error({ code: wrapped.code, msg: wrapped.message }, 'webhook processing failed');
+    return { ok: false, error: wrapped.code };
   }
 }
 
