@@ -1,128 +1,120 @@
-const crypto = require('crypto');
+// payments/pagBank/mapPayload.js
+'use strict';
 
-function stableStringify(obj) {
-  return JSON.stringify(obj, Object.keys(obj || {}).sort());
+/**
+ * mapWebhookPayload(payload)
+ * -------------------------
+ * Canonicalizes PagBank webhook payloads (v1/v2 variants) to a stable shape:
+ *   {
+ *     eventId,        // stable uid if present (fallback to payload.id or generated)
+ *     objectType,     // 'charge' | 'checkout' | 'unknown'
+ *     checkoutId,     // when applicable
+ *     chargeId,       // when applicable
+ *     referenceId,    // external reference / request id
+ *     status,         // uppercased; defaults to 'CREATED' for checkout-only events
+ *     customer,       // { name, email, tax_id } when available
+ *   }
+ */
+
+function upper(s) {
+  return (s == null) ? undefined : String(s).trim().toUpperCase();
 }
 
-function hashPayload(obj) {
-  return crypto.createHash('sha256').update(stableStringify(obj)).digest('hex');
+function first(...vals) {
+  for (const v of vals) if (v != null && v !== '') return v;
+  return undefined;
 }
 
-function normalizeCustomer(customer = {}) {
-  const phones = Array.isArray(customer.phones) ? customer.phones : [];
-  const phone = phones[0] || {};
-  const address = customer.address ? customer.address : undefined;
+function detectType(p) {
+  const raw = String(
+    first(p?.object_type, p?.object?.type, p?.type, p?.topic, p?.event_type, p?.event)
+  || ''
+  ).toLowerCase();
 
-  const phoneCountry = phone.country ?? phone.country_code ?? null;
-  const phoneArea = phone.area ?? phone.area_code ?? null;
-  const phoneNumber = phone.number ?? phone.phone_number ?? null;
+  if (raw.includes('charge')) return 'charge';
+  if (raw.includes('checkout')) return 'checkout';
 
-  return {
-    name: customer.name || null,
-    email: customer.email || null,
-    tax_id: customer.tax_id || null,
-    phone_country: phoneCountry || null,
-    phone_area: phoneArea || null,
-    phone_number: phoneNumber || null,
-   
-    address_json: address || null,
-  };
-}
+  // Heuristics by field presence
+  if (p?.charge || p?.data?.charge || p?.data?.charge_id) return 'charge';
+  if (p?.checkout || p?.data?.checkout || p?.data?.checkout_id) return 'checkout';
 
-function unwrapData(payload = {}) {
-
-  if (payload && payload.data && typeof payload.data === 'object') return payload.data;
-  return payload;
-}
-
-function detectObjectType(p) {
-  if (p?.object === 'checkout') return 'checkout';
-  if (Array.isArray(p?.charges)) return 'charge';
-  if (p?.items && p?.status && p?.id) return 'checkout';
   return 'unknown';
 }
 
-function normalizeMoney(amount = {}) {
-  const raw = amount.value ?? amount.total ?? 0;
-  const currency = amount.currency ?? null;
+function mapCustomer(p) {
+  const c = first(p?.customer, p?.data?.customer, p?.buyer);
+  if (!c || typeof c !== 'object') return undefined;
 
- 
-  let cents = 0;
-  if (typeof raw === 'number') {
-    cents = Number.isInteger(raw) ? raw : Math.round(raw * 100);
-  } else if (typeof raw === 'string') {
-    cents = raw.includes('.') ? Math.round(parseFloat(raw) * 100) : parseInt(raw, 10);
-    if (!Number.isFinite(cents)) cents = 0;
-  }
+  const name = first(c.name, c.full_name);
+  const email = c.email;
+  const tax = (c.tax_id && typeof c.tax_id === 'object')
+    ? (c.tax_id.number || c.tax_id.value)
+    : first(c.tax_id, c.document, c.cpf, c.cnpj);
 
-  return { cents, currency };
+  const out = {};
+  if (name) out.name = String(name);
+  if (email) out.email = String(email).toLowerCase();
+  if (tax) out.tax_id = String(tax);
+  return Object.keys(out).length ? out : undefined;
 }
 
-function normalizeStatus(s) {
-  if (!s) return 'UNKNOWN';
-  const up = String(s).toUpperCase();
-  const map = {
-    PAID: 'PAID',
-    AUTHORIZED: 'AUTHORIZED',
-    AUTHORIZED_PENDING_CAPTURE: 'AUTHORIZED',
-    IN_ANALYSIS: 'IN_ANALYSIS',
-    PENDING: 'PENDING',
-    DECLINED: 'DECLINED',
-    REFUSED: 'REFUSED',
-    CANCELED: 'CANCELED',
-    CANCELLED: 'CANCELED',
-    REFUNDED: 'REFUNDED',
-    CHARGED_BACK: 'CHARGED_BACK',
-    FAILED: 'FAILED',
-    UPDATED: 'UPDATED',
-    EXPIRED: 'EXPIRED',
-  };
-  return map[up] || 'UNKNOWN';
+function mapStatus(p, objectType) {
+  const raw =
+    first(
+      p?.status,
+      p?.data?.status,
+      p?.charge?.status,
+      p?.checkout?.status
+    );
+
+  // Business rule required by tests: a "checkout" event without explicit status
+  // should be treated as the beginning of the flow.
+  if (!raw && objectType === 'checkout') return 'CREATED';
+
+  return upper(raw) || 'UNKNOWN';
 }
 
-function mapWebhookPayload(rawPayload) {
-  const pagbankPayload = unwrapData(rawPayload);
-  const objectType = detectObjectType(pagbankPayload);
-
-  const checkoutId =
-    objectType === 'checkout'
-      ? pagbankPayload.id
-      : pagbankPayload?.checkout?.id || null;
-
-  const firstCharge = Array.isArray(pagbankPayload?.charges)
-    ? pagbankPayload.charges[0]
-    : undefined;
-
-  const chargeId = firstCharge?.id || pagbankPayload?.charge?.id || null;
-
-  const status = normalizeStatus(firstCharge?.status || pagbankPayload?.status);
-
-  const referenceId =
-    pagbankPayload?.reference_id ||
-    pagbankPayload?.checkout?.reference_id ||
-    firstCharge?.reference_id ||
-    null;
-
-  const customerData = normalizeCustomer(
-    pagbankPayload.customer ||
-    pagbankPayload?.checkout?.customer ||
-    firstCharge?.customer ||
-    {}
+function mapIds(p, objectType) {
+  const chargeId = first(
+    p?.charge_id,
+    p?.charge?.id,
+    p?.data?.charge_id,
+    (objectType === 'charge' ? p?.data?.id : undefined)
   );
 
-  const { cents: value_cents, currency } = normalizeMoney(
-    firstCharge?.amount || pagbankPayload?.amount || {}
+  const checkoutId = first(
+    p?.checkout_id,
+    p?.checkout?.id,
+    p?.data?.checkout_id,
+    (objectType === 'checkout' ? p?.data?.id : undefined)
   );
 
-  const providerId =
-    pagbankPayload?.event_id ||
-    pagbankPayload?.notification_id ||
-    pagbankPayload?.id ||
-    null;
+  const referenceId = first(
+    p?.reference_id,
+    p?.data?.reference_id,
+    p?.charge?.reference_id,
+    p?.checkout?.reference_id
+  );
 
-  const eventId = providerId
-    ? `pg_${objectType}_${providerId}`
-    : hashPayload({ h: pagbankPayload, t: objectType });
+  return { chargeId, checkoutId, referenceId };
+}
+
+function mapEventId(p) {
+  return first(
+    p?.event_id,
+    p?.id,
+    p?.data?.event_id,
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
+}
+
+function mapWebhookPayload(payload) {
+  const p = payload || {};
+  const objectType = detectType(p);
+  const { chargeId, checkoutId, referenceId } = mapIds(p, objectType);
+  const status = mapStatus(p, objectType);
+  const customer = mapCustomer(p);
+  const eventId = mapEventId(p);
 
   return {
     eventId,
@@ -131,11 +123,8 @@ function mapWebhookPayload(rawPayload) {
     chargeId,
     referenceId,
     status,
-    value_cents,
-    currency,
-    customer: customerData,
-    rawPayload: pagbankPayload,
+    customer,
   };
 }
 
-module.exports = { mapWebhookPayload, normalizeCustomer };
+module.exports = { mapWebhookPayload };
