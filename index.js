@@ -239,7 +239,3 @@ app.use('/', mpWebhookRouter);
 app.use(errorHandlerMiddleware);
 
 module.exports = app;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
