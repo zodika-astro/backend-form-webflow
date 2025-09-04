@@ -1,3 +1,5 @@
+//payment/mercadoPago/service.js
+
 'use strict';
 
 /**
@@ -12,7 +14,7 @@
  *   - Exponential backoff (utils/httpClient) + explicit timeouts.
  *   - HTTPS URL normalization and length bounds for safety.
  *   - Structured logging with request correlation (no PII).
- *   - Optional Prometheus metrics (gracefully disabled if abscent).
+ *   - Optional Prometheus metrics (gracefully disabled if absent).
  *
  * API
  *   - createCheckout(input, ctx?) -> { url, preferenceId }
@@ -24,6 +26,7 @@ const httpClient = require('../../utils/httpClient');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const baseLogger = require('../../utils/logger').child('payments.mp');
+const { AppError } = require('../../utils/appError');
 const { env } = require('../../config/env');
 const mpRepository = require('./repository');
 
@@ -107,10 +110,12 @@ async function createCheckout(input, ctx = {}) {
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
 
-  if (!requestId) throw new Error('requestId is required');
+  if (!requestId) throw AppError.fromUnexpected('mp_checkout_failed', 'requestId is required', { status: 400 });
 
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) throw new Error('invalid productValue (cents, integer > 0)');
+  if (!Number.isFinite(valueNum) || valueNum <= 0) {
+    throw AppError.fromUnexpected('mp_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
+  }
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
@@ -186,7 +191,9 @@ async function createCheckout(input, ctx = {}) {
     const data = res?.data || {};
     const preferenceId = data.id || null;
     const initPoint = data.init_point || data.sandbox_init_point || null;
-    if (!initPoint) throw new Error('init_point not found in Mercado Pago response');
+    if (!initPoint) {
+      throw AppError.fromUnexpected('mp_checkout_failed', 'init_point not found in Mercado Pago response');
+    }
 
     await mpRepository.createCheckout({
       request_id: String(requestId),
@@ -220,7 +227,13 @@ async function createCheckout(input, ctx = {}) {
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
     log.error({ status: e?.response?.status, msg: e?.message }, 'create preference failed');
-    throw e;
+    // Normalize upstream error into AppError with standardized code
+    throw AppError.fromUpstream(
+      'mp_checkout_failed',
+      'Failed to create checkout with Mercado Pago',
+      e,
+      { provider: 'mercadopago', endpoint: url }
+    );
   }
 }
 
@@ -260,6 +273,9 @@ async function fetchPayment(paymentId, ctx = {}) {
  *   2) If topic=payment, fetch full payment and upsert normalized row.
  *   3) Update request status (approved/pending/rejected/…).
  *   4) Emit "payment:paid" on APPROVED.
+ *
+ * Note: This handler is intentionally tolerant; it returns {ok:false} instead of throwing
+ * to avoid surfacing 5xx to the provider. The router decides the HTTP response.
  */
 async function processWebhook(body, meta = {}, ctx = {}) {
   const log = (ctx.log || baseLogger).child('webhook', { rid: ctx.requestId });
@@ -363,8 +379,10 @@ async function processWebhook(body, meta = {}, ctx = {}) {
 
     return { ok: true };
   } catch (err) {
-    log.error({ msg: err?.message }, 'webhook processing failed');
-    return { ok: false, error: 'internal_error' };
+    // Keep behavior tolerant but log with a standardized code for observability.
+    const wrapped = AppError.fromUnexpected('mp_webhook_failed', 'Error processing Mercado Pago webhook', { cause: err });
+    log.error({ code: wrapped.code, msg: wrapped.message }, 'webhook processing failed');
+    return { ok: false, error: wrapped.code };
   }
 }
 
