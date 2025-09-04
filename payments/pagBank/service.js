@@ -22,7 +22,7 @@
  */
 
 const httpClient = require('../../utils/httpClient');
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child('payments.pagbank');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
