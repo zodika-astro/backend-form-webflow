@@ -45,6 +45,10 @@ function resolveTrustProxySetting() {
 const TRUST_PROXY_SETTING = resolveTrustProxySetting();
 app.set('trust proxy', TRUST_PROXY_SETTING);
 
+// Correlation id
+const correlationId = require('./middlewares/correlationId');
+app.use(correlationId);
+
 // Middlewares
 const corsMiddleware = require('./middlewares/cors');
 const errorHandlerMiddleware = require('./middlewares/errorHandler');
