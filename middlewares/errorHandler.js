@@ -1,24 +1,52 @@
-// middlewares/errorHandler.js
+'use strict';
 
 /**
- * Express error-handling middleware.
- * Captures errors thrown in routes/controllers and formats a consistent JSON response.
+ * Global Error Handler
+ * --------------------
+ * Purpose:
+ *   - Convert thrown errors/exceptions into clean JSON responses.
+ *   - Emit structured logs (no PII) with request correlation.
+ *   - Avoid leaking stack traces in production.
  *
- * @param {Error} err - The error object
- * @param {import('express').Request} req - Express request object
- * @param {import('express').Response} res - Express response object
- * @param {import('express').NextFunction} next - Express next middleware function
+ * Conventions:
+ *   - `err.status` (HTTP status) and `err.code` (machine-readable code) are optional.
+ *   - We always attach `X-Request-Id` to the response when available.
  */
-function errorHandler(err, req, res, next) {
-  console.error(err); // You can replace this with your logger utility
 
-  const statusCode = res.statusCode && res.statusCode !== 200 ? res.statusCode : 500;
+const baseLogger = require('../utils/logger').child('error');
 
-  res.status(statusCode).json({
-    message: err.message || 'Internal Server Error',
-    // Only expose stack in development
-    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
-  });
-}
+module.exports = function errorHandler(err, req, res, _next) {
+  const status = Number(err?.status || 500);
+  const code   = String(err?.code || 'internal_error');
+  const rid    = req?.requestId || null;
+  const log    = (req?.log || baseLogger).child('handler');
 
-module.exports = errorHandler;
+  // Surface correlation id to the client for support/debugging.
+  if (rid) res.set('X-Request-Id', String(rid));
+
+  // Structured log without PII or secrets.
+  log.error({
+    status,
+    code,
+    rid,
+    method: req?.method,
+    path: req?.originalUrl,
+    msg: err?.message,
+  }, 'unhandled error');
+
+  // Minimal, client-safe payload.
+  const body = {
+    error: {
+      code,
+      message: status >= 500 ? 'Internal server error' : (err?.message || 'Request error'),
+      request_id: rid || undefined,
+    }
+  };
+
+  // Only show stack traces outside production.
+  if (process.env.NODE_ENV !== 'production' && err?.stack) {
+    body.error.stack = err.stack;
+  }
+
+  res.status(status).json(body);
+};
