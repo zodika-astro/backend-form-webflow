@@ -1,64 +1,37 @@
-// utils/errorCodes.js
 'use strict';
 
 /**
- * Canonical error codes (stable, kebab/dot case).
- * Regra: domínio.subdomínio.motivo
- * - Curto, estável, sem IDs sensíveis.
- * - Usado para métricas, alertas e dashboards.
+ * Stable, machine-readable error codes used across the application.
+ * Keep codes lowercase with underscores. Once introduced, avoid renaming
+ * to preserve dashboards, alerts, and client-side handling.
+ *
+ * Grouped by domain for readability. You can safely add new codes over time.
  */
-const codes = Object.freeze({
-  // Form & validações
-  form: {
-    birthchart: {
-      validation_failed: 'form.birthchart.validation_failed',
-    },
-  },
+module.exports = {
+  /* Generic */
+  INTERNAL_ERROR: 'internal_error',
+  INVALID_ARGUMENT: 'invalid_argument',
+  VALIDATION_FAILED: 'validation_failed',
+  NOT_FOUND: 'not_found',
+  CONFLICT: 'conflict',
+  UNAUTHORIZED: 'unauthorized',
+  FORBIDDEN: 'forbidden',
+  TOO_MANY_REQUESTS: 'too_many_requests',
+  UPSTREAM_ERROR: 'upstream_error',
+  TIMEOUT: 'timeout',
+  BAD_GATEWAY: 'bad_gateway',
+  SERVICE_UNAVAILABLE: 'service_unavailable',
 
-  // Pagamentos
-  payments: {
-    mp: {
-      checkout_failed: 'payments.mp.checkout_failed',
-      payment_fetch_failed: 'payments.mp.payment_fetch_failed',
-      webhook_process_failed: 'payments.mp.webhook_process_failed',
-    },
-    pagbank: {
-      checkout_failed: 'payments.pagbank.checkout_failed',
-      webhook_process_failed: 'payments.pagbank.webhook_process_failed',
-    },
-  },
+  /* Webhook / Security */
+  WEBHOOK_SIGNATURE_INVALID: 'webhook_signature_invalid',
+  WEBHOOK_TIMESTAMP_STALE: 'webhook_timestamp_stale',
+  DUPLICATE_REQUEST: 'duplicate_request',
 
-  // Webhooks (comum)
-  webhook: {
-    invalid_signature: 'webhook.invalid_signature',
-    invalid_ts: 'webhook.invalid_ts',
-    stale_or_future_ts: 'webhook.stale_or_future_ts',
-    duplicate_request_id: 'webhook.duplicate_request_id',
-    bad_signature_format: 'webhook.bad_signature_format',
-    middleware_exception: 'webhook.middleware_exception',
-  },
+  /* Payments - Mercado Pago */
+  MP_CREATE_PREFERENCE_FAILED: 'mp_create_preference_failed',
+  MP_FETCH_PAYMENT_FAILED: 'mp_fetch_payment_failed',
 
-  // Autorização básica
-  auth: {
-    referer_forbidden: 'auth.referer_forbidden',
-    origin_forbidden: 'auth.origin_forbidden',
-  },
-
-  // Infraestrutura
-  infra: {
-    http_timeout: 'infra.http.timeout',
-    http_error: 'infra.http.error',
-    db_error: 'infra.db.error',
-    db_conflict: 'infra.db.conflict',
-  },
-
-  // Observabilidade
-  observability: {
-    healthcheck_failed: 'observability.healthcheck_failed',
-  },
-
-  // Fallback
-  unknown: 'unknown',
-});
-
-module.exports = { codes };
+  /* Payments - PagBank */
+  PB_CREATE_CHECKOUT_FAILED: 'pagbank_create_checkout_failed',
+  PB_WEBHOOK_PROCESSING_FAILED: 'pagbank_webhook_processing_failed',
+};
