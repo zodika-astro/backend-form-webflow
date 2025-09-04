@@ -4,72 +4,58 @@
 /**
  * Global Error Handler
  * --------------------
- * Purpose
- *   - Translate thrown exceptions into clean, stable JSON responses.
- *   - Emit structured logs (no PII) with request correlation.
- *   - Avoid leaking stack traces in production.
- *
- * Conventions
- *   - `err.status`  → HTTP status code (defaults to 500).
- *   - `err.code`    → stable, machine-readable error code (see utils/errorCodes).
- *   - `err.details` → safe, serializable object with extra info for clients.
- *   - `req.requestId` and/or `req.log` should be set by upstream middleware.
+ * - Converts thrown errors into clean JSON responses.
+ * - Emits structured logs (no PII) with request correlation.
+ * - Avoids leaking stacks in production.
  */
 
-const baseLogger = require('../utils/logger').child('http.error');
-const isProd = (process.env.NODE_ENV || 'production') === 'production';
+const rootLogger = require('../utils/logger');
+const baseLogger = (typeof rootLogger?.child === 'function')
+  ? rootLogger.child('error')
+  : rootLogger;
 
 module.exports = function errorHandler(err, req, res, _next) {
-  const statusRaw = Number(err?.status);
-  const status = Number.isInteger(statusRaw) && statusRaw >= 400 && statusRaw <= 599 ? statusRaw : 500;
+  const status = Number(err?.status || 500);
+  const code   = String(err?.code || 'internal_error');
+  const rid    = req?.requestId || null;
 
-  // Prefer explicit code; otherwise choose a generic one by class of error
-  const code = String(
-    err?.code ||
-    (status >= 500 ? 'internal_error' : 'bad_request')
-  );
+  // Prefer req.log when provided; gracefully handle stubs without .child()
+  const parentLog = req?.log || baseLogger || {};
+  const log = (typeof parentLog.child === 'function') ? parentLog.child('handler') : parentLog;
 
-  const rid = req?.requestId || null;
-  const log = req?.log || baseLogger;
-
-  // Surface correlation id for support/debugging
   if (rid) res.set('X-Request-Id', String(rid));
 
-  // Prevent caches from storing error payloads
-  res.set('Cache-Control', 'no-store');
-
-  // Structured server log (avoid dumping PII or large payloads)
   const logPayload = {
-    code,
     status,
+    code,
     rid,
     method: req?.method,
     path: req?.originalUrl,
     msg: err?.message,
   };
-  if (!isProd && err?.stack) {
+
+  if (process.env.NODE_ENV !== 'production' && err?.stack) {
     logPayload.stack = err.stack;
   }
-  log.error(logPayload, 'request failed');
 
-  // Minimal, client-safe error body
+  // If test stubs pass a plain object, ensure we don't crash:
+  if (typeof log?.error === 'function') {
+    log.error(logPayload, 'request failed');
+  } else {
+    // Last-resort logging
+    // eslint-disable-next-line no-console
+    console.error('[errorHandler]', logPayload);
+  }
+
   const body = {
     error: {
       code,
-      message: status >= 500
-        ? 'Internal server error'
-        : (err?.message || 'Request error'),
+      message: status >= 500 ? 'Internal server error' : (err?.message || 'Request error'),
       request_id: rid || undefined,
-    },
+    }
   };
 
-  // Include safe details when provided
-  if (err?.details && typeof err.details === 'object') {
-    body.error.details = err.details;
-  }
-
-  // In non-prod, include stack for easier debugging
-  if (!isProd && err?.stack) {
+  if (process.env.NODE_ENV !== 'production' && err?.stack) {
     body.error.stack = err.stack;
   }
 
