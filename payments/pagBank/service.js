@@ -1,4 +1,3 @@
-// payments/pagBank/service.js
 'use strict';
 
 /**
@@ -10,10 +9,10 @@
  *   - Emit domain events ("payment:paid") on PAID.
  *
  * Non-functional
- *   - Explicit timeouts + limited retries with backoff (utils/httpClient).
+ *   - Exponential backoff (utils/httpClient) + explicit timeouts.
  *   - HTTPS URL validation and bounded strings.
  *   - Structured logging with correlation (no PII).
- *   - Optional Prometheus metrics (gracefully disabled if not installed).
+ *   - Optional Prometheus metrics (no hard dependency).
  *
  * API
  *   - createCheckout(input, ctx?) -> { url, checkoutId }
@@ -24,7 +23,6 @@
 const httpClient = require('../../utils/httpClient');
 const baseLogger = require('../../utils/logger').child('payments.pagbank');
 const { AppError } = require('../../utils/appError');
-const { get: getSecret } = require('../../config/secretProvider');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
@@ -55,12 +53,11 @@ function observe(op, status, startNs) {
 
 /* --------------------------------- Helpers ----------------------------------------- */
 
-/** Strip accidental quotes/trailing separators that might come from CMS/spreadsheets. */
 function stripQuotesAndSemicolons(u) {
   if (!u) return null;
   let s = String(u).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
-  s = s.replace(/[.;\s]+$/g, '');
+  s = s.replace(/[;\s]+$/g, '');
   return s;
 }
 
@@ -78,37 +75,14 @@ function safeHost(u) {
   try { return new URL(u).host; } catch { return undefined; }
 }
 
-/** Build a stable idempotency key per business entity (requestId). */
-function buildIdempotencyKey(requestId) {
-  // Stable key ensures PagBank dedupes across retries and user double-submits.
-  return `zdk:pb:checkout:${String(requestId)}`;
-}
-
-/** Resolve PagBank API token using secret provider (fallback to ENV). */
-async function resolvePagBankToken() {
-  // Prefer external secret manager; fallback to validated env var
-  const fromProvider = await getSecret('PAGBANK_API_TOKEN').catch(() => null);
-  return fromProvider || env.PAGBANK_API_TOKEN || process.env.PAGBANK_API_TOKEN || null;
-}
-
-/** Compute default webhook URL when not explicitly configured. */
-function defaultPagBankWebhookUrl() {
-  const base = process.env.PUBLIC_BASE_URL || env.PUBLIC_BASE_URL;
-  if (!base) return null;
-  const pathSecret = (process.env.WEBHOOK_PATH_SECRET || '').trim();
-  const suffix = pathSecret ? `/${pathSecret}` : '';
-  return `${base.replace(/\/+$/, '')}/webhook/pagbank${suffix}`;
-}
-
 /* --------------------------------- API calls --------------------------------------- */
 
 /**
  * Create a PagBank checkout session.
  * Notes:
- *  - `unit_amount` is in cents.
- *  - Defaults to PIX + CREDIT_CARD unless explicitly disabled.
- *  - Redirect URL must point back to our /pagbank/return handler (public).
- *  - Idempotency key is STABLE per requestId to avoid duplicates on retries.
+ *   - `unit_amount` is in cents.
+ *   - Defaults to PIX + CREDIT_CARD unless explicitly disabled.
+ *   - Redirect URL must point back to our /pagBank/return handler.
  */
 async function createCheckout(input, ctx = {}) {
   const {
@@ -125,33 +99,17 @@ async function createCheckout(input, ctx = {}) {
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
 
-  if (!requestId) {
-    throw AppError.fromUnexpected('pagbank_checkout_failed', 'requestId is required', { status: 400 });
-  }
+  if (!requestId) throw AppError.fromUnexpected('pagbank_checkout_failed', 'requestId is required', { status: 400 });
 
   const valueNum = Number(productValue);
   if (!Number.isFinite(valueNum) || valueNum <= 0) {
     throw AppError.fromUnexpected('pagbank_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
   }
 
-  // Resolve API token (fail-closed in production if missing)
-  const token = await resolvePagBankToken();
-  const isProd = (process.env.NODE_ENV || 'production') === 'production';
-  if (isProd && !token) {
-    throw AppError.fromUpstream('pagbank_checkout_failed', 'PagBank token unavailable', null, { provider: 'pagbank' });
-  }
-  if (!token) {
-    // Non-prod: allow local testing without secret provider.
-    log.warn('PagBank token not configured; attempting request may fail in dev.');
-  }
-
-  // Base URL (env already validated via envalid with a default sandbox URL)
-  const base = (process.env.PAGBANK_BASE_URL || env.PAGBANK_BASE_URL || 'https://api.pagbank.com.br').replace(/\/+$/, '');
-  const url = `${base}/checkouts`;
-
-  // Redirect back to our app
-  const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
-  const redirect_url = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/pagbank/return`);
+  const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
+  // IMPORTANT: match the mount path in index.js -> app.use('/pagBank', pagbankReturnRouter)
+  const redirectUrlRaw = `${PUBLIC_BASE_URL}/pagBank/return`;
+  const redirect_url = normalizeHttpsUrl(redirectUrlRaw);
   if (!redirect_url) {
     throw AppError.fromUnexpected('pagbank_checkout_failed', 'invalid redirect_url', { status: 400 });
   }
@@ -162,11 +120,8 @@ async function createCheckout(input, ctx = {}) {
   if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
   const selected = methods.length ? methods : ['PIX', 'CREDIT_CARD'];
 
-  // Notification (webhook) URL — prefer explicit, else derive from PUBLIC_BASE_URL
-  const configuredWebhook = process.env.PAGBANK_WEBHOOK_URL || env.PAGBANK_WEBHOOK_URL;
-  const webhookUrl = normalizeHttpsUrl(configuredWebhook || defaultPagBankWebhookUrl());
-
-  // Product image (optional; limit length)
+  const webhookUrl =
+    normalizeHttpsUrl(process.env.PAGBANK_WEBHOOK_URL || env.PAGBANK_WEBHOOK_URL);
   const imageUrl =
     normalizeHttpsUrl(productImageUrl, { max: 512 }) ||
     normalizeHttpsUrl(process.env.PAGBANK_PRODUCT_IMAGE_URL || env.PAGBANK_PRODUCT_IMAGE_URL, { max: 512 });
@@ -196,8 +151,13 @@ async function createCheckout(input, ctx = {}) {
       : undefined,
     payment_notification_urls: webhookUrl ? [webhookUrl] : undefined,
     customer: name && email ? { name, email } : undefined,
-    currency: currency || undefined, // leave undefined if not required by the API
+    currency: currency || undefined,
   }));
+
+  // Prefer configured base; fallback to official API.
+  const base =
+    (process.env.PAGBANK_BASE_URL || env.PAGBANK_BASE_URL || 'https://api.pagbank.com.br').replace(/\/+$/, '');
+  const url = `${base}/checkouts`;
 
   const op = 'create_checkout';
   const t0 = process.hrtime.bigint();
@@ -205,11 +165,10 @@ async function createCheckout(input, ctx = {}) {
   try {
     const res = await httpClient.post(url, payload, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${env.PAGBANK_API_TOKEN || process.env.PAGBANK_API_TOKEN}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        // Stable key → PagBank dedupes duplicate creates and our client retries.
-        'X-Idempotency-Key': buildIdempotencyKey(requestId),
+        'X-Idempotency-Key': uuid(),
       },
       timeout: 20_000,
       retries: 2,
@@ -217,7 +176,7 @@ async function createCheckout(input, ctx = {}) {
     });
 
     observe(op, res?.status, t0);
-    baseLogger.info({ status: res?.status }, 'pagbank checkout created');
+    log.info({ status: res?.status }, 'checkout created');
 
     const data = res?.data || {};
 
@@ -232,10 +191,9 @@ async function createCheckout(input, ctx = {}) {
     if (!payLink && data.payment_url) payLink = data.payment_url;
     if (!payLink && data.checkout?.payment_url) payLink = data.checkout.payment_url;
     if (!payLink) {
-      throw AppError.fromUnexpected('pagbank_checkout_failed', 'PAY link not found in PagBank response');
+      throw AppError.fromUnexpected('pagbank_checkout_failed', 'PAY link not found in PagBank return');
     }
 
-    // Persist checkout record (customer/raw sanitized in repository)
     await pagbankRepository.createCheckout({
       request_id: String(requestId),
       product_type: productType,
@@ -247,11 +205,11 @@ async function createCheckout(input, ctx = {}) {
       raw: data,
     });
 
-    // Best-effort audit trail (keep payload minimal; repository sanitizes JSON)
+    // Best-effort audit trail
     try {
       await pagbankRepository.logEvent({
         event_uid: `checkout_created_${data.id || requestId}`,
-        payload: { response: { id: data.id || null, has_pay_link: !!payLink } },
+        payload: { request_payload: payload, response: data },
         headers: null,
         query: null,
         topic: 'checkout',
@@ -260,15 +218,18 @@ async function createCheckout(input, ctx = {}) {
         charge_id: null,
       });
     } catch (e) {
-      baseLogger.warn({ msg: e?.message }, 'could not log checkout creation event');
+      log.warn({ msg: e?.message }, 'could not log checkout creation event');
     }
 
-    baseLogger.info({ checkoutId: data.id || null, host: safeHost(payLink) }, 'pagbank checkout ready');
+    log.info({ checkoutId: data.id || null, host: safeHost(payLink) }, 'checkout ready');
     return { url: payLink, checkoutId: data.id || null };
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
-    const st = e?.response?.status;
-    baseLogger.error({ status: st, msg: e?.message }, st ? 'create checkout failed' : 'create checkout network error');
+    if (e.response) {
+      log.error({ status: e.response.status, msg: e?.message }, 'create checkout failed');
+    } else {
+      log.error({ msg: e.message }, 'create checkout network error');
+    }
     // Normalize upstream error into AppError with standardized code
     throw AppError.fromUpstream(
       'pagbank_checkout_failed',
@@ -281,16 +242,6 @@ async function createCheckout(input, ctx = {}) {
 
 /* -------------------------------- Webhook handler ---------------------------------- */
 
-/**
- * Process a verified PagBank webhook (idempotent).
- * Steps
- *   1) Persist raw event (headers/query/body) with stable event_uid.
- *   2) Update checkout status if present.
- *   3) Upsert payment by chargeId with normalized customer fields.
- *   4) Emit "payment:paid" for status === 'PAID'.
- *
- * Tolerant behavior: returns { ok:false } instead of throwing to keep 2xx at the edge.
- */
 async function processWebhook(p, meta = {}, ctx = {}) {
   const log = (ctx.log || baseLogger).child('webhook', { rid: ctx.requestId });
 
