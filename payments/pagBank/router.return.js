@@ -1,4 +1,4 @@
-// payments/pagbank/router.return.js
+// payments/pagBank/router.return.js
 'use strict';
 
 /**
@@ -10,7 +10,7 @@
  *  - Keep responses non-cacheable and echo a stable correlation id header.
  *
  * Mount point (important):
- *  - This router is mounted under **/pagBank** (capital "B") in the main app:
+ *  - This router is mounted under /pagBank (capital B) in the main app:
  *      app.use('/pagBank', pagbankReturnRouter);
  *
  * Route
