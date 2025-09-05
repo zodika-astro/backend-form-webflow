@@ -9,31 +9,49 @@ const cors = require('cors');
  * Goals
  * - Allow only trusted Origins for browser requests.
  * - For *public* endpoints (e.g., /birthchart/**), REQUIRE an Origin header (block non-browser).
- * - Validate Referer against an allowlist (defense-in-depth against CSRF-like abuse).
+ * - Validate Referer against an allowlist (defense-in-depth).
  * - Do NOT interfere with server-to-server endpoints (webhooks), health checks, metrics, or static assets.
  *
- * Environment
- * - ALLOWED_ORIGINS:   comma-separated list of allowed origins
- *                      e.g., "https://www.zodika.com.br,https://zodika.webflow.io"
- * - ALLOWED_REFERERS:  comma-separated list of allowed Referer prefixes or full origins
- *                      e.g., "https://www.zodika.com.br/articles/,https://zodika.webflow.io/"
- * - STRICT_ORIGIN_PATHS (optional): comma-separated path prefixes that REQUIRE an Origin
- *                      default: "/birthchart"
+ * Env
+ * - ALLOWED_ORIGINS:   CSV of allowed origins or host wildcards
+ *                      e.g. "https://www.zodika.com.br,https://zodika.webflow.io,*.zodika.com.br"
+ * - ALLOWED_REFERERS:  CSV of allowed Referer prefixes or full URLs
+ *                      e.g. "https://www.zodika.com.br/articles/,https://zodika.webflow.io/"
+ * - STRICT_ORIGIN_PATHS (optional): CSV of path prefixes that REQUIRE an Origin (default "/birthchart")
  *
  * Notes
- * - This middleware performs early allow/deny and then delegates to `cors()` for response headers.
- * - Webhooks, health, metrics, and static assets are bypassed entirely (no CORS headers needed).
- * - Designed to scale: to protect additional public forms, just append their prefixes to STRICT_ORIGIN_PATHS.
+ * - This middleware performs early allow/deny and then delegates to `cors()` for headers.
+ * - Webhooks/health/metrics/static assets are bypassed entirely (no CORS headers needed).
+ * - Wildcards are host-only: "*.example.com" allows foo.example.com, bar.example.com, not example.com itself.
  */
 
 // ------------------------- Parse / normalize configuration -------------------------
 
-const ALLOWED_ORIGINS = parseOrigins(process.env.ALLOWED_ORIGINS || '');
+const NODE_ENV = (process.env.NODE_ENV || 'production').toLowerCase();
+const IS_PROD = NODE_ENV === 'production';
+
+const {
+  exactOrigins: EXACT_ORIGINS,
+  wildcardHosts: WILDCARD_HOSTS,
+} = parseOrigins(process.env.ALLOWED_ORIGINS || '');
+
 const ALLOWED_REFERERS = parseReferers(process.env.ALLOWED_REFERERS || '');
+
 const STRICT_PATHS = (process.env.STRICT_ORIGIN_PATHS || '/birthchart')
   .split(',')
   .map((s) => normalizePathPrefix(s))
   .filter(Boolean);
+
+// Sensible dev defaults if no allowlist provided
+if (!IS_PROD && EXACT_ORIGINS.size === 0 && WILDCARD_HOSTS.length === 0) {
+  [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8080',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5173',
+  ].forEach((o) => EXACT_ORIGINS.add(o));
+}
 
 /** Normalize a path prefix (ensure it starts with '/', trim whitespace). */
 function normalizePathPrefix(s) {
@@ -41,59 +59,6 @@ function normalizePathPrefix(s) {
   const t = String(s).trim();
   if (!t) return '';
   return t.startsWith('/') ? t : `/${t}`;
-}
-
-/** Parse a comma-separated list of origins into a Set of normalized origins. */
-function parseOrigins(list) {
-  return new Set(
-    list
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map(normalizeOrigin)
-      .filter(Boolean)
-  );
-}
-
-/** Parse a comma-separated list of referer prefixes into an array of normalized href prefixes. */
-function parseReferers(list) {
-  return (list || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(normalizeAsPrefix);
-}
-
-/** Normalize a value to URL.origin (scheme + host + port). Returns null if invalid. */
-function normalizeOrigin(value) {
-  try {
-    const u = new URL(value);
-    return u.origin;
-  } catch {
-    // Best-effort: allow host-only inputs (assume https)
-    try {
-      const u2 = new URL(`https://${value}`);
-      return u2.origin;
-    } catch {
-      return null;
-    }
-  }
-}
-
-/** Normalize a value as a prefix string used for startsWith() checks on the Referer. */
-function normalizeAsPrefix(value) {
-  try {
-    const u = new URL(value);
-    return u.href; // keep trailing slash/prefix if provided
-  } catch {
-    try {
-      const u2 = new URL(`https://${value}`);
-      return u2.href;
-    } catch {
-      // Last resort: return raw value (consumer should provide proper URLs)
-      return value;
-    }
-  }
 }
 
 /** Return the path without query string, preferring originalUrl (more accurate under routers). */
@@ -118,14 +83,110 @@ function isBypassedPath(req) {
   return false;
 }
 
+// ------------------------------ Origin / Referer parsing ------------------------------
+
+/**
+ * Parse a CSV of origins into:
+ *  - exactOrigins: Set of normalized origins (scheme+host+port)
+ *  - wildcardHosts: array of host suffixes for patterns like "*.example.com"
+ */
+function parseOrigins(list) {
+  const exactOrigins = new Set();
+  const wildcardHosts = [];
+
+  for (const raw of list.split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (raw.startsWith('*.') || raw.includes('://*.')) {
+      // "*.domain.com" or "https://*.domain.com"
+      const host = normalizeWildcardHost(raw);
+      if (host) wildcardHosts.push(host); // store ".domain.com"
+      continue;
+    }
+    const origin = normalizeOrigin(raw);
+    if (origin) exactOrigins.add(origin);
+  }
+  return { exactOrigins, wildcardHosts };
+}
+
+/** Normalize a value to URL.origin (scheme+host+port). Returns null if invalid. */
+function normalizeOrigin(value) {
+  try {
+    const u = new URL(value);
+    return u.origin;
+  } catch {
+    // Best-effort: allow host-only inputs (assume https)
+    try {
+      const u2 = new URL(`https://${value}`);
+      return u2.origin;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** Extract wildcard host suffix from patterns like "*.example.com" or "https://*.example.com" -> ".example.com" */
+function normalizeWildcardHost(value) {
+  try {
+    // Strip scheme if present
+    const v = String(value).replace(/^[a-z]+:\/\//i, '');
+    const host = v.replace(/^\*\./, ''); // remove "*."
+    if (!host || host.startsWith('*')) return null;
+    return `.${host.toLowerCase()}`; // store with leading dot for endsWith checks
+  } catch {
+    return null;
+  }
+}
+
+/** Parse a CSV of referer prefixes into normalized href prefixes. */
+function parseReferers(list) {
+  return (list || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(normalizeAsPrefix);
+}
+
+/** Normalize a value as a prefix string used for startsWith() checks on the Referer. */
+function normalizeAsPrefix(value) {
+  try {
+    const u = new URL(value);
+    return u.href; // keep trailing slash/prefix if provided
+  } catch {
+    try {
+      const u2 = new URL(`https://${value}`);
+      return u2.href;
+    } catch {
+      // Last resort: return raw value (consumer should provide proper URLs)
+      return value;
+    }
+  }
+}
+
 // ------------------------------ Core policy validators ------------------------------
 
-/** Validate Origin against the allowlist. Returns normalized origin or null. */
+/**
+ * Validate Origin against allowlist.
+ *  - Exact match against normalized origin
+ *  - Host wildcard match (*.example.com) against the request hostname
+ * Returns the normalized origin (to reflect) or null if not allowed.
+ */
 function validateOrigin(origin) {
   if (!origin) return null;
+
+  let normalized;
   try {
-    const normalized = new URL(origin).origin;
-    return ALLOWED_ORIGINS.has(normalized) ? normalized : null;
+    const u = new URL(origin);
+    normalized = u.origin;
+
+    if (EXACT_ORIGINS.has(normalized)) return normalized;
+
+    const host = u.hostname.toLowerCase();
+    for (const suffix of WILDCARD_HOSTS) {
+      // Require a subdomain: "foo.example.com" endsWith ".example.com" but "example.com" does not
+      if (host.endsWith(suffix) && host.length > suffix.length) {
+        return normalized;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -134,8 +195,8 @@ function validateOrigin(origin) {
 /**
  * Validate Referer using either origin allowlist or explicit allowed prefixes.
  * Behavior:
- * - If no Referer header: return true (absence is acceptable unless your policy says otherwise).
- * - If present: allow when (a) its origin is in ALLOWED_ORIGINS OR (b) it starts with any allowed prefix.
+ * - If no Referer header: return true (absence is acceptable).
+ * - If present: allow when (a) its origin is in ALLOWED_ORIGINS OR (b) it startsWith any allowed prefix.
  * - If an Origin header is present and mismatches the Referer origin: reject (tight coupling).
  */
 function validateReferer(referer, normalizedOriginIfAny) {
@@ -144,7 +205,11 @@ function validateReferer(referer, normalizedOriginIfAny) {
     const refUrl = new URL(referer);
     const refOrigin = refUrl.origin;
 
-    if (ALLOWED_ORIGINS.has(refOrigin)) return true;
+    if (EXACT_ORIGINS.has(refOrigin)) return true;
+    if (WILDCARD_HOSTS.length) {
+      const host = refUrl.hostname.toLowerCase();
+      if (WILDCARD_HOSTS.some((sfx) => host.endsWith(sfx) && host.length > sfx.length)) return true;
+    }
     if (ALLOWED_REFERERS.some((prefix) => referer.startsWith(prefix))) return true;
 
     if (normalizedOriginIfAny && normalizedOriginIfAny !== refOrigin) return false;
@@ -167,21 +232,20 @@ function applyCorsHeaders(req, res, next, normalizedOrigin) {
       if (normalizedOrigin && origin === normalizedOrigin) {
         return callback(null, true);
       }
-      // If no origin provided (non-browser), do not set ACAO
-      if (!origin) return callback(null, false);
-      // Fallback validation (should rarely be needed)
+      if (!origin) return callback(null, false); // non-browser: no ACAO
       const val = validateOrigin(origin);
       return callback(null, !!val);
     },
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
+      'Accept',
       'Content-Type',
       'Authorization',
       'X-Requested-With',
       'X-Request-Id',
     ],
-    credentials: false,          // Typically false for pure APIs; enable only if you truly need cookies/auth
-    optionsSuccessStatus: 204,   // For legacy browsers
+    credentials: false,          // Keep false unless you truly need cookies/auth
+    optionsSuccessStatus: 204,   // Legacy compatibility
     maxAge: 600,                 // Cache preflight for 10 minutes
   };
 
@@ -198,7 +262,7 @@ module.exports = function corsPolicy(req, res, next) {
   const originHdr = req.headers.origin || '';
   const refererHdr = req.headers.referer || req.headers.referrer || '';
 
-  // Apply "strict" policy only to configured public path prefixes (scales with more products/forms)
+  // Apply "strict" policy only to configured public path prefixes
   const isStrict = pathStartsWithAny(path, STRICT_PATHS);
 
   // 1) Enforce presence of Origin on strict public endpoints
