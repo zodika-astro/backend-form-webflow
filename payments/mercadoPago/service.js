@@ -1,25 +1,24 @@
-//payment/mercadoPago/service.js
-
+// payments/mercadoPago/service.js
 'use strict';
 
 /**
  * Mercado Pago Service
  * --------------------
  * Responsibilities
- *   - Create checkout preferences (hosted checkout).
- *   - Process webhooks and upsert normalized records.
- *   - Emit domain events ("payment:paid") on APPROVED.
+ *  - Create checkout preferences (hosted checkout).
+ *  - Process webhooks and upsert normalized records.
+ *  - Emit domain events ("payment:paid") on APPROVED.
  *
  * Non-functional
- *   - Exponential backoff (utils/httpClient) + explicit timeouts.
- *   - HTTPS URL normalization and length bounds for safety.
- *   - Structured logging with request correlation (no PII).
- *   - Optional Prometheus metrics (gracefully disabled if absent).
+ *  - Exponential backoff (utils/httpClient) + explicit timeouts.
+ *  - HTTPS URL normalization and length bounds for safety.
+ *  - Structured logging with request correlation (no PII).
+ *  - Optional Prometheus metrics (gracefully disabled if absent).
  *
  * API
- *   - createCheckout(input, ctx?) -> { url, preferenceId }
- *   - processWebhook(body, meta, ctx?) -> { ok, ... }
- *   - events (EventEmitter)
+ *  - createCheckout(input, ctx?) -> { url, preferenceId }
+ *  - processWebhook(body, meta, ctx?) -> { ok, ... }
+ *  - events (EventEmitter)
  */
 
 const httpClient = require('../../utils/httpClient');
@@ -28,12 +27,13 @@ const EventEmitter = require('events');
 const baseLogger = require('../../utils/logger').child('payments.mp');
 const { AppError } = require('../../utils/appError');
 const { env } = require('../../config/env');
+const { get: getSecret } = require('../../config/secretProvider');
 const mpRepository = require('./repository');
 
 const events = new EventEmitter();
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
-/* ------------------------------- Metrics (optional) -------------------------------- */
+/* --------------------------------- Metrics (optional) -------------------------------- */
 let prom = null;
 try { prom = require('prom-client'); } catch { /* metrics disabled */ }
 
@@ -52,7 +52,7 @@ function observe(op, status, startNs) {
   mpHistogram.labels(op, String(status || 'ERR')).observe(Number(dur));
 }
 
-/* --------------------------------- Helpers ----------------------------------------- */
+/* --------------------------------- Helpers ------------------------------------------ */
 
 /** Trim quotes and dangling separators that might sneak in via CMS/spreadsheets. */
 function stripQuotesAndSemicolons(u) {
@@ -77,6 +77,12 @@ function safeHost(u) {
   try { return new URL(u).host; } catch { return undefined; }
 }
 
+/** Build a stable idempotency key per business entity (requestId). */
+function buildIdempotencyKey(requestId) {
+  // Stable key ensures MP dedupes across retries and user double-submits.
+  return `zdk:mp:pref:${String(requestId)}`;
+}
+
 /** Map Mercado Pago payment.status → internal request status. */
 function mapPreferenceStatusFromPayment(paymentStatus) {
   switch ((paymentStatus || '').toLowerCase()) {
@@ -92,14 +98,21 @@ function mapPreferenceStatusFromPayment(paymentStatus) {
   }
 }
 
-/* --------------------------------- API calls --------------------------------------- */
+/** Resolve MP access token using secret provider (fallback to ENV). */
+async function resolveMpAccessToken() {
+  // Prefer external secret manager; fallback to validated env var
+  const fromProvider = await getSecret('MP_ACCESS_TOKEN').catch(() => null);
+  return fromProvider || env.MP_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN || null;
+}
+
+/* --------------------------------- API calls ---------------------------------------- */
 
 /**
  * Create a hosted checkout preference on Mercado Pago.
  * Notes:
- *   - Amount is provided in cents; we convert to BRL with 2 decimals.
- *   - Boleto is excluded by default (only PIX + credit card).
- *   - Idempotency via `X-Idempotency-Key` to avoid duplicate preferences.
+ *  - Amount is provided in cents; we convert to BRL with 2 decimals.
+ *  - Boleto is excluded by default (only PIX + credit card).
+ *  - Idempotency via stable `X-Idempotency-Key` derived from requestId.
  */
 async function createCheckout(input, ctx = {}) {
   const {
@@ -117,14 +130,25 @@ async function createCheckout(input, ctx = {}) {
     throw AppError.fromUnexpected('mp_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
   }
 
+  const token = await resolveMpAccessToken();
+  const isProd = (process.env.NODE_ENV || 'production') === 'production';
+  if (isProd && !token) {
+    // Fail closed in production rather than creating unpaid flows.
+    throw AppError.fromUpstream('mp_checkout_failed', 'Mercado Pago token unavailable', null, { provider: 'mercadopago' });
+  }
+  if (!token) {
+    // Non-prod: allow local testing without secret provider.
+    log.warn('Mercado Pago token not configured; attempting request may fail in dev.');
+  }
+
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
   // back_urls (validated) + notification target
-  const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
+  const FAILURE_URL = process.env.PAYMENT_FAILURE_URL || env.PAYMENT_FAILURE_URL;
   const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/success`);
   const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadopago/return/pending`);
-  const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL);
+  const notification_url = normalizeHttpsUrl(process.env.MP_WEBHOOK_URL || env.MP_WEBHOOK_URL);
 
   // product image for MP UI (optional)
   const picture_url = normalizeHttpsUrl(productImageUrl, { max: 512 }) || null;
@@ -150,6 +174,17 @@ async function createCheckout(input, ctx = {}) {
     default_installments: Math.min(Math.max(1, maxInst), 12),
   };
 
+  // Metadata: keep bounded to avoid upstream rejections
+  const safeMetadata = (() => {
+    try {
+      const raw = { source: 'webflow', ...metadata };
+      const str = JSON.stringify(raw);
+      return str.length > 2000 ? { source: 'webflow' } : raw;
+    } catch {
+      return { source: 'webflow' };
+    }
+  })();
+
   const preferencePayload = {
     external_reference: String(requestId),
     items: [{
@@ -163,7 +198,7 @@ async function createCheckout(input, ctx = {}) {
     back_urls: { success, failure, pending },
     auto_return: 'approved',
     notification_url: notification_url || undefined,
-    metadata: { source: 'webflow', ...metadata },
+    metadata: safeMetadata,
     // binary_mode: true, // optional: skip intermediate "pending"
     payment_methods,
   };
@@ -175,10 +210,11 @@ async function createCheckout(input, ctx = {}) {
   try {
     const res = await httpClient.post(url, preferencePayload, {
       headers: {
-        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'X-Idempotency-Key': uuid(),
+        // Stable key → MP dedupes duplicates and our internal httpClient retries.
+        'X-Idempotency-Key': buildIdempotencyKey(requestId),
       },
       timeout: 20_000,
       retries: 2,
@@ -195,8 +231,10 @@ async function createCheckout(input, ctx = {}) {
       throw AppError.fromUnexpected('mp_checkout_failed', 'init_point not found in Mercado Pago response');
     }
 
+    // Persist request checkout (ensure external_reference recorded)
     await mpRepository.createCheckout({
       request_id: String(requestId),
+      external_reference: String(requestId),
       product_type: productType,
       preference_id: preferenceId,
       status: 'CREATED',
@@ -206,11 +244,11 @@ async function createCheckout(input, ctx = {}) {
       raw: data,
     });
 
-    // Best-effort audit trail
+    // Best-effort audit trail (payload sanitized in repository)
     try {
       await mpRepository.logEvent({
         event_uid: `preference_created_${preferenceId || requestId}`,
-        payload: { request_payload: preferencePayload, response: data },
+        payload: { response: { id: preferenceId, has_init_point: !!initPoint } }, // keep minimal
         headers: null,
         query: null,
         topic: 'preference',
@@ -242,6 +280,12 @@ async function fetchPayment(paymentId, ctx = {}) {
   const log = (ctx.log || baseLogger).child('fetch', { rid: ctx.requestId });
   if (!paymentId) return null;
 
+  const token = await resolveMpAccessToken();
+  if (!token) {
+    log.warn({ paymentId }, 'access token unavailable while fetching payment');
+    return null;
+  }
+
   const op = 'get_payment';
   const t0 = process.hrtime.bigint();
   const url = `https://api.mercadopago.com/v1/payments/${paymentId}`;
@@ -249,7 +293,7 @@ async function fetchPayment(paymentId, ctx = {}) {
   try {
     const res = await httpClient.get(url, {
       headers: {
-        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         Accept: 'application/json',
       },
       timeout: 15_000,
@@ -265,17 +309,16 @@ async function fetchPayment(paymentId, ctx = {}) {
   }
 }
 
-/* -------------------------------- Webhook handler ---------------------------------- */
+/* -------------------------------- Webhook handler ----------------------------------- */
 
 /**
  * Process an authenticated webhook (idempotent).
- *   1) Persist raw event for audit (headers/query/body).
- *   2) If topic=payment, fetch full payment and upsert normalized row.
- *   3) Update request status (approved/pending/rejected/…).
- *   4) Emit "payment:paid" on APPROVED.
+ *  1) Persist raw event for audit (headers/query/body).
+ *  2) If topic=payment, fetch full payment and upsert normalized row.
+ *  3) Update request status (approved/pending/rejected/…).
+ *  4) Emit "payment:paid" on APPROVED.
  *
- * Note: This handler is intentionally tolerant; it returns {ok:false} instead of throwing
- * to avoid surfacing 5xx to the provider. The router decides the HTTP response.
+ * Note: Tolerant handler — returns { ok:false } on failure to avoid 5xx to the provider.
  */
 async function processWebhook(body, meta = {}, ctx = {}) {
   const log = (ctx.log || baseLogger).child('webhook', { rid: ctx.requestId });
@@ -347,7 +390,8 @@ async function processWebhook(body, meta = {}, ctx = {}) {
       if (preference_id) {
         updatedReq = await mpRepository.updateRequestStatusByPreferenceId(preference_id, reqStatus, payment);
       } else if (external_reference) {
-        updatedReq = await mpRepository.updateRequestStatusByRequestId(external_reference, reqStatus, payment);
+        // Align with repository semantics: external_reference is TEXT from MP
+        updatedReq = await mpRepository.updateRequestStatusByExternalReference(external_reference, reqStatus, payment);
         if (updatedReq?.preference_id) {
           preference_id = updatedReq.preference_id;
           await mpRepository.attachPaymentToPreference(payment_id, preference_id);
@@ -360,7 +404,7 @@ async function processWebhook(body, meta = {}, ctx = {}) {
           : preference_id
           ? await mpRepository.findByPreferenceId(preference_id)
           : external_reference
-          ? await mpRepository.findByRequestId(external_reference)
+          ? await mpRepository.findByExternalReference(external_reference)
           : null);
 
         if (record) {
