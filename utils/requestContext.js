@@ -4,43 +4,112 @@
 /**
  * Request-scoped context using AsyncLocalStorage
  * ----------------------------------------------
- * Why:
- *  - Keep a correlation-id (reqId) and other per-request metadata available
- *    across async boundaries without threading arguments manually.
+ * Purpose
+ *  - Keep per-request metadata (e.g., reqId/method/path/ip) available across
+ *    async boundaries without threading arguments through every call.
  *
- * Usage:
- *  - Wrap each incoming request with `runWith({ reqId }, () => next())`
- *    (we'll do this in a dedicated middleware).
- *  - Anywhere in your code, call `get('reqId')` or `getAll()` to include it in logs.
+ * How it’s wired
+ *  - A small Express middleware (handled separately) will wrap each request with
+ *    `runWith({ reqId, method, path, ip }, () => next())`.
+ *  - Anywhere in your code, call `get('reqId')` or `getAll()` and include these
+ *    fields in your logs/metrics.
  *
- * Notes:
- *  - This module has zero external dependencies and works on Node 16+.
+ * Design notes
+ *  - Zero external deps; works on Node.js >= 16.
+ *  - `runWith` inherits the current context by default, so nested calls augment
+ *    rather than replace (configurable via { inherit: false }).
+ *  - Includes helpers to `bind` callbacks to the current context (useful for
+ *    timers/event handlers) and `merge` multiple keys at once.
  */
 
 const { AsyncLocalStorage } = require('async_hooks');
 
-const store = new AsyncLocalStorage();
+const als = new AsyncLocalStorage();
 
-/** Run a function within a fresh context object (e.g., { reqId }) */
-function runWith(ctx, fn) {
-  return store.run(ctx || {}, fn);
+/**
+ * Run a function within a context.
+ * By default, merges with any existing parent context (inherit = true).
+ *
+ * @param {object} ctx - key/value map to inject (e.g., { reqId })
+ * @param {Function} fn - function to execute inside this context
+ * @param {object} [opts]
+ * @param {boolean} [opts.inherit=true] - if false, do not merge with parent
+ * @returns {*} return value of fn
+ */
+function runWith(ctx, fn, opts = {}) {
+  const inherit = opts.inherit !== false;
+  const parent = als.getStore();
+  const base = inherit && parent ? { ...parent, ...(ctx || {}) } : (ctx || {});
+  return als.run(base, fn);
 }
 
-/** Set a key/value on the current request context (noop if none) */
+/**
+ * Set a single key/value on the current context (noop if there is no context).
+ * @param {string} key
+ * @param {*} value
+ */
 function set(key, value) {
-  const s = store.getStore();
-  if (s) s[key] = value;
+  const s = als.getStore();
+  if (s && key) s[key] = value;
 }
 
-/** Get a single value from the current request context */
+/**
+ * Merge multiple keys into the current context (noop if none).
+ * @param {object} patch - key/value entries to merge
+ */
+function merge(patch) {
+  const s = als.getStore();
+  if (s && patch && typeof patch === 'object') Object.assign(s, patch);
+}
+
+/**
+ * Get a single value from the current context.
+ * @param {string} key
+ * @returns {*} value or undefined
+ */
 function get(key) {
-  const s = store.getStore();
+  const s = als.getStore();
   return s ? s[key] : undefined;
 }
 
-/** Get the whole context object (returns {} when not inside a context) */
+/**
+ * Get all context values (returns a frozen empty object when not inside a context).
+ * @returns {object}
+ */
 function getAll() {
-  return store.getStore() || {};
+  return als.getStore() || {};
 }
 
-module.exports = { runWith, set, get, getAll };
+/**
+ * Bind a function to the current context, so when it runs later (e.g., timers,
+ * event handlers) it still "sees" the same request context.
+ * @param {Function} fn - function to bind
+ * @returns {Function} bound function
+ */
+function bind(fn) {
+  const ctx = als.getStore();
+  if (!ctx || typeof fn !== 'function') return fn;
+  return function boundContextFn(...args) {
+    return als.run(ctx, () => fn.apply(this, args));
+  };
+}
+
+/**
+ * (Testing/advanced) Replace the current context within the same tick.
+ * Prefer `runWith` in application code. This is handy in unit tests.
+ * @param {object} newCtx
+ */
+function reset(newCtx = {}) {
+  // enterWith sets the store for the current synchronous execution context
+  if (typeof als.enterWith === 'function') als.enterWith(newCtx || {});
+}
+
+module.exports = {
+  runWith,
+  set,
+  merge,
+  get,
+  getAll,
+  bind,
+  reset, // primarily for tests
+};
