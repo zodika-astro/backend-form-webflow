@@ -7,34 +7,45 @@
  * Responsibilities:
  *  - Read an incoming correlation id from headers (x-request-id | x-correlation-id | traceparent).
  *  - Validate and, if missing/invalid, generate a new stable id (UUIDv4).
- *  - Expose id on request object (req.reqId) and AsyncLocalStorage context.
- *  - Return the id back to the client via response headers for easier troubleshooting.
+ *  - Expose id on request object as BOTH `req.requestId` (project-wide convention) and `req.reqId`.
+ *  - Populate AsyncLocalStorage context so logs/metrics can read it.
+ *  - Echo the id back via response headers for easier troubleshooting.
  *
  * Notes:
- *  - Keep this middleware as early as possible in the chain, so all downstream logs carry reqId.
- *  - This module has zero external dependencies; uses node:crypto for UUID.
+ *  - Keep this middleware as early as possible in the chain.
+ *  - Zero external dependencies besides Node's crypto.
  */
 
 const crypto = require('crypto');
-const { runWith, set: setCtx, getAll } = require('../utils/requestContext');
+const { runWith, set: setCtx, getAll, bind } = require('../utils/requestContext');
 
-// Basic allow-list for IDs coming from the edge
+// Strict allow-list for correlation IDs that arrive from the edge
 const SAFE_ID_RE = /^[a-zA-Z0-9._\-:@]{6,128}$/;
 
-// Extract a candidate correlation id from common headers
+/** Pick a candidate id from common headers; validate with SAFE_ID_RE. */
 function pickIncomingId(req) {
-  const h = (name) => req.get(name) || req.headers?.[name];
+  const h = (name) => req.get?.(name) || req.headers?.[name];
 
-  // Priority: x-request-id, x-correlation-id, then traceparent (W3C)
-  const id =
+  // Priority: x-request-id, x-correlation-id, then W3C traceparent (trace-id segment)
+  const direct =
     h('x-request-id') ||
-    h('x-correlation-id') ||
-    (h('traceparent') ? String(h('traceparent')).split('-')[1] : null);
+    h('x-correlation-id');
 
-  return id && SAFE_ID_RE.test(String(id)) ? String(id) : null;
+  if (direct && SAFE_ID_RE.test(String(direct))) return String(direct);
+
+  const tp = h('traceparent');
+  if (tp) {
+    // traceparent format: "00-<traceId>-<spanId>-<flags>"
+    const parts = String(tp).split('-');
+    if (parts.length >= 2) {
+      const traceId = parts[1];
+      if (/^[a-f0-9]{32}$/i.test(traceId)) return traceId;
+    }
+  }
+  return null;
 }
 
-// Generate UUIDv4 (falls back to random string if not available)
+/** Generate UUIDv4; fallback to a high-entropy string if not available. */
 function newId() {
   try { return crypto.randomUUID(); }
   catch { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -44,34 +55,38 @@ function correlationIdMiddleware(req, res, next) {
   const incoming = pickIncomingId(req);
   const reqId = incoming || newId();
 
-  // Prepare the initial per-request context
+  // Initial per-request context (read by logger via AsyncLocalStorage)
   const baseCtx = {
     reqId,
     method: req.method,
     path: req.originalUrl || req.url,
     ip: req.ip, // honors app.set('trust proxy', ...)
-    ua: req.get('user-agent') || '',
+    ua: req.get?.('user-agent') || '',
     start: Date.now(),
   };
 
-  // Run downstream middlewares/handlers inside the ALS context
+  // Run downstream middlewares/handlers inside this context
   return runWith(baseCtx, () => {
-    // Also expose on req and res.locals for convenience
+    // Expose on request with both property names used across the codebase
+    req.requestId = reqId; // <- project-wide convention
     req.reqId = reqId;
+
+    // Also provide on res.locals for templates/diagnostics
+    res.locals.requestId = reqId;
     res.locals.reqId = reqId;
 
-    // Make sure response carries the id back to clients/NGINX/APM
+    // Always echo back to client/proxy/APM
     res.setHeader('X-Request-Id', reqId);
     res.setHeader('X-Correlation-Id', reqId);
 
-    // Optional: on finish, store duration in context (useful for later loggers/metrics)
-    res.on('finish', () => {
+    // On response finish, update duration in the context.
+    // Bind the handler to preserve ALS context across the event boundary.
+    res.on('finish', bind(() => {
       const ctx = getAll();
-      // Attach duration in ms (won't log here; logger/metrics middleware can read it)
       if (ctx && typeof ctx.start === 'number') {
         setCtx('durationMs', Date.now() - ctx.start);
       }
-    });
+    }));
 
     next();
   });
