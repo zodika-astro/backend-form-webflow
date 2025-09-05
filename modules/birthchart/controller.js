@@ -13,7 +13,7 @@
  * Non-functional
  *  - Structured logging with request correlation (no PII).
  *  - Standardized error codes (AppError) for upstream and internal failures.
- *  - No secrets read directly from process.env (use secret provider).
+ *  - Never trust raw req.body: filter/whitelist allowed fields before validation.
  */
 
 const { validateBirthchartPayload } = require('./validators');
@@ -23,7 +23,7 @@ const { get: getSecret } = require('../../config/secretProvider');
 const { env } = require('../../config/env');
 const { AppError } = require('../../utils/appError');
 
-// Logger (namespaced); request-scoped logger is derived from middleware (req.log)
+// Logger (namespaced); request-scoped logger comes from middleware (req.log)
 const baseLogger = require('../../utils/logger').child('form.birthchart');
 
 // PSP services
@@ -37,21 +37,67 @@ function safeHost(u) {
   try { return new URL(u).host; } catch { return undefined; }
 }
 
+/** Shallow pick helper to avoid mass assignment and keep validators stable. */
+function pick(input, allowedKeys) {
+  const out = {};
+  if (!input || typeof input !== 'object') return out;
+  for (const k of allowedKeys) {
+    if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+  }
+  return out;
+}
+
+/** Allowed public form fields (whitelist). Extra fields (e.g., CAPTCHA) are ignored here. */
+const ALLOWED_FORM_KEYS = [
+  'name',
+  'social_name',
+  'email',
+  'birth_date',
+  'birth_time',
+  'birth_place',
+
+  // hidden/structured location fields
+  'birth_place_place_id',
+  'birth_place_full',
+  'birth_place_country',
+  'birth_place_admin1',
+  'birth_place_admin2',
+  'birth_place_lat',
+  'birth_place_lng',
+  'birth_place_json',
+
+  // product selector
+  'product_type',
+];
+
 /**
- * POST /birthchart (public)
+ * POST /birthchart/birthchartsubmit-form (public)
  * Body: validated by Zod in validateBirthchartPayload (normalized on return)
+ *
+ * Security:
+ * - CAPTCHA and Privacy checks are enforced by the router middlewares.
+ * - We still ignore any unexpected fields (e.g., recaptcha_token) before validation/persistence.
  */
 async function processForm(req, res, next) {
   // Derive a request-scoped logger (keeps correlation-id from middleware)
   const logger = (req.log || baseLogger).child('processForm', { rid: req.requestId });
 
   try {
-    logger.info('received submission');
+    logger.info(
+      {
+        // minimal, non-sensitive signal
+        hasCaptcha: !!req.captcha,
+        captchaProv: req.captcha?.provider || undefined,
+      },
+      'received submission'
+    );
 
-    // 1) Validate & normalize input
-    //    - If your validators already throw AppError.validation, this will bubble up intact.
-    //    - If they throw a plain error, we convert to AppError in the catch block below.
-    const input = validateBirthchartPayload(req.body);
+    // 1) Filter raw body (avoid mass assignment) and validate/normalize
+    const filtered = pick(req.body, ALLOWED_FORM_KEYS);
+
+    // If your validators already throw AppError.validation, this will bubble up intact.
+    // If they throw a plain error, we convert to AppError in the catch block below.
+    const input = validateBirthchartPayload(filtered);
 
     // 2) Resolve timezone (no PII in logs)
     const googleApiKey = await getSecret('GOOGLE_MAPS_API_KEY').catch((e) => {
@@ -67,6 +113,10 @@ async function processForm(req, res, next) {
     }).catch((e) => {
       throw AppError.fromUpstream('tz_lookup_failed', 'Failed to resolve timezone', e, { provider: 'google_timezone' });
     });
+
+    if (!tz || !tz.tzId || typeof tz.offsetMin !== 'number') {
+      throw AppError.internal('tz_invalid', 'Resolved timezone is invalid', { got: tz ? Object.keys(tz) : null });
+    }
 
     logger.info({ tzId: tz.tzId, offsetMin: tz.offsetMin }, 'timezone resolved');
 
@@ -172,7 +222,7 @@ async function processForm(req, res, next) {
     // 6) Contract expected by the frontend
     return res.status(200).json({ url: paymentResponse.url });
   } catch (err) {
-    // Normalize non-AppError validation failures
+    // Normalize non-AppError validation failures (e.g., Zod)
     if (err && err.name === 'ValidationError' && !err.code) {
       const wrapped = AppError.validation('validation_error', 'Validation Error', {
         details: err.details || undefined,
