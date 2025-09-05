@@ -4,13 +4,22 @@
 /**
  * AppError
  * --------
- * A small, production-safe error type with:
+ * Production-safe error class with:
  *  - machine-readable `code`
  *  - HTTP `status`
  *  - human `message`
- *  - optional `details` (safe to log/return)
+ *  - optional `details` (safe to log/return; never include secrets/PII)
  *
- * Also exposes helpers to wrap unknown errors and to map PSP HTTP errors.
+ * Helpers included:
+ *  - validation(...)        → 400 errors for input validation
+ *  - fromUnexpected(...)    → 500 (or provided status) for unexpected failures
+ *  - fromUpstream(...)      → wraps HTTP client/provider errors (default 502)
+ *  - fromMPResponse(...)    → specialized mapping for Mercado Pago responses
+ *  - fromPagBankResponse(...) → specialized mapping for PagBank responses
+ *
+ * Notes:
+ *  - `.safeJSON()` yields a client-safe payload (no stack, no cause).
+ *  - Keep `details` compact; prefer primitives and small objects.
  */
 
 class AppError extends Error {
@@ -26,10 +35,12 @@ class AppError extends Error {
     this.code = code || 'internal_error';
     this.status = Number.isFinite(status) ? Number(status) : 500;
     if (details !== undefined) this.details = details;
+    this.isAppError = true; // easy type guard in handlers
+    // Preserve stack without including constructor in the trace (when supported)
     Error.captureStackTrace?.(this, AppError);
   }
 
-  /** Minimal, client-safe JSON view. */
+  /** Minimal, client-safe JSON view (no stack/cause). */
   safeJSON() {
     const out = {
       code: this.code || 'internal_error',
@@ -40,11 +51,52 @@ class AppError extends Error {
     return out;
   }
 
-  /** Wrap any unknown error into an AppError (defaults to 500/internal_error). */
-  static wrap(err, fallbackCode = 'internal_error') {
+  /** Override default JSON serialization to the safe representation. */
+  toJSON() {
+    return this.safeJSON();
+  }
+
+  /** Generic wrapper when the thrown value is not an AppError. */
+  static wrap(err, fallbackCode = 'internal_error', status = 500, details) {
     if (err instanceof AppError) return err;
     const msg = err?.message || 'Internal server error';
-    return new AppError(fallbackCode, msg, 500);
+    return new AppError(fallbackCode, msg, status, details);
+  }
+
+  /** 400 Validation error (used by controllers to normalize Zod/Val. libs). */
+  static validation(code = 'validation_error', message = 'Validation error', details) {
+    return new AppError(code, message, 400, details);
+  }
+
+  /**
+   * Wrap unexpected errors (internal exceptions).
+   * @param {string} code
+   * @param {string} message
+   * @param {object} [opts] { cause?: any, status?: number, details?: object }
+   */
+  static fromUnexpected(code = 'internal_error', message = 'Internal server error', opts = {}) {
+    const status = Number.isFinite(opts?.status) ? Number(opts.status) : 500;
+    const details = opts?.details || (opts?.cause ? { cause: String(opts.cause?.message || opts.cause) } : undefined);
+    return new AppError(code, message, status, details);
+  }
+
+  /**
+   * Wrap upstream/provider HTTP errors (e.g., PSP, external APIs).
+   * Attempts to derive a meaningful HTTP status and preserves safe metadata.
+   * @param {string} code
+   * @param {string} message
+   * @param {any} upstreamErr  Typically an error thrown by httpClient (with response)
+   * @param {object} [extraDetails]
+   */
+  static fromUpstream(code, message, upstreamErr, extraDetails = undefined) {
+    const status = normalizeHttpStatus(upstreamErr?.response?.status, 502);
+    const details = Object.assign(
+      {},
+      extraDetails || {},
+      extractRetryAfter(upstreamErr?.response?.headers),
+      upstreamErr?.response?.status ? { upstreamStatus: upstreamErr.response.status } : {}
+    );
+    return new AppError(code || 'upstream_error', message || 'Upstream error', status, details);
   }
 
   /**
@@ -69,23 +121,8 @@ class AppError extends Error {
     };
 
     const code = codeByStatus[status] || 'mp_http_error';
-
-    const details = { context };
-    // Retry-After → milliseconds (tests expect this)
-    const ra = headers['retry-after'];
-    if (ra != null) {
-      if (/^\d+$/.test(String(ra))) {
-        details.retryAfterMs = Number(ra) * 1000;
-      } else {
-        const ts = Date.parse(String(ra));
-        if (!Number.isNaN(ts)) {
-          const delta = ts - Date.now();
-          details.retryAfterMs = Math.max(0, delta);
-        }
-      }
-    }
-
-    return new AppError(code, e?.message || code, Number(status) || 502, details);
+    const details = { context, ...extractRetryAfter(headers) };
+    return new AppError(code, e?.message || code, normalizeHttpStatus(status, 502), details);
   }
 
   /**
@@ -108,9 +145,31 @@ class AppError extends Error {
     };
 
     const code = codeByStatus[status] || 'pagbank_http_error';
-    const details = { context };
-    return new AppError(code, e?.message || code, Number(status) || 502, details);
+    const details = { context, ...extractRetryAfter(e?.response?.headers) };
+    return new AppError(code, e?.message || code, normalizeHttpStatus(status, 502), details);
   }
 }
 
-module.exports = AppError;
+/* ----------------------------- helpers (internal) ---------------------------- */
+
+function normalizeHttpStatus(status, fallback = 500) {
+  const n = Number(status);
+  return Number.isFinite(n) && n >= 400 && n <= 599 ? n : fallback;
+}
+
+/** Parse Retry-After header (seconds or HTTP-date) into { retryAfterMs }. */
+function extractRetryAfter(headers) {
+  if (!headers) return {};
+  const ra = headers['retry-after'];
+  if (ra == null) return {};
+  const s = String(ra).trim();
+  if (/^\d+$/.test(s)) return { retryAfterMs: Number(s) * 1000 };
+  const ts = Date.parse(s);
+  if (!Number.isNaN(ts)) {
+    const delta = ts - Date.now();
+    return { retryAfterMs: Math.max(0, delta) };
+  }
+  return {};
+}
+
+module.exports = { AppError };
