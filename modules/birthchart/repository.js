@@ -1,198 +1,223 @@
-// modules/birthchart/repository.js
+// modules/birthchart/validators.js
 'use strict';
 
+const { z } = require('zod');
+
 /**
- * Birthchart Repository
- * ---------------------
- * Responsibilities
- *  - Persist a new zodika_requests row for a public form submission.
- *  - Provide a database-level idempotency guard to avoid duplicate rows
- *    when the user double-submits or the network retries occur.
+ * Birthchart validators (Zod)
+ * --------------------------
+ * Goals:
+ *  - Strong, reusable schemas with clear error messages.
+ *  - Trim/normalize inputs (lowercasing emails, coercing numbers when safe).
+ *  - Validate date/time format AND logical ranges (HH:MM, lat/lng ranges).
+ *  - Accept structured objects for "birth_place_json" (not only stringified JSON).
+ *  - NEW: Tolerate CAPTCHA/Privacy fields from the public form (server enforces them via middleware).
  *
- * Idempotency strategy (no schema changes required):
- *  - Within a short time window (default 10 minutes), treat as duplicates any
- *    submission that matches the following business keys:
- *      • email (lowercased)
- *      • birth_date (YYYY-MM-DD)
- *      • birth_time (HH:MM:SS)
- *      • location identity:
- *          - prefer exact match on birth_place_place_id when present; otherwise
- *          - match on birth_place_full (string equality; already normalized on input)
- *  - We use a CTE that:
- *      1) SELECTs a recent existing row by those keys
- *      2) INSERTs a new row only if the SELECT found nothing
- *      3) Returns either the inserted row or the existing row
- *
- * Notes
- *  - Assumes the table zodika_requests has a created_at with default NOW().
- *  - Keep the column order/types consistent with the existing schema.
- *  - Do not log payloads or PII here; let the service/controller handle structured logs.
+ * Security/PII notes:
+ *  - Do not log full payloads from public forms; surface only validation paths/messages.
+ *  - Keep error messages user-friendly and non-verbose to avoid leaking data.
  */
 
-const db = require('../../db/db');
+/* --------------------------------- Helpers --------------------------------- */
 
-// Dedup window (minutes). Can be tuned via env without changing code.
-const DEDUP_WINDOW_MIN =
-  Number.isFinite(Number(process.env.BIRTHCHART_DEDUP_WINDOW_MIN))
-    ? Number(process.env.BIRTHCHART_DEDUP_WINDOW_MIN)
-    : 10;
-
-/* ------------------------------- helpers ----------------------------------- */
-
-function toNumberOrNull(v) {
-  if (v === undefined || v === null) return null;
-  const s = String(v).trim();
-  if (s === '') return null;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+/** Validate YYYY-MM-DD with calendar bounds (no timezone shifts). */
+function isValidISODate(yyyyMMdd) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(yyyyMMdd)) return false;
+  const [y, m, d] = yyyyMMdd.split('-').map(Number);
+  if (m < 1 || m > 12) return false;
+  if (d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() + 1 === m &&
+    dt.getUTCDate() === d
+  );
 }
 
-function toJsonOrNull(v) {
-  if (v === undefined || v === null) return null;
-  if (typeof v === 'object') return v; // pg will serialize JS objects to jsonb
-  if (typeof v === 'string') {
-    const s = v.trim();
-    if (s === '') return null;
+/** Validate HH:MM 24h. */
+function isValidHHmm(hhmm) {
+  if (!/^\d{2}:\d{2}$/.test(hhmm)) return false;
+  const [h, m] = hhmm.split(':').map(Number);
+  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+}
+
+/** Safe JSON parse that accepts either string or object and returns an object, or undefined. */
+function parseOptionalJson(value) {
+  if (value == null) return undefined;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string' && value.trim() === '') return undefined;
+  if (typeof value === 'string') {
     try {
-      const parsed = JSON.parse(s);
-      return (parsed && typeof parsed === 'object') ? parsed : null;
+      const obj = JSON.parse(value);
+      return typeof obj === 'object' && obj !== null ? obj : undefined;
     } catch {
-      return null;
+      return undefined;
     }
   }
-  return null;
+  return undefined;
 }
 
-/* ------------------------------- API --------------------------------------- */
+/* ------------------------------ Reusable pieces ----------------------------- */
+
+const NameSchema = z
+  .string({ required_error: 'name is required', invalid_type_error: 'name must be a string' })
+  .trim()
+  .min(3, 'name must have at least 3 characters');
+
+const OptionalSocialNameSchema = z
+  .union([
+    z.string().trim(),
+    z.literal(''),
+    z.null(),
+    z.undefined(),
+  ])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || v.length <= 20, {
+    message: 'social_name must have at most 20 characters',
+  });
+
+const EmailSchema = z
+  .string({ required_error: 'email is required', invalid_type_error: 'email must be a string' })
+  .trim()
+  .email('invalid email format')
+  .transform((e) => e.toLowerCase());
+
+const DateYMD = z
+  .string({ required_error: 'birth_date is required', invalid_type_error: 'birth_date must be a string' })
+  .trim()
+  .refine(isValidISODate, 'date format must be YYYY-MM-DD');
+
+const TimeHHmm = z
+  .string({ required_error: 'birth_time is required', invalid_type_error: 'birth_time must be a string' })
+  .trim()
+  .refine(isValidHHmm, 'time format must be HH:MM');
+
+const BirthPlaceSchema = z
+  .string({ required_error: 'birth_place is required', invalid_type_error: 'birth_place must be a string' })
+  .trim()
+  .min(2, 'birth place must have at least 2 characters');
+
+const ProductTypeSchema = z
+  .string({ required_error: 'product_type is required', invalid_type_error: 'product_type must be a string' })
+  .trim()
+  .min(3, 'product_type must have at least 3 characters')
+  .transform((s) => s.toLowerCase());
+
+const CountryCodeSchema = z
+  .string({ invalid_type_error: 'birth_place_country must be a string' })
+  .trim()
+  .length(2, 'birth_place_country must be a 2-letter code')
+  .transform((s) => s.toUpperCase())
+  .optional();
+
+const OptionalShortText = z.string().trim().min(1).optional();
+
+const OptionalLat = z
+  .union([z.coerce.number(), z.string().trim().length(0)])
+  .transform((v) => (typeof v === 'number' ? v : undefined))
+  .refine((v) => v === undefined || (v >= -90 && v <= 90), 'birth_place_lat must be between -90 and 90')
+  .optional();
+
+const OptionalLng = z
+  .union([z.coerce.number(), z.string().trim().length(0)])
+  .transform((v) => (typeof v === 'number' ? v : undefined))
+  .refine((v) => v === undefined || (v >= -180 && v <= 180), 'birth_place_lng must be between -180 and 180')
+  .optional();
+
+const OptionalJson = z
+  .any()
+  .optional()
+  .transform((v) => parseOptionalJson(v));
+
+const OptionalTzId = z.string().trim().min(1).optional();
+
+const OptionalUtcOffsetMin = z
+  .union([z.coerce.number(), z.string().trim().length(0)])
+  .transform((v) => (typeof v === 'number' ? v : undefined))
+  .refine(
+    (v) => v === undefined || (Number.isFinite(v) && v >= -720 && v <= 840),
+    'birth_utc_offset_min must be a number between -720 and 840'
+  )
+  .optional();
+
+/* ----- NEW: optional fields coming from the frontend (CAPTCHA & Privacy) ----- */
+
+/** Accepts booleans or common truthy/falsey strings, normalized to boolean. */
+const OptionalBoolish = z
+  .union([
+    z.boolean(),
+    z.string().trim().toLowerCase().transform((s) => ['true', '1', 'yes', 'on'].includes(s)),
+    z.number().transform((n) => n === 1),
+  ])
+  .optional();
+
+/** reCAPTCHA token and action are optional (server middleware verifies token). */
+const OptionalCaptchaToken  = z.string().trim().min(1).optional();
+const OptionalCaptchaAction = z.string().trim().min(1).optional();
+
+/* ------------------------------- Root schema -------------------------------- */
+
+const birthchartSchema = z
+  .object({
+    // core fields
+    name: NameSchema,
+    social_name: OptionalSocialNameSchema,
+    email: EmailSchema,
+    birth_date: DateYMD,
+    birth_time: TimeHHmm,
+    birth_place: BirthPlaceSchema,
+    product_type: ProductTypeSchema,
+
+    birth_place_place_id: OptionalShortText,
+    birth_place_full: OptionalShortText,
+    birth_place_country: CountryCodeSchema,
+    birth_place_admin1: OptionalShortText,
+    birth_place_admin2: OptionalShortText,
+
+    birth_place_lat: OptionalLat,
+    birth_place_lng: OptionalLng,
+
+    birth_place_json: OptionalJson,
+
+    // optional timezone fields (system may compute server-side)
+    birth_timezone_id: OptionalTzId,
+    birth_utc_offset_min: OptionalUtcOffsetMin,
+
+    // NEW: tolerated fields from the public form (verified by middleware)
+    privacy_agreed: OptionalBoolish,
+    recaptcha_token: OptionalCaptchaToken,
+    recaptcha_action: OptionalCaptchaAction,
+  })
+  .strict(); // Reject any other unexpected keys
+
+/* ----------------------------- Public API (module) -------------------------- */
 
 /**
- * Create a birthchart request with idempotency (dedup window).
- * @param {object} requestData - validated & normalized payload from the controller
- * @returns {Promise<object>} the persisted (or deduped) row
+ * Validates and normalizes the public form payload.
+ * @param {unknown} payload
+ * @returns {object} Parsed data (normalized)
+ * @throws {Error} ValidationError with `status = 400` and `details` (flattened issues)
  */
-async function createBirthchartRequest(requestData) {
-  const {
-    name,
-    social_name,
-    email,
-    birth_date,
-    birth_time,
-    birth_place,
-    product_type,
+function validateBirthchartPayload(payload) {
+  const result = birthchartSchema.safeParse(payload);
+  if (result.success) return result.data;
 
-    birth_place_place_id,
-    birth_place_full,
-    birth_place_country,
-    birth_place_admin1,
-    birth_place_admin2,
-    birth_place_lat,
-    birth_place_lng,
-    birth_place_json,
-
-    birth_timezone_id,
-    birth_utc_offset_min,
-  } = requestData;
-
-  // Normalize primitives defensively (validators already normalized most fields)
-  const emailLower = (email || '').toLowerCase().trim();
-
-  const lat = toNumberOrNull(birth_place_lat);
-  const lng = toNumberOrNull(birth_place_lng);
-  const rawJson = toJsonOrNull(birth_place_json);
-
-  /**
-   * Idempotency CTE
-   *  - existing: select a recent row that matches our natural keys
-   *  - ins: insert only if no recent match
-   *  - final select: return the inserted row or the existing row
-   *
-   * Matching logic for location:
-   *   Prefer exact match on place_id when provided; otherwise use the full label.
-   */
-  const sql = `
-    WITH existing AS (
-      SELECT *
-        FROM zodika_requests
-       WHERE email = $3
-         AND birth_date = $4::date
-         AND birth_time = $5::time
-         AND (
-              ($8 IS NOT NULL AND birth_place_place_id = $8)
-           OR ($8 IS NULL AND COALESCE(birth_place_full, '') = COALESCE($9, ''))
-         )
-         AND created_at >= NOW() - ($18::int * INTERVAL '1 minute')
-       ORDER BY created_at DESC
-       LIMIT 1
-    ), ins AS (
-      INSERT INTO zodika_requests (
-        name,                 --  1
-        social_name,          --  2
-        email,                --  3
-        birth_date,           --  4
-        birth_time,           --  5
-        birth_place,          --  6
-        product_type,         --  7
-        birth_place_place_id, --  8
-        birth_place_full,     --  9
-        birth_place_country,  -- 10
-        birth_place_admin1,   -- 11
-        birth_place_admin2,   -- 12
-        birth_place_lat,      -- 13
-        birth_place_lng,      -- 14
-        birth_place_json,     -- 15
-        birth_timezone_id,    -- 16
-        birth_utc_offset_min  -- 17
-      )
-      SELECT
-        $1,
-        $2,
-        $3,
-        $4::date,
-        $5::time,
-        $6,
-        $7,
-        $8,
-        $9,
-        $10,
-        $11,
-        $12,
-        $13::float8,
-        $14::float8,
-        $15::jsonb,
-        $16,
-        $17::int
-      WHERE NOT EXISTS (SELECT 1 FROM existing)
-      RETURNING *
-    )
-    SELECT * FROM ins
-    UNION ALL
-    SELECT * FROM existing
-    LIMIT 1;
-  `;
-
-  const values = [
-    name,                                //  1
-    social_name || null,                 //  2
-    emailLower,                          //  3 (normalized)
-    birth_date,                          //  4
-    birth_time,                          //  5
-    birth_place,                         //  6
-    product_type,                        //  7
-    birth_place_place_id || null,        //  8
-    birth_place_full || null,            //  9
-    birth_place_country || null,         // 10
-    birth_place_admin1 || null,          // 11
-    birth_place_admin2 || null,          // 12
-    lat,                                 // 13
-    lng,                                 // 14
-    rawJson,                             // 15
-    birth_timezone_id || null,           // 16
-    toNumberOrNull(birth_utc_offset_min),// 17
-    DEDUP_WINDOW_MIN,                    // 18 (minutes)
-  ];
-
-  const { rows } = await db.query(sql, values);
-  return rows[0];
+  const flattened = result.error.flatten();
+  const err = new Error('Validation Error');
+  err.name = 'ValidationError';
+  err.status = 400;
+  err.details = {
+    fieldErrors: flattened.fieldErrors,
+    formErrors: flattened.formErrors,
+  };
+  throw err;
 }
 
-module.exports = { createBirthchartRequest };
+module.exports = {
+  validateBirthchartPayload,
+  birthchartSchema,
+};
