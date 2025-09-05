@@ -6,7 +6,7 @@
  * -------------
  * - Loads and validates environment variables (envalid)
  * - Initializes the PostgreSQL connection pool
- * - Instantiates Express and configures security, parsing, and rate limiting
+ * - Instantiates Express and configures security, parsing, rate limiting, and routing
  */
 require('./config/env');
 require('./db/db');
@@ -22,46 +22,55 @@ const PORT = process.env.PORT || 3000;
 /**
  * Networking / Proxy trust
  * ------------------------
- * This app runs behind a reverse proxy (Railway/Render/Fly/Cloud Run, etc.).
- * NEVER use `true` (trust-all): it allows forging `X-Forwarded-For` and
- * breaks IP-based rate-limiting (express-rate-limit throws ERR_ERL_PERMISSIVE_TRUST_PROXY).
- *
- * Strategy:
- * - Control the trusted proxy hops via env var (TRUST_PROXY_HOPS).
- * - Production default: 1 hop (typical single load balancer).
- * - Local/dev default: 0 (disabled).
- *
- * Examples:
- *   TRUST_PROXY_HOPS=1        -> app.set('trust proxy', 1)
- *   TRUST_PROXY_HOPS=0/false  -> app.set('trust proxy', false)
+ * NEVER use `true` (trust-all). Control hops via TRUST_PROXY_HOPS.
+ * Prod default: 1 hop (typical LB). Dev default: disabled.
  */
 function resolveTrustProxySetting() {
   const raw = (process.env.TRUST_PROXY_HOPS || '').trim().toLowerCase();
-
-  // Explicitly disabled
   if (raw === 'false' || raw === '0') return false;
-
-  // Numeric hop count, if provided
   const n = parseInt(raw, 10);
   if (Number.isFinite(n) && n >= 0) return n;
-
-  // Safe defaults
   const env = (process.env.NODE_ENV || 'production').toLowerCase();
   return env === 'production' ? 1 : false;
 }
-
 const TRUST_PROXY_SETTING = resolveTrustProxySetting();
 app.set('trust proxy', TRUST_PROXY_SETTING);
 
 /**
- * HTTP security headers
- * ---------------------
- * - Helmet applies a set of security-related headers.
- * - Also disable Express 'X-Powered-By' to avoid stack disclosure.
- * (CSP is not enabled here to avoid breaking frontend; add it later with
- *  proper domain/origin allowlists if needed.)
+ * HTTP security headers (Helmet)
+ * ------------------------------
+ * - Minimal but strong CSP for API/redirect responses (safe for JSON).
+ * - Disable X-Powered-By to avoid stack disclosure.
+ * If you need to loosen CSP for HTML pages served here in the future, adjust directives.
  */
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        "default-src": ["'none'"],
+        "base-uri": ["'none'"],
+        "frame-ancestors": ["'none'"],
+        "form-action": ["'self'"],
+        "connect-src": ["'self'"],
+        // The lines below are conservative and safe for API/static assets.
+        "img-src": ["'self'"],
+        "style-src": ["'self'"],
+        "script-src": ["'none'"],
+        "frame-src": ["'none'"],
+        "object-src": ["'none'"],
+      },
+    },
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginResourcePolicy: { policy: 'same-site' },
+    xFrameOptions: true,
+    xDnsPrefetchControl: true,
+    xDownloadOptions: true,
+    noSniff: true,
+    ieNoOpen: true,
+    hidePoweredBy: true,
+  })
+);
 app.disable('x-powered-by');
 
 /**
@@ -75,7 +84,7 @@ app.use(correlationId);
 /**
  * Infra middlewares
  * -----------------
- * - Global CORS (safe across routes; does not replace backend origin validation)
+ * - Global CORS (safe across routes; does not replace backend origin verification)
  * - Centralized error handler (registered last)
  */
 const corsMiddleware = require('./middlewares/cors');
@@ -98,48 +107,42 @@ const mpReturnRouter  = require('./payments/mercadoPago/router.return');
  * -----------------------------------------
  * Webhooks must validate provider signatures against the exact raw bytes.
  * Therefore:
- * 1) Register `express.raw()` parsers BEFORE any JSON parser;
+ * 1) Register `express.raw()` parsers BEFORE any JSON/urlencoded parser;
  * 2) Keep body limits reasonable to avoid hashing large payloads.
  */
 function rawBodySaver(req, res, buf) {
   if (buf && buf.length) req.rawBody = Buffer.from(buf);
 }
 
-// Raw parsers dedicated to webhook endpoints (MUST be before the global JSON parser)
+// Raw parsers dedicated to webhook endpoints (MUST be before the global parsers)
 app.use('/webhook/mercadopago', express.raw({ type: '*/*', limit: '1mb', verify: rawBodySaver }));
 app.use('/webhook/pagbank',     express.raw({ type: '*/*', limit: '1mb', verify: rawBodySaver }));
 
 /**
  * Rate limiting (express-rate-limit)
  * ----------------------------------
- * Rules:
- * - The limiter MUST mirror the Express proxy trust policy by passing
- *   `trustProxy: TRUST_PROXY_SETTING`. This avoids ERR_ERL_PERMISSIVE_TRUST_PROXY
- *   and prevents IP spoofing via X-Forwarded-For.
- * - Conservative defaults with env overrides.
+ * The limiter MUST mirror the Express proxy trust policy by passing `trustProxy`.
  */
 const toInt = (v, d) => {
   const n = parseInt(String(v ?? ''), 10);
   return Number.isFinite(n) ? n : d;
 };
-
 const createRateLimiter = ({
   windowMs,
   limit,
   message,
-  // Must mirror the app's trust proxy setting (boolean|number|function)
   trustProxy = TRUST_PROXY_SETTING,
 }) =>
   rateLimit({
     windowMs,
     limit,
     message: { message },
-    standardHeaders: 'draft-7', // emits modern RateLimit-* headers
+    standardHeaders: 'draft-7',
     legacyHeaders: false,
-    trustProxy,                 // CRITICAL: aligned with app 'trust proxy'
+    trustProxy,
   });
 
-// Webhook limiter (allow higher throughput but still bounded)
+// Webhook limiter (allow higher throughput but bounded)
 const webhookLimiter = createRateLimiter({
   windowMs: toInt(process.env.WEBHOOK_RL_WINDOW_MS, 5 * 60 * 1000), // 5 min
   limit: toInt(process.env.WEBHOOK_RL_MAX, 1000),
@@ -162,17 +165,27 @@ const formLimiter = createRateLimiter({
 app.use(corsMiddleware);
 
 /**
- * JSON parser for non-webhook routes
- * ----------------------------------
+ * JSON / URL-encoded parsers for non-webhook routes
+ * -------------------------------------------------
  * We also keep a raw copy for non-webhook routes when useful.
- * Note: 'type' is a function to exclude webhook paths.
  */
+const nonWebhookType = (req) => !req.path.startsWith('/webhook/');
 app.use(
   express.json({
-    type: (req) => !req.path.startsWith('/webhook/'),
+    type: nonWebhookType,
     limit: '1mb',
     verify: (req, res, buf) => {
-      if (!req.path.startsWith('/webhook/')) rawBodySaver(req, res, buf);
+      if (nonWebhookType(req)) rawBodySaver(req, res, buf);
+    },
+  })
+);
+app.use(
+  express.urlencoded({
+    type: nonWebhookType,
+    extended: false,
+    limit: '100kb',
+    verify: (req, res, buf) => {
+      if (nonWebhookType(req)) rawBodySaver(req, res, buf);
     },
   })
 );
@@ -216,7 +229,6 @@ app.use('/birthchart', formLimiter, birthchartRouter);
  */
 app.use('/webhook/pagbank', webhookLimiter);
 app.use('/', pagbankWebhookRouter);
-
 if (process.env.PAGBANK_ENABLED === 'true') {
   app.use('/pagBank', pagbankReturnRouter);
 }
