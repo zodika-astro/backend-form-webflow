@@ -138,7 +138,7 @@ const env = cleanEnv(
   }
 );
 
-// Guardrails forbidding dangerous toggles in production
+// Guardrails forbidding dangerous toggles in production.
 if (isProd && env.ALLOW_UNSIGNED_WEBHOOKS) {
   throw new Error('Security violation: ALLOW_UNSIGNED_WEBHOOKS must be false in production.');
 }
