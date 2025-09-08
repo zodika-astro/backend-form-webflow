@@ -97,6 +97,10 @@ const env = cleanEnv(
       default: false,
       desc: 'Toggle to enable PagBank return routes',
     }),
+    PAGBANK_WEBHOOK_URL: url({
+      default: isProd ? undefined : 'http://localhost:3000/webhook/pagbank',
+      desc: 'Public webhook URL configured in PagBank (required in production)',
+    }),
 
     // Checkout UX
     PAYMENT_FAILURE_URL: url({
@@ -124,6 +128,17 @@ const env = cleanEnv(
         "Recommended: '1' in production (single LB). Use '0' or 'false' to disable in dev. " +
         'Do NOT use true/trust-all.',
     }),
+
+    // Captcha
+    CAPTCHA_PROVIDER: str({
+      default: '',
+      choices: ['', 'recaptcha', 'turnstile'],
+      desc: 'Captcha provider to validate user submissions',
+    }),
+    RECAPTCHA_SECRET: str({
+      default: isProd ? undefined : '',
+      desc: 'reCAPTCHA secret key (required in production when CAPTCHA_PROVIDER=recaptcha)',
+    }),
   },
   {
     // Keep error output minimal and non-sensitive if validation fails
@@ -141,6 +156,11 @@ const env = cleanEnv(
 // Guardrails forbidding dangerous toggles in production.
 if (isProd && env.ALLOW_UNSIGNED_WEBHOOKS) {
   throw new Error('Security violation: ALLOW_UNSIGNED_WEBHOOKS must be false in production.');
+}
+
+// Guardrails for reCAPTCHA
+if (isProd && env.CAPTCHA_PROVIDER === 'recaptcha' && !env.RECAPTCHA_SECRET) {
+  throw new Error('Security violation: RECAPTCHA_SECRET is required in production when CAPTCHA_PROVIDER=recaptcha.');
 }
 
 // Soft deprecation notice for old TRUST_PROXY var (if still present)
