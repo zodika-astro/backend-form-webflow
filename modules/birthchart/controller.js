@@ -47,6 +47,54 @@ function pick(input, allowedKeys) {
   return out;
 }
 
+/* -------------------------------------------------------------------------- */
+/* NEW: Minimal, in-file normalizers (no extra imports to avoid breakage).    */
+/* -------------------------------------------------------------------------- */
+/**
+ * Accepts common consent field shapes from the frontend and maps to boolean.
+ * Supports: boolean true/false, "on", "yes", "1", "true", "checked".
+ */
+function normalizeConsent(body = {}) {
+  const raw =
+    body.privacyConsent ??
+    body.privacy_agreed ??
+    body.privacy ??
+    body.privacy_policy ??
+    body.policy ??
+    body.terms;
+
+  if (raw == null) return false;
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'number') return raw === 1;
+
+  const s = String(raw).trim().toLowerCase();
+  return s === 'true' || s === 'on' || s === 'yes' || s === '1' || s === 'checked';
+}
+
+/**
+ * Picks the most likely reCAPTCHA token field sent by the frontend.
+ * Supports: recaptcha_token, recaptchaToken, g-recaptcha-response, etc.
+ */
+function pickCaptchaToken(body = {}) {
+  return (
+    body.recaptcha_token ??
+    body.recaptchaToken ??
+    body.captcha_token ??
+    body.captchaToken ??
+    body['g-recaptcha-response'] ??
+    body.g_recaptcha_response ??
+    body.captcha ??
+    null
+  );
+}
+
+/**
+ * Feature flag: by default captcha is required unless explicitly disabled via env.
+ * We intentionally read from process.env to avoid depending on envalid schema changes.
+ */
+const RECAPTCHA_REQUIRED =
+  String(process.env.RECAPTCHA_REQUIRED ?? 'true').trim().toLowerCase() !== 'false';
+
 /** Allowed public form fields (whitelist). Extra fields (e.g., CAPTCHA) are ignored here. */
 const ALLOWED_FORM_KEYS = [
   'name',
@@ -75,22 +123,47 @@ const ALLOWED_FORM_KEYS = [
  * Body: validated by Zod in validateBirthchartPayload (normalized on return)
  *
  * Security:
- * - CAPTCHA and Privacy checks are enforced by the router middlewares.
- * - We still ignore any unexpected fields (e.g., recaptcha_token) before validation/persistence.
+ * - Router middlewares may enforce CAPTCHA/Privacy; we additionally normalize
+ *   and enforce here to be robust against field-name drift on the frontend.
+ * - We still ignore unexpected fields before validation/persistence.
  */
 async function processForm(req, res, next) {
   // Derive a request-scoped logger (keeps correlation-id from middleware)
   const logger = (req.log || baseLogger).child('processForm', { rid: req.requestId });
 
   try {
+    /* ----------------------- NEW: consent & captcha guards ---------------------- */
+    // Normalize privacy consent from multiple possible field names.
+    const privacyConsent = normalizeConsent(req.body);
+    if (!privacyConsent) {
+      // Use 400 to indicate client-side correction needed.
+      throw new AppError(
+        'privacy_consent_required',
+        'Privacy Policy consent is required to submit this form.',
+        400,
+        { field: 'privacyConsent' }
+      );
+    }
+
+    // Extract captcha token in a tolerant way; require it unless explicitly disabled.
+    const captchaToken = pickCaptchaToken(req.body);
+    if (RECAPTCHA_REQUIRED && !captchaToken) {
+      throw new AppError(
+        'recaptcha_token_missing',
+        'reCAPTCHA token is missing.',
+        400,
+        { provider: 'recaptcha_v3' }
+      );
+    }
+
     logger.info(
       {
-        // minimal, non-sensitive signal
-        hasCaptcha: !!req.captcha,
-        captchaProv: req.captcha?.provider || undefined,
+        hasCaptchaHeader: !!req.captcha,     // from middleware (if any)
+        hasCaptchaToken: !!captchaToken,     // from body
       },
-      'received submission'
+      'consent/captcha normalized'
     );
+    /* -------------------------------------------------------------------------- */
 
     // 1) Filter raw body (avoid mass assignment) and validate/normalize
     const filtered = pick(req.body, ALLOWED_FORM_KEYS);
@@ -115,7 +188,9 @@ async function processForm(req, res, next) {
     });
 
     if (!tz || !tz.tzId || typeof tz.offsetMin !== 'number') {
-      throw AppError.internal('tz_invalid', 'Resolved timezone is invalid', { got: tz ? Object.keys(tz) : null });
+      // NOTE: keeping existing semantics; AppError.internal may not exist in your class,
+      // so keep using a standard AppError with 500 to avoid breaking.
+      throw new AppError('tz_invalid', 'Resolved timezone is invalid', 500, { got: tz ? Object.keys(tz) : null });
     }
 
     logger.info({ tzId: tz.tzId, offsetMin: tz.offsetMin }, 'timezone resolved');
