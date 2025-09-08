@@ -14,7 +14,7 @@ const server = app.listen(PORT, () => {
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     // eslint-disable-next-line no-console
-    console.error(`Port ${PORT} is already in use. Did Railway already start another process?`);
+    console.error(`Port ${PORT} is already in use.`);
     process.exit(1);
   } else {
     throw err;
