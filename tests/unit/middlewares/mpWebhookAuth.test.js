@@ -43,11 +43,19 @@ function buildReqResNext({ id, xRequestId, tsSec, payload }) {
 
   const raw = Buffer.from(JSON.stringify(payload), 'utf8');
 
+  // simulate Express req with both .header() and .get() helpers (case-insensitive)
+  const getter = (name) => {
+    const keyLc = String(name).toLowerCase();
+    // try exact, then lowercase
+    return headers[name] ?? headers[keyLc];
+  };
+
   const req = {
     headers,
     rawBody: raw,
     body: raw, // middleware supports rawBody || body buffer
-    header: (name) => headers[String(name).toLowerCase()] || headers[name],
+    header: getter,
+    get: getter,
   };
 
   const res = {};
@@ -90,14 +98,16 @@ describe('middlewares/mpWebhookAuth', () => {
     const paymentId = '9999';
     const payload = { type: 'payment', data: { id: paymentId } };
 
-    // Build valid headers then tamper the signature
+    // Build valid request, then tamper ONLY the signature keeping 64 hex chars
     const ctx = buildReqResNext({
       id: paymentId,
       xRequestId: 'req-2',
       tsSec: String(nowSec),
       payload,
     });
-    ctx.req.headers['x-signature'] = `ts=${nowSec},v1=deadbeef`; // wrong signature
+
+    const badV1 = ctx.v1.replace(/^./, ctx.v1[0] === 'a' ? 'b' : 'a'); // change 1st nibble, still hex/64 chars
+    ctx.req.headers['x-signature'] = `ts=${nowSec},v1=${badV1}`;
 
     await mpWebhookAuth(ctx.req, ctx.res, ctx.next);
 
