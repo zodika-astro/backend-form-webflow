@@ -11,11 +11,11 @@
  *  - optional `details` (safe to log/return; never include secrets/PII)
  *
  * Helpers included:
- *  - validation(...)        → 400 errors for input validation
- *  - fromUnexpected(...)    → 500 (or provided status) for unexpected failures
- *  - fromUpstream(...)      → wraps HTTP client/provider errors (default 502)
- *  - fromMPResponse(...)    → specialized mapping for Mercado Pago responses
- *  - fromPagBankResponse(...) → specialized mapping for PagBank responses
+ *  - validation(...)           → 400 errors for input validation
+ *  - fromUnexpected(...)       → 500 (or provided status) for unexpected failures
+ *  - fromUpstream(...)         → wraps HTTP client/provider errors (default 502)
+ *  - fromMPResponse(...)       → specialized mapping for Mercado Pago responses
+ *  - fromPagBankResponse(...)  → specialized mapping for PagBank responses
  *
  * Notes:
  *  - `.safeJSON()` yields a client-safe payload (no stack, no cause).
@@ -35,8 +35,8 @@ class AppError extends Error {
     this.code = code || 'internal_error';
     this.status = Number.isFinite(status) ? Number(status) : 500;
     if (details !== undefined) this.details = details;
-    this.isAppError = true; // easy type guard in handlers
-    // Preserve stack without including constructor in the trace (when supported)
+    this.isAppError = true; // simple type guard for handlers
+    // Keep constructor out of stack where supported
     Error.captureStackTrace?.(this, AppError);
   }
 
@@ -51,25 +51,25 @@ class AppError extends Error {
     return out;
   }
 
-  /** Override default JSON serialization to the safe representation. */
+  /** Override default JSON serialization with the safe representation. */
   toJSON() {
     return this.safeJSON();
   }
 
-  /** Generic wrapper when the thrown value is not an AppError. */
+  /** Wrap non-AppError values into an AppError. */
   static wrap(err, fallbackCode = 'internal_error', status = 500, details) {
     if (err instanceof AppError) return err;
     const msg = err?.message || 'Internal server error';
     return new AppError(fallbackCode, msg, status, details);
   }
 
-  /** 400 Validation error (used by controllers to normalize Zod/Val. libs). */
+  /** 400 Validation error (to normalize Zod/validator libs in controllers). */
   static validation(code = 'validation_error', message = 'Validation error', details) {
     return new AppError(code, message, 400, details);
   }
 
   /**
-   * Wrap unexpected errors (internal exceptions).
+   * Wrap unexpected internal failures with a consistent code/status.
    * @param {string} code
    * @param {string} message
    * @param {object} [opts] { cause?: any, status?: number, details?: object }
@@ -81,7 +81,7 @@ class AppError extends Error {
   }
 
   /**
-   * Wrap upstream/provider HTTP errors (e.g., PSP, external APIs).
+   * Wrap upstream/provider HTTP errors (e.g., PSP/external APIs).
    * Attempts to derive a meaningful HTTP status and preserves safe metadata.
    * @param {string} code
    * @param {string} message
@@ -150,7 +150,7 @@ class AppError extends Error {
   }
 }
 
-/* ----------------------------- helpers (internal) ---------------------------- */
+/* ----------------------------- Internal helpers ----------------------------- */
 
 function normalizeHttpStatus(status, fallback = 500) {
   const n = Number(status);
@@ -172,4 +172,11 @@ function extractRetryAfter(headers) {
   return {};
 }
 
-module.exports = { AppError };
+/**
+ * EXPORT SHAPE (supports both import styles)
+ * ------------------------------------------
+ *  const AppError = require('.../appError');
+ *  const { AppError } = require('.../appError');
+ */
+module.exports = AppError;          // default export
+module.exports.AppError = AppError; // named export
