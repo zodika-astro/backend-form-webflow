@@ -35,4 +35,5 @@ jobs:
       - name: Run unit tests
         env:
           NODE_ENV: test
+          INIT_DB_ON_STARTUP: 'false'
         run: npm test
