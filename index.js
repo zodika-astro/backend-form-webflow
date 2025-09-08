@@ -46,7 +46,7 @@ function resolveTrustProxySetting() {
   if (Number.isFinite(n) && n >= 0) return n;
 
   // Safe defaults
-  const env = (process.env.NODE_ENV || 'production').toLowerCase();
+  const env = (process.env.NODE_ENV || 'development').toLowerCase();
   return env === 'production' ? 1 : false;
 }
 
