@@ -7,7 +7,8 @@
     "start": "node server.js",
     "test": "jest --runInBand",
     "test:watch": "jest --watch",
-    "test:cov": "jest --runInBand --coverage"
+    "test:cov": "jest --runInBand --coverage",
+    "test:ci": "jest --runInBand --ci --reporters=default"
   },
   "keywords": [],
   "author": "",
@@ -25,5 +26,8 @@
     "pg": "^8.16.3",
     "undici": "^6.21.3",
     "zod": "^4.0.15"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }
