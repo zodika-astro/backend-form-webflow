@@ -277,7 +277,6 @@ function validateBirthchartPayload(payload) {
 module.exports = {
   // Main validator
   validateBirthchartPayload,
-
   // Export schema for reuse (e.g., unit tests or composing extended schemas)
   birthchartSchema,
 };
