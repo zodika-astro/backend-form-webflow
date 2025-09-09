@@ -62,6 +62,23 @@ function parseOptionalJson(value) {
   return undefined;
 }
 
+/** Consolidate captcha token from multiple common keys (frontend variants). */
+function pickCaptchaToken(body = {}) {
+  const c =
+    body.captcha_token ??
+    body.captchaToken ??
+    body.recaptcha_token ??
+    body.recaptchaToken ??
+    body['g-recaptcha-response'] ??
+    body.g_recaptcha_response ??
+    body.captcha ??
+    null;
+
+  if (c == null) return null;
+  const s = String(c).trim();
+  return s.length ? s : null;
+}
+
 /* ------------------------------ Reusable pieces ----------------------------- */
 
 const NameSchema = z
@@ -71,12 +88,7 @@ const NameSchema = z
   .max(60, 'name must have at most 60 characters');
 
 const OptionalSocialNameSchema = z
-  .union([
-    z.string().trim(),
-    z.literal(''),
-    z.null(),
-    z.undefined(),
-  ])
+  .union([z.string().trim(), z.literal(''), z.null(), z.undefined()])
   .transform((v) => {
     if (v == null) return undefined;
     const s = String(v).trim();
@@ -156,23 +168,12 @@ const OptionalLng = z
  * Then transforms to an object (or undefined) and lightly validates shape.
  */
 const OptionalJson = z
-  .union([
-    z.string().max(10_000, 'birth_place_json string is too large'),
-    z.record(z.any()),
-  ])
+  .union([z.string().max(10_000, 'birth_place_json string is too large'), z.record(z.any())])
   .optional()
   .transform((v) => parseOptionalJson(v))
+  .refine((obj) => obj === undefined || typeof obj === 'object', 'birth_place_json must be a JSON object')
   .refine(
-    (obj) =>
-      obj === undefined ||
-      typeof obj === 'object',
-    'birth_place_json must be a JSON object'
-  )
-  .refine(
-    (obj) =>
-      obj === undefined ||
-      typeof obj.place_id === 'string' ||
-      obj.place_id === undefined,
+    (obj) => obj === undefined || typeof obj.place_id === 'string' || obj.place_id === undefined,
     'birth_place_json.place_id must be a string when present'
   );
 
@@ -181,15 +182,27 @@ const OptionalTzId = z.string().trim().min(1).max(128).optional();
 const OptionalUtcOffsetMin = z
   .union([z.coerce.number(), z.string().trim().length(0)])
   .transform((v) => (typeof v === 'number' ? v : undefined))
-  .refine(
-    (v) => v === undefined || (Number.isFinite(v) && v >= -720 && v <= 840),
-    'birth_utc_offset_min must be a number between -720 and 840'
-  )
+  .refine((v) => v === undefined || (Number.isFinite(v) && v >= -720 && v <= 840), 'birth_utc_offset_min must be a number between -720 and 840')
   .optional();
 
 /* ------------------------------- Root schema -------------------------------- */
+/**
+ * Envolvemos o schema raiz com z.preprocess:
+ * - Consolidamos `captcha_token` a partir de variantes do frontend.
+ * - Não alteramos mais nada na estrutura/validações existentes.
+ */
+const birthchartSchema = z.preprocess((raw) => {
+  const obj = raw && typeof raw === 'object' ? { ...raw } : {};
 
-const birthchartSchema = z
+  // Consolidar token do captcha em captcha_token (se não vier com esse nome)
+  if (!obj.captcha_token) {
+    const tok = pickCaptchaToken(obj);
+    if (tok) obj.captcha_token = tok;
+  }
+
+  return obj;
+},
+z
   .object({
     name: NameSchema,
     social_name: OptionalSocialNameSchema,
@@ -215,8 +228,27 @@ const birthchartSchema = z
     // Optional timezone id and offset (system may compute them server-side).
     birth_timezone_id: OptionalTzId,
     birth_utc_offset_min: OptionalUtcOffsetMin,
+
+    // ===== reCAPTCHA / consent (novos, para compatibilidade com strict()) =====
+    // token consolidado e OBRIGATÓRIO
+    captcha_token: z.string().trim().min(1, 'reCAPTCHA token is missing'),
+    // metadados opcionais
+    recaptcha_action: z.string().trim().min(1).optional(),
+    captcha_provider: z.string().trim().min(1).optional(),
+    // as variantes ficam opcionais para não quebrar strict(); serão ignoradas
+    recaptcha_token: z.string().optional(),
+    recaptchaToken: z.string().optional(),
+    captchaToken: z.string().optional(),
+    captcha: z.string().optional(),
+    'g-recaptcha-response': z.string().optional(),
+    g_recaptcha_response: z.string().optional(),
+
+    // consentimento (opcional, aceitamos para não falhar com strict)
+    privacyConsent: z.coerce.boolean().optional(),
+    privacy_agreed: z.coerce.boolean().optional(),
   })
-  .strict(); // Reject unexpected keys to avoid silently accepting malformed input
+  .strict()
+);
 
 /* ----------------------------- Public API (module) -------------------------- */
 
