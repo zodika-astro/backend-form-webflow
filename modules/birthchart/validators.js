@@ -6,16 +6,20 @@ const { z } = require('zod');
 /**
  * Birthchart validators (Zod)
  * --------------------------
- * Goals
+ * Objectives
  * - Strong, reusable schemas with clear error messages.
  * - Trim/normalize inputs (lowercasing emails, coercing numbers when safe).
  * - Validate date/time formats AND logical ranges (YYYY-MM-DD, HH:MM, lat/lng ranges).
- * - Accept structured objects for "birth_place_json" (not only stringified JSON).
- * - Enforce sane max lengths to prevent oversized payloads from public forms.
+ * - Accept structured objects for "birth_place_json" (not only JSON strings).
+ * - Enforce reasonable max lengths to prevent oversized public payloads.
  *
  * Security/PII
- * - Do not log full payloads from public forms; surface only paths/messages.
- * - Keep error messages user-friendly and non-verbose to avoid leaking data.
+ * - Do not log full public payloads; surface only paths/messages.
+ * - Keep messages user-friendly without leaking sensitive details.
+ *
+ * Business rule
+ * - reCAPTCHA token is mandatory. We consolidate it from multiple common keys
+ *   and expose it as `captcha_token` for the rest of the application.
  */
 
 /* --------------------------------- Helpers --------------------------------- */
@@ -41,12 +45,16 @@ function isValidHHmm(hhmm) {
   return h >= 0 && h <= 23 && m >= 0 && m <= 59;
 }
 
-/** Get today's date as YYYY-MM-DD in UTC (for lexicographic comparison). */
+/** Today's date as YYYY-MM-DD in UTC (safe for lexicographic comparison). */
 function todayYMD() {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** Safe parse: accepts object or JSON string; returns object or undefined. */
+/**
+ * Safe parse:
+ * - Accepts an object or a JSON string.
+ * - Returns an object or undefined (never throws).
+ */
 function parseOptionalJson(value) {
   if (value == null) return undefined;
   if (typeof value === 'object') return value;
@@ -62,7 +70,10 @@ function parseOptionalJson(value) {
   return undefined;
 }
 
-/** Consolidate captcha token from multiple common keys (frontend variants). */
+/**
+ * Consolidate captcha token from multiple common client keys.
+ * If absent or empty, returns null (validation will reject it later).
+ */
 function pickCaptchaToken(body = {}) {
   const c =
     body.captcha_token ??
@@ -124,8 +135,8 @@ const BirthPlaceSchema = z
   .max(120, 'birth_place must have at most 120 characters');
 
 /**
- * Product type is currently fixed by business rules. We still normalize to lowercase
- * before enforcing the literal to allow for minor front-end discrepancies.
+ * Product type is currently fixed by business requirements.
+ * Normalize to lowercase first, then enforce the literal.
  */
 const ProductTypeSchema = z
   .string({ required_error: 'product_type is required', invalid_type_error: 'product_type must be a string' })
@@ -162,10 +173,10 @@ const OptionalLng = z
   .optional();
 
 /**
- * Accepts either:
- * - a JSON string up to 10kB, or
- * - a plain object (record)
- * Then transforms to an object (or undefined) and lightly validates shape.
+ * Accept either:
+ * - a JSON string up to 10 kB, or
+ * - a plain object
+ * Transform to an object (or undefined) and lightly validate shape.
  */
 const OptionalJson = z
   .union([z.string().max(10_000, 'birth_place_json string is too large'), z.record(z.any())])
@@ -187,73 +198,70 @@ const OptionalUtcOffsetMin = z
 
 /* ------------------------------- Root schema -------------------------------- */
 /**
- * Envolvemos o schema raiz com z.preprocess:
- * - Consolidamos `captcha_token` a partir de variantes do frontend.
- * - Não alteramos mais nada na estrutura/validações existentes.
+ * Wrap the root schema with z.preprocess to:
+ * - Consolidate a captcha token into `captcha_token` (mandatory).
+ * - Keep the rest of the structure intact (strict mode remains).
  */
-const birthchartSchema = z.preprocess((raw) => {
-  const obj = raw && typeof raw === 'object' ? { ...raw } : {};
+const birthchartSchema = z.preprocess(
+  (raw) => {
+    const obj = raw && typeof raw === 'object' ? { ...raw } : {};
+    if (!obj.captcha_token) {
+      const tok = pickCaptchaToken(obj);
+      if (tok) obj.captcha_token = tok;
+    }
+    return obj;
+  },
+  z
+    .object({
+      name: NameSchema,
+      social_name: OptionalSocialNameSchema,
+      email: EmailSchema,
+      birth_date: DateYMD,
+      birth_time: TimeHHmm,
+      birth_place: BirthPlaceSchema,
+      product_type: ProductTypeSchema,
 
-  // Consolidar token do captcha em captcha_token (se não vier com esse nome)
-  if (!obj.captcha_token) {
-    const tok = pickCaptchaToken(obj);
-    if (tok) obj.captcha_token = tok;
-  }
+      birth_place_place_id: PlaceIdSchema,
+      birth_place_full: z.string().trim().min(2).max(200).optional(),
+      birth_place_country: CountryCodeSchema,
+      birth_place_admin1: OptionalAdminText,
+      birth_place_admin2: OptionalAdminText,
 
-  return obj;
-},
-z
-  .object({
-    name: NameSchema,
-    social_name: OptionalSocialNameSchema,
-    email: EmailSchema,
-    birth_date: DateYMD,
-    birth_time: TimeHHmm,
-    birth_place: BirthPlaceSchema,
-    product_type: ProductTypeSchema,
+      // Accept numbers or numeric strings; coerce and enforce ranges.
+      birth_place_lat: OptionalLat,
+      birth_place_lng: OptionalLng,
 
-    birth_place_place_id: PlaceIdSchema,
-    birth_place_full: z.string().trim().min(2).max(200).optional(),
-    birth_place_country: CountryCodeSchema,
-    birth_place_admin1: OptionalAdminText,
-    birth_place_admin2: OptionalAdminText,
+      // Accept stringified JSON or object; transform to object when possible.
+      birth_place_json: OptionalJson,
 
-    // Accept numbers or numeric strings; convert to numbers; enforce ranges.
-    birth_place_lat: OptionalLat,
-    birth_place_lng: OptionalLng,
+      // Optional timezone id and offset (may be computed server-side).
+      birth_timezone_id: OptionalTzId,
+      birth_utc_offset_min: OptionalUtcOffsetMin,
 
-    // Accept stringified JSON or object; convert to object when possible.
-    birth_place_json: OptionalJson,
+      // ===== reCAPTCHA & consent (added to cooperate with strict mode) =====
+      // Consolidated token: REQUIRED
+      captcha_token: z.string().trim().min(1, 'reCAPTCHA token is missing'),
+      // Optional metadata
+      recaptcha_action: z.string().trim().min(1).optional(),
+      captcha_provider: z.string().trim().min(1).optional(),
+      // Allow alternative client keys (optional; ignored if present)
+      recaptcha_token: z.string().optional(),
+      recaptchaToken: z.string().optional(),
+      captchaToken: z.string().optional(),
+      captcha: z.string().optional(),
+      'g-recaptcha-response': z.string().optional(),
+      g_recaptcha_response: z.string().optional(),
 
-    // Optional timezone id and offset (system may compute them server-side).
-    birth_timezone_id: OptionalTzId,
-    birth_utc_offset_min: OptionalUtcOffsetMin,
-
-    // ===== reCAPTCHA / consent (novos, para compatibilidade com strict()) =====
-    // token consolidado e OBRIGATÓRIO
-    captcha_token: z.string().trim().min(1, 'reCAPTCHA token is missing'),
-    // metadados opcionais
-    recaptcha_action: z.string().trim().min(1).optional(),
-    captcha_provider: z.string().trim().min(1).optional(),
-    // as variantes ficam opcionais para não quebrar strict(); serão ignoradas
-    recaptcha_token: z.string().optional(),
-    recaptchaToken: z.string().optional(),
-    captchaToken: z.string().optional(),
-    captcha: z.string().optional(),
-    'g-recaptcha-response': z.string().optional(),
-    g_recaptcha_response: z.string().optional(),
-
-    // consentimento (opcional, aceitamos para não falhar com strict)
-    privacyConsent: z.coerce.boolean().optional(),
-    privacy_agreed: z.coerce.boolean().optional(),
-  })
-  .strict()
+      // Consent flags (optional; accepted to avoid strict() rejections)
+      privacyConsent: z.coerce.boolean().optional(),
+      privacy_agreed: z.coerce.boolean().optional(),
+    })
+    .strict()
 );
 
 /* ----------------------------- Public API (module) -------------------------- */
-
 /**
- * Validates and normalizes the public form payload.
+ * Validate and normalize the public form payload.
  * @param {unknown} payload
  * @returns {object} Parsed data (normalized)
  * @throws {Error} ValidationError with `status = 400` and `details` (flattened issues)
@@ -262,7 +270,7 @@ function validateBirthchartPayload(payload) {
   const result = birthchartSchema.safeParse(payload);
   if (result.success) return result.data;
 
-  // Build a compact error with paths and messages for centralized error handler
+  // Compact error for a centralized error handler
   const flattened = result.error.flatten();
   const err = new Error('Validation Error');
   err.name = 'ValidationError';
@@ -275,8 +283,6 @@ function validateBirthchartPayload(payload) {
 }
 
 module.exports = {
-  // Main validator
   validateBirthchartPayload,
-  // Export schema for reuse (e.g., unit tests or composing extended schemas)
   birthchartSchema,
 };
