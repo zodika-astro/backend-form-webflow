@@ -1,4 +1,4 @@
-// middlewares/recaptchaVerify.js
+// middlewares/recaptcha.js
 'use strict';
 
 /**
