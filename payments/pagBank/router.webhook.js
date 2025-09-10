@@ -1,14 +1,17 @@
+//payments/pagBank/router.webhook.js
 'use strict';
 
 /**
  * PagBank Webhook Router
  * ----------------------
- * Responsibilities
- * - Receive & authenticate webhooks (raw body is configured at app level).
- * - Enforce optional path secret (WEBHOOK_PATH_SECRET) before heavier work.
- * - Soft auth: verify headers/signature but NEVER block provider delivery.
- * - Build a minimal, PII-free metadata envelope for the service.
- * - Always return 200 to avoid unnecessary provider retries (service is idempotent).
+ * Goals (production-grade):
+ *  - Enforce optional path secret before any processing.
+ *  - Soft authentication: verify headers/signature but NEVER block delivery.
+ *  - Build a minimal metadata envelope (no secrets/PII).
+ *  - Always return 200 to avoid unnecessary provider retries (service is idempotent).
+ *
+ * Requirements:
+ *  - `req.rawBody` must be available (set in app-level body-parser verify hook).
  */
 
 const express = require('express');
@@ -16,17 +19,16 @@ const crypto = require('crypto');
 const router = express.Router();
 
 const service = require('./service');
-// const pagbankWebhookAuth = require('../../middlewares/pagbankWebhookAuth'); // replaced by soft auth
 const { env } = require('../../config/env');
 
 /* --------------------------------- Helpers ---------------------------------- */
 
-/** Resolve a single, stable correlation id and echo it back to the client/proxy. */
+/** Resolve a request correlation id and echo back to the client/proxy. */
 function getRequestId(req) {
   return req.reqId || req.requestId || req.get('x-request-id') || req.get('x-correlation-id');
 }
 
-/** Constant-time compare for base64 strings. */
+/** Constant-time compare for base64 signatures. */
 function timingSafeEqualB64(a, b) {
   try {
     const A = Buffer.from(String(a) || '', 'base64');
@@ -38,19 +40,18 @@ function timingSafeEqualB64(a, b) {
   }
 }
 
-/** Compute base64(HMAC-SHA256(rawBody, secret)) */
+/** Compute base64(HMAC-SHA256(rawBody, secret)). */
 function hmacB64(rawBody, secret) {
   return crypto.createHmac('sha256', String(secret || '')).update(rawBody || '').digest('base64');
 }
 
-/** Pick a safe subset of headers for audit/diagnostics (no secrets). */
+/** Build a safe header snapshot for auditing (no secret values). */
 function buildSafeHeaders(req, authFlags) {
   const src = req.headers || {};
   const allow = new Set([
     'x-request-id',
     'x-correlation-id',
     'x-idempotency-key',
-    // sensitive ones are masked (we only keep presence via authFlags)
     'content-type',
     'user-agent',
   ]);
@@ -61,26 +62,28 @@ function buildSafeHeaders(req, authFlags) {
     if (allow.has(key)) out[key] = v;
   }
 
-  // Echo correlation id consistently
+  // Normalize correlation id presence
   const rid = getRequestId(req);
   if (rid) {
     out['x-request-id'] = String(rid);
     out['x-correlation-id'] = String(rid);
   }
 
-  // Indicate presence of sensitive headers without exposing values
+  // Indicate presence of sensitive headers without leaking values
   out['x-authenticity-token-present'] = Boolean(req.get('x-authenticity-token'));
   out['x-signature-present'] = Boolean(req.get('x-signature'));
+
+  // Compact auth summary flags
   out['auth-summary'] = {
-    pathSecretOk: authFlags?.pathSecretOk || false,
-    tokenOk: authFlags?.tokenOk || false,
-    hmacOk: authFlags?.hmacOk || false,
+    pathSecretOk: Boolean(authFlags?.pathSecretOk),
+    tokenOk: Boolean(authFlags?.tokenOk),
+    hmacOk: Boolean(authFlags?.hmacOk),
   };
 
   return out;
 }
 
-/** Build auth flags (path-secret + soft verification). */
+/** Build soft-auth flags (token match + HMAC match). Never throws. */
 function buildAuthFlags(req) {
   const flags = {
     provider: 'pagbank',
@@ -89,24 +92,23 @@ function buildAuthFlags(req) {
     hmacOk: false,
   };
 
-  const tokenHeader = req.get('x-authenticity-token'); // expected to be the API token in many PagBank examples
-  const signatureHeader = req.get('x-signature');      // expected base64(HMAC-SHA256(rawBody, token))
+  const tokenHeader = req.get('x-authenticity-token'); // Often the API token itself (per PagBank docs/examples)
+  const signatureHeader = req.get('x-signature');      // base64(HMAC-SHA256(rawBody, token))
+  const secret = env.PAGBANK_API_TOKEN;
 
-  // Soft token check (exact match)
-  if (tokenHeader && env.PAGBANK_API_TOKEN && tokenHeader === env.PAGBANK_API_TOKEN) {
+  if (tokenHeader && secret && tokenHeader === secret) {
     flags.tokenOk = true;
   }
 
-  // Soft HMAC check
-  if (signatureHeader && env.PAGBANK_API_TOKEN && req.rawBody) {
-    const expected = hmacB64(req.rawBody, env.PAGBANK_API_TOKEN);
+  if (signatureHeader && secret && req.rawBody) {
+    const expected = hmacB64(req.rawBody, secret);
     flags.hmacOk = timingSafeEqualB64(signatureHeader, expected);
   }
 
   return flags;
 }
 
-/** Build the metadata object passed to the service layer (lean, no PII). */
+/** Build the metadata object passed to the service layer (lean, PII-free). */
 function buildMeta(req, body, authFlags) {
   return {
     headers: buildSafeHeaders(req, authFlags),
@@ -118,22 +120,17 @@ function buildMeta(req, body, authFlags) {
 }
 
 /* ------------------------------ Path-secret guard ---------------------------- */
-
 /**
- * Guard que aplica WEBHOOK_PATH_SECRET antes da verificação de assinatura.
- * Fontes aceitas (ordem de prioridade):
- *   - URL param : /webhook/pagbank/:secret
- *   - Query     : ?s=... ou ?secret=...
- *   - Header    : x-webhook-secret
+ * Enforce WEBHOOK_PATH_SECRET (optional). Accepted sources (priority):
+ *  - URL param : /webhook/pagbank/:secret
+ *  - Query     : ?s=... or ?secret=...
+ *  - Header    : x-webhook-secret
  *
- * Comportamento:
- *   - Se WEBHOOK_PATH_SECRET não estiver configurada → pass-through (sem checagem).
- *   - Se configurada e o valor não bater → 404 (oculta rota) + no-store.
- *   - Se bater → marca `req.webhookAuth.pathSecretOk = true` e segue.
+ * If configured and mismatched, respond 404 (hide route) with no-store caching.
  */
 function pathSecretGuard(req, res, next) {
   const expected = String(env.WEBHOOK_PATH_SECRET || '').trim();
-  if (!expected) return next(); // não configurado → sem verificação
+  if (!expected) return next(); // not configured
 
   const provided =
     (req.params && req.params.secret && String(req.params.secret).trim()) ||
@@ -153,16 +150,15 @@ function pathSecretGuard(req, res, next) {
 }
 
 /* ----------------------------------- Route ---------------------------------- */
-
 /**
- * Route shape:
- *   POST /webhook/pagbank
- *   POST /webhook/pagbank/:secret
+ * Routes:
+ *  - POST /webhook/pagbank
+ *  - POST /webhook/pagbank/:secret
  *
- * Ordem:
- *   1) pathSecretGuard     → rejeita cedo se secreto de caminho não bater (quando configurado)
- *   2) soft auth           → verifica token e HMAC mas NUNCA bloqueia entrega
- *   3) handler             → encaminha ao service; sempre retorna 200
+ * Order:
+ *  1) pathSecretGuard → early reject if path secret mismatches (when configured)
+ *  2) soft auth       → set verification flags; never block delivery
+ *  3) handler         → forward to service; ALWAYS 200
  */
 router.post('/webhook/pagbank/:secret?', pathSecretGuard, async (req, res, next) => {
   const rid = getRequestId(req);
@@ -178,6 +174,7 @@ router.post('/webhook/pagbank/:secret?', pathSecretGuard, async (req, res, next)
     const out = await service.processWebhook(body, meta, ctx);
     res.status(200).json(out || { ok: true });
   } catch (err) {
+    // Never block provider delivery; still surface to error pipeline for observability.
     try { res.status(200).json({ ok: false }); } catch (_) {}
     next(err);
   }
