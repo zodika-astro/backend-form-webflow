@@ -1,5 +1,8 @@
 'use strict';
 
+// Add a temporary logger to help debug the environment.
+const debugLogger = require('console');
+
 /**
  * reCAPTCHA Enterprise (compat) verification middleware
  * -----------------------------------------------------
@@ -14,7 +17,7 @@
  * - RECAPTCHA_MIN_SCORE   → optional (default: 0.5)
  *
  * Usage
- *   router.post('/birthchartsubmit-form', recaptchaVerify(), controller.processForm)
+ * router.post('/birthchartsubmit-form', recaptchaVerify(), controller.processForm)
  */
 
 const DEFAULT_MIN_SCORE = Number.isFinite(Number(process.env.RECAPTCHA_MIN_SCORE))
@@ -79,9 +82,15 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
 function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}) {
   return async function recaptchaVerifyMiddleware(req, res, next) {
     const rid = echoRequestId(req, res);
-
+    
+    // START DEBUGGING LOGS
+    debugLogger.log('--- RECAPTCHA DEBUG: Starting verification process ---');
+    debugLogger.log(`RECAPTCHA_SECRET (read from env): ${process.env.RECAPTCHA_SECRET ? 'SET' : 'NOT SET'}`);
+    debugLogger.log(`RECAPTCHA_MIN_SCORE (read from env): ${process.env.RECAPTCHA_MIN_SCORE}`);
+    
     const secret = process.env.RECAPTCHA_SECRET;
     if (!secret) {
+      debugLogger.log('RECAPTCHA DEBUG: Secret is NOT set. Returning 500.');
       return res.status(500).json({
         error: 'recaptcha_misconfigured',
         message: 'Server reCAPTCHA secret not configured',
@@ -90,7 +99,10 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
     }
 
     const token = pickCaptchaToken(req.body || {});
+    debugLogger.log(`RECAPTCHA DEBUG: Token received? ${!!token}`);
+    
     if (!token) {
+      debugLogger.log('RECAPTCHA DEBUG: Token is missing. Returning 400.');
       return res.status(400).json({
         error: 'recaptcha_missing',
         message: 'reCAPTCHA token is missing',
@@ -99,13 +111,16 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
     }
 
     try {
+      debugLogger.log(`RECAPTCHA DEBUG: Attempting to verify token with Google...`);
       const remoteip = getClientIp(req);
-      const { ok, data /* status */ } = await verifyWithGoogle({
+      const { ok, data, status } = await verifyWithGoogle({
         secret, response: token, remoteip, timeoutMs,
       });
+      debugLogger.log(`RECAPTCHA DEBUG: Google API call complete. Status: ${status}, OK: ${ok}`);
+      debugLogger.log('RECAPTCHA DEBUG: Google API response data:', data);
 
-      // If Google is unreachable or returns non-2xx, treat as a client-visible, retryable 400.
       if (!ok) {
+        debugLogger.log('RECAPTCHA DEBUG: Response from Google was not OK. Returning 400.');
         return res.status(400).json({
           error: 'recaptcha_unavailable',
           message: 'reCAPTCHA verification unavailable, please try again',
@@ -114,6 +129,8 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       }
 
       if (!data || data.success !== true) {
+        debugLogger.log('RECAPTCHA DEBUG: Verification failed. Data success is not true.');
+        debugLogger.log('RECAPTCHA DEBUG: Error codes:', data?.['error-codes']);
         return res.status(400).json({
           error: 'recaptcha_failed',
           message: 'reCAPTCHA verification failed',
@@ -124,6 +141,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
 
       const score = Number(data.score);
       if (Number.isFinite(score) && score < Number(minScore)) {
+        debugLogger.log(`RECAPTCHA DEBUG: Low score. Score: ${score}, Min Score: ${minScore}.`);
         return res.status(400).json({
           error: 'recaptcha_low_score',
           message: 'reCAPTCHA score too low',
@@ -135,6 +153,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       const expectedAction =
         (req.body && (req.body.recaptcha_action || req.body.action)) || undefined;
       if (expectedAction && data.action && String(data.action) !== String(expectedAction)) {
+        debugLogger.log(`RECAPTCHA DEBUG: Action mismatch. Expected: ${expectedAction}, Got: ${data.action}.`);
         return res.status(400).json({
           error: 'recaptcha_action_mismatch',
           message: 'reCAPTCHA action mismatch',
@@ -143,6 +162,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
+      debugLogger.log(`RECAPTCHA DEBUG: Verification SUCCESSFUL! Score: ${score}`);
       req.recaptcha = {
         success: true,
         score: Number.isFinite(score) ? score : undefined,
@@ -154,6 +174,8 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       return next();
     } catch (err) {
       const isAbort = err?.name === 'AbortError';
+      debugLogger.error(`RECAPTCHA DEBUG: Caught error: ${err.message}, isAbort: ${isAbort}`);
+      
       // Return 400 to avoid proxies stripping CORS headers on 5xx.
       return res.status(400).json({
         error: isAbort ? 'recaptcha_timeout' : 'recaptcha_error',
@@ -161,6 +183,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         request_id: rid,
       });
     }
+    // END DEBUGGING LOGS
   };
 }
 
