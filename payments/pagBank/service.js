@@ -1,5 +1,3 @@
-// payments/pagBank/service.js
-
 'use strict';
 
 /**
@@ -11,7 +9,7 @@
  *   - Emit domain events ("payment:paid") on PAID.
  *
  * Non-functional
- *   - Exponential backoff (utils/httpClient) + explicit timeouts.
+ *   - Explicit per-attempt timeouts with tight retry policy (fail fast).
  *   - HTTPS URL validation and bounded strings.
  *   - Structured logging with correlation (no PII).
  *   - Optional Prometheus metrics (no hard dependency).
@@ -59,7 +57,7 @@ function stripQuotesAndSemicolons(u) {
   if (!u) return null;
   let s = String(u).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
-  s = s.replace(/[;\s]+$/g, '');
+  s = s.replace(/[.;\s]+$/g, '');
   return s;
 }
 
@@ -77,12 +75,17 @@ function safeHost(u) {
   try { return new URL(u).host; } catch { return undefined; }
 }
 
+/** Deterministic idempotency key per logical request. */
+function buildIdempotencyKey(requestId) {
+  return `pb-co-${String(requestId).slice(0, 64)}`;
+}
+
 /* --------------------------------- API calls --------------------------------------- */
 
 /**
  * Create a PagBank checkout session.
  * Notes:
- *   - `unit_amount` is in cents.
+ *   - `unit_amount` is in cents (integer).
  *   - Defaults to PIX + CREDIT_CARD unless explicitly disabled.
  *   - Redirect URL must point back to our /pagBank/return handler.
  */
@@ -101,11 +104,23 @@ async function createCheckout(input, ctx = {}) {
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
 
-  if (!requestId) throw AppError.fromUnexpected('pagbank_checkout_failed', 'requestId is required', { status: 400 });
+  if (!requestId) {
+    throw AppError.fromUnexpected('pagbank_checkout_failed', 'requestId is required', { status: 400 });
+  }
 
+  const PB_TOKEN = process.env.PAGBANK_API_TOKEN || env.PAGBANK_API_TOKEN;
+  if (!PB_TOKEN) {
+    throw AppError.fromUnexpected('pagbank_config_missing', 'PAGBANK_API_TOKEN is not configured', { status: 500 });
+  }
+
+  // Amount must be integer cents > 0
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) {
-    throw AppError.fromUnexpected('pagbank_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
+  if (!Number.isFinite(valueNum) || valueNum <= 0 || !Number.isInteger(valueNum)) {
+    throw AppError.fromUnexpected(
+      'pagbank_checkout_failed',
+      'invalid productValue (must be integer cents > 0)',
+      { status: 400 }
+    );
   }
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
@@ -117,13 +132,18 @@ async function createCheckout(input, ctx = {}) {
   }
 
   // Payment methods (PIX + CARD unless disabled)
+  const wantPix  = paymentOptions?.allow_pix !== false;
+  const wantCard = paymentOptions?.allow_card !== false;
   const methods = [];
-  if (paymentOptions?.allow_pix !== false) methods.push('PIX');
-  if (paymentOptions?.allow_card !== false) methods.push('CREDIT_CARD');
+  if (wantPix) methods.push('PIX');
+  if (wantCard) methods.push('CREDIT_CARD');
   const selected = methods.length ? methods : ['PIX', 'CREDIT_CARD'];
 
-  const webhookUrl =
-    normalizeHttpsUrl(process.env.PAGBANK_WEBHOOK_URL || env.PAGBANK_WEBHOOK_URL);
+  // Cap installments to [1..12]
+  const maxInstRaw = Number(paymentOptions?.max_installments ?? 1);
+  const maxInstallments = Number.isFinite(maxInstRaw) ? Math.min(Math.max(1, maxInstRaw), 12) : 1;
+
+  const webhookUrl = normalizeHttpsUrl(process.env.PAGBANK_WEBHOOK_URL || env.PAGBANK_WEBHOOK_URL);
   const imageUrl =
     normalizeHttpsUrl(productImageUrl, { max: 512 }) ||
     normalizeHttpsUrl(process.env.PAGBANK_PRODUCT_IMAGE_URL || env.PAGBANK_PRODUCT_IMAGE_URL, { max: 512 });
@@ -133,7 +153,7 @@ async function createCheckout(input, ctx = {}) {
     reference_id: String(requestId),
     items: [
       {
-        name: productName || productType || 'Produto',
+        name: (productName || productType || 'Produto').toString().slice(0, 150),
         quantity: 1,
         unit_amount: valueNum, // cents
         ...(imageUrl ? { image_url: imageUrl } : {}),
@@ -146,35 +166,38 @@ async function createCheckout(input, ctx = {}) {
           {
             type: 'CREDIT_CARD',
             config_options: [
-              { option: 'INSTALLMENTS_LIMIT', value: String(paymentOptions?.max_installments || '1') },
+              { option: 'INSTALLMENTS_LIMIT', value: String(maxInstallments) },
             ],
           },
         ]
       : undefined,
     payment_notification_urls: webhookUrl ? [webhookUrl] : undefined,
-    customer: name && email ? { name, email } : undefined,
+    customer: (name || email) ? { name, email } : undefined,
     currency: currency || undefined,
   }));
 
   // Prefer configured base; fallback to official API.
-  const base =
-    (process.env.PAGBANK_BASE_URL || env.PAGBANK_BASE_URL || 'https://api.pagbank.com.br').replace(/\/+$/, '');
+  const base = (process.env.PAGBANK_BASE_URL || env.PAGBANK_BASE_URL || 'https://api.pagbank.com.br').replace(/\/+$/, '');
   const url = `${base}/checkouts`;
 
   const op = 'create_checkout';
   const t0 = process.hrtime.bigint();
 
+  // Tight budget: 12s per attempt, 1 retry → worst-case ~24s.
+  const PER_ATTEMPT_TIMEOUT_MS = 12_000;
+  const RETRIES = 1;
+
   try {
     const res = await httpClient.post(url, payload, {
       headers: {
-        Authorization: `Bearer ${env.PAGBANK_API_TOKEN || process.env.PAGBANK_API_TOKEN}`,
+        Authorization: `Bearer ${PB_TOKEN}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'X-Idempotency-Key': uuid(),
+        'X-Idempotency-Key': buildIdempotencyKey(requestId),
       },
-      timeout: 20_000,
-      retries: 2,
-      retryBackoffMs: [0, 250, 700],
+      timeout: PER_ATTEMPT_TIMEOUT_MS,
+      retries: RETRIES,
+      retryBackoffMs: [0, 250],
     });
 
     observe(op, res?.status, t0);
@@ -185,10 +208,11 @@ async function createCheckout(input, ctx = {}) {
     // Find the public payment URL across common response shapes
     let payLink = null;
     if (Array.isArray(data.links)) {
+      const rel = (x) => String(x?.rel || '').toUpperCase();
       payLink =
-        data.links.find((l) => String(l.rel || '').toUpperCase() === 'PAY')?.href ||
-        data.links.find((l) => String(l.rel || '').toUpperCase() === 'CHECKOUT')?.href ||
-        data.links.find((l) => String(l.rel || '').toUpperCase() === 'SELF')?.href;
+        data.links.find((l) => rel(l) === 'PAY')?.href ||
+        data.links.find((l) => rel(l) === 'CHECKOUT')?.href ||
+        data.links.find((l) => rel(l) === 'SELF')?.href;
     }
     if (!payLink && data.payment_url) payLink = data.payment_url;
     if (!payLink && data.checkout?.payment_url) payLink = data.checkout.payment_url;
@@ -203,7 +227,7 @@ async function createCheckout(input, ctx = {}) {
       status: data.status || 'CREATED',
       value: valueNum,
       link: payLink,
-      customer: name && email ? { name, email } : null,
+      customer: (name || email) ? { name, email } : null,
       raw: data,
     });
 
@@ -227,10 +251,10 @@ async function createCheckout(input, ctx = {}) {
     return { url: payLink, checkoutId: data.id || null };
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
-    if (e.response) {
+    if (e?.response) {
       log.error({ status: e.response.status, msg: e?.message }, 'create checkout failed');
     } else {
-      log.error({ msg: e.message }, 'create checkout network error');
+      log.error({ msg: e?.message }, 'create checkout network error');
     }
     // Normalize upstream error into AppError with standardized code
     throw AppError.fromUpstream(
