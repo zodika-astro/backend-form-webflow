@@ -1,4 +1,3 @@
-// modules/birthchart/controller.js
 'use strict';
 
 /**
@@ -6,7 +5,7 @@
  * ---------------------
  * Responsibilities
  *  - Validate and normalize public form input.
- *  - Resolve timezone at the given birth moment (Google Time Zone API).
+ *  - Resolve timezone at the given birth moment (Google/GeoNames).
  *  - Persist the request record.
  *  - Create a checkout on the selected PSP (PagBank or Mercado Pago).
  *
@@ -14,6 +13,11 @@
  *  - Structured logging with request correlation (no PII).
  *  - Standardized error codes (AppError) for upstream and internal failures.
  *  - Never trust raw req.body: filter/whitelist allowed fields before validation.
+ *
+ * Business rule
+ *  - Product-specific success URLs live in the product module (here).
+ *  - PSP back_urls/redirects always point back to our backend return controllers.
+ *    The return controller decides final redirects (success/fail/pending).
  */
 
 const { validateBirthchartPayload } = require('./validators');
@@ -51,8 +55,8 @@ function pick(input, allowedKeys) {
 /* Normalizers                                                                */
 /* -------------------------------------------------------------------------- */
 /**
- * Accepts common consent field shapes from the frontend and maps to boolean.
- * Supports: boolean true/false, "on", "yes", "1", "true", "checked".
+ * Accept consent field variants and map to boolean.
+ * Supports: boolean, number (1), "on"/"yes"/"1"/"true"/"checked".
  */
 function normalizeConsent(body = {}) {
   const raw =
@@ -72,8 +76,7 @@ function normalizeConsent(body = {}) {
 }
 
 /**
- * Picks the most likely reCAPTCHA token field sent by the frontend.
- * Supports: recaptcha_token, recaptchaToken, captcha_token, g-recaptcha-response, etc.
+ * Pick the most likely reCAPTCHA token field from the request body.
  */
 function pickCaptchaToken(body = {}) {
   return (
@@ -89,8 +92,8 @@ function pickCaptchaToken(body = {}) {
 }
 
 /**
- * Feature flag: by default captcha is required unless explicitly disabled via env.
- * Intentionally read from process.env to avoid envalid schema changes.
+ * Feature flag: captcha is required unless explicitly disabled via env.
+ * Read from process.env to avoid changing envalid schema.
  */
 const RECAPTCHA_REQUIRED =
   String(process.env.RECAPTCHA_REQUIRED ?? 'true').trim().toLowerCase() !== 'false';
@@ -231,6 +234,8 @@ async function processForm(req, res, next) {
     logger.info({ requestId: newRequest.request_id, productType: newRequest.product_type }, 'request persisted');
 
     // 5) Compose product for checkout
+    // NOTE: successUrl is documented here (business rule), but NOT sent to the PSP.
+    // PSP return URLs always point back to our backend return controllers.
     const product = {
       productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
@@ -241,7 +246,8 @@ async function processForm(req, res, next) {
         allow_card: true,
         max_installments: 1,
       },
-      returnUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${newRequest.request_id}`,
+      // Product-specific success URL (used by return controllers).
+      successUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${encodeURIComponent(newRequest.request_id)}`,
       metadata: {
         source: 'webflow',
         product_version: 'v1',
@@ -292,7 +298,7 @@ async function processForm(req, res, next) {
         },
         productImageUrl: PRODUCT_IMAGE_URL,
         currency:   product.currency,
-        returnUrl:  product.returnUrl,
+        // Intentionally DO NOT pass successUrl/returnUrl to the provider.
         metadata:   product.metadata,
       }, ctx);
 
