@@ -9,15 +9,11 @@
  * - Enforces a minimum score (configurable via RECAPTCHA_MIN_SCORE).
  * - Optionally enforces the expected "action" when the client provides one.
  *
- * Why this exists
- * - Without an explicit timeout, the backend may hang on the external call,
- *   causing the browser to abort at ~20s and Railway to log HTTP 499.
- *
  * Environment
  * - RECAPTCHA_SECRET      → MUST be the Secret Key of the SAME Enterprise key used on the frontend.
  * - RECAPTCHA_MIN_SCORE   → optional (default: 0.5)
  *
- * Usage (router)
+ * Usage
  *   router.post('/birthchartsubmit-form', recaptchaVerify(), controller.processForm)
  */
 
@@ -28,17 +24,12 @@ const DEFAULT_MIN_SCORE = Number.isFinite(Number(process.env.RECAPTCHA_MIN_SCORE
 // Enterprise "compat" verification endpoint
 const VERIFY_URL = 'https://www.google.com/recaptcha/enterprise/siteverify';
 
-/** Small helper to echo a single, stable request id back to the client. */
 function echoRequestId(req, res) {
-  const rid =
-    req.requestId ||
-    req.get?.('x-request-id') ||
-    req.get?.('x-correlation-id');
+  const rid = req.requestId || req.get?.('x-request-id') || req.get?.('x-correlation-id');
   if (rid) res.set('X-Request-Id', String(rid));
   return rid;
 }
 
-/** Consolidate captcha token from multiple common client-side keys. */
 function pickCaptchaToken(body = {}) {
   const c =
     body.recaptcha_token ??
@@ -55,21 +46,10 @@ function pickCaptchaToken(body = {}) {
   return s.length ? s : null;
 }
 
-/** Resolve client IP (honors Express trust proxy). */
 function getClientIp(req) {
-  return (
-    req.ip ||
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.connection?.remoteAddress ||
-    undefined
-  );
+  return req.ip || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.connection?.remoteAddress || undefined;
 }
 
-/**
- * Perform the verification against Google's siteverify with an explicit timeout.
- * Uses the global fetch (Node 18+). We do NOT use the internal httpClient to
- * avoid host allowlisting friction.
- */
 async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }) {
   const params = new URLSearchParams();
   params.append('secret', String(secret));
@@ -83,10 +63,7 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
   try {
     resp = await fetch(VERIFY_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: params.toString(),
       signal: ctrl.signal,
     });
@@ -95,25 +72,14 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
   }
 
   let data = {};
-  try {
-    data = await resp.json();
-  } catch {
-    // keep empty object on parse failure
-  }
+  try { data = await resp.json(); } catch { /* keep empty */ }
   return { ok: resp.ok, data, status: resp.status };
 }
 
-/**
- * Factory: returns the middleware.
- * Options:
- * - minScore: minimum acceptable v3/Enterprise compat score (default 0.5).
- * - timeoutMs: hard timeout for the verification call (default 6000ms).
- */
 function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}) {
   return async function recaptchaVerifyMiddleware(req, res, next) {
     const rid = echoRequestId(req, res);
 
-    // Fail-closed when not configured in production.
     const secret = process.env.RECAPTCHA_SECRET;
     if (!secret) {
       return res.status(500).json({
@@ -123,7 +89,6 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       });
     }
 
-    // Token presence check (most common 400).
     const token = pickCaptchaToken(req.body || {});
     if (!token) {
       return res.status(400).json({
@@ -133,28 +98,21 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       });
     }
 
-    // Remote verification with tight timeout to avoid 499 on the client.
     try {
       const remoteip = getClientIp(req);
-      const { ok, data, status } = await verifyWithGoogle({
-        secret,
-        response: token,
-        remoteip,
-        timeoutMs,
+      const { ok, data /* status */ } = await verifyWithGoogle({
+        secret, response: token, remoteip, timeoutMs,
       });
 
-      // Network/HTTP-level failure to reach Google
+      // If Google is unreachable or returns non-2xx, treat as a client-visible, retryable 400.
       if (!ok) {
-        // 504: verification timed out or gateway-ish failure; 502 for other non-2xx statuses
-        const code = status === 408 || status === 504 ? 504 : 502;
-        return res.status(code).json({
-          error: 'recaptcha_unreachable',
-          message: 'reCAPTCHA verification unavailable',
+        return res.status(400).json({
+          error: 'recaptcha_unavailable',
+          message: 'reCAPTCHA verification unavailable, please try again',
           request_id: rid,
         });
       }
 
-      // Protocol-level failure (success: false)
       if (!data || data.success !== true) {
         return res.status(400).json({
           error: 'recaptcha_failed',
@@ -164,7 +122,6 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      // Score gating (Enterprise compat returns score similarly to v3)
       const score = Number(data.score);
       if (Number.isFinite(score) && score < Number(minScore)) {
         return res.status(400).json({
@@ -175,7 +132,6 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      // Optional action validation: if client sent an expected action, enforce exact match.
       const expectedAction =
         (req.body && (req.body.recaptcha_action || req.body.action)) || undefined;
       if (expectedAction && data.action && String(data.action) !== String(expectedAction)) {
@@ -187,7 +143,6 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      // Attach a compact verification context (PII-free) for downstream handlers.
       req.recaptcha = {
         success: true,
         score: Number.isFinite(score) ? score : undefined,
@@ -198,9 +153,9 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
 
       return next();
     } catch (err) {
-      // Aborted == timed out locally; treat as 504 to make it visible in logs.
       const isAbort = err?.name === 'AbortError';
-      return res.status(isAbort ? 504 : 400).json({
+      // Return 400 to avoid proxies stripping CORS headers on 5xx.
+      return res.status(400).json({
         error: isAbort ? 'recaptcha_timeout' : 'recaptcha_error',
         message: isAbort ? 'reCAPTCHA verification timed out' : 'reCAPTCHA verification error',
         request_id: rid,
