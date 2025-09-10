@@ -143,14 +143,35 @@ const ProductTypeSchema = z
   .transform((s) => String(s).trim().toLowerCase())
   .refine((s) => s === 'birth_chart', { message: 'invalid product_type' });
 
-const CountryCodeSchema = z
-  .string({ invalid_type_error: 'birth_place_country must be a string' })
-  .trim()
-  .length(2, 'birth_place_country must be a 2-letter code')
-  .transform((s) => s.toUpperCase())
-  .optional();
+/**
+ * Country coming from Google Places is often a full name ("Brasil", "Brazil").
+ * Accept non-empty strings up to 120 chars, or empty -> undefined.
+ */
+const CountrySchema = z
+  .union([z.string().trim(), z.literal(''), z.null(), z.undefined()])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || (typeof v === 'string' && v.length >= 2 && v.length <= 120), {
+    message: 'birth_place_country must be between 2 and 120 characters',
+  });
 
-const OptionalAdminText = z.string().trim().min(1).max(120).optional();
+/**
+ * Admin fields can be empty depending on the place (e.g., some countries/cities).
+ * Accept empty -> undefined; otherwise limit to 120 characters.
+ */
+const OptionalAdminText = z
+  .union([z.string().trim(), z.literal(''), z.null(), z.undefined()])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || v.length <= 120, {
+    message: 'must have at most 120 characters',
+  });
 
 const PlaceIdSchema = z
   .string({ invalid_type_error: 'birth_place_place_id must be a string' })
@@ -188,13 +209,33 @@ const OptionalJson = z
     'birth_place_json.place_id must be a string when present'
   );
 
-const OptionalTzId = z.string().trim().min(1).max(128).optional();
+/** Optional timezone info (computed server-side); accept empty -> undefined. */
+const OptionalTzId = z
+  .union([z.string().trim(), z.literal(''), z.null(), z.undefined()])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || v.length <= 128, { message: 'birth_timezone_id must have at most 128 characters' });
 
 const OptionalUtcOffsetMin = z
   .union([z.coerce.number(), z.string().trim().length(0)])
   .transform((v) => (typeof v === 'number' ? v : undefined))
   .refine((v) => v === undefined || (Number.isFinite(v) && v >= -720 && v <= 840), 'birth_utc_offset_min must be a number between -720 and 840')
   .optional();
+
+/** birth_place_full: allow empty -> undefined; non-empty 2..200 chars. */
+const OptionalPlaceFull = z
+  .union([z.string().trim(), z.literal(''), z.null(), z.undefined()])
+  .transform((v) => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    return s === '' ? undefined : s;
+  })
+  .refine((v) => v === undefined || (v.length >= 2 && v.length <= 200), {
+    message: 'birth_place_full must be between 2 and 200 characters',
+  });
 
 /* ------------------------------- Root schema -------------------------------- */
 /**
@@ -222,8 +263,8 @@ const birthchartSchema = z.preprocess(
       product_type: ProductTypeSchema,
 
       birth_place_place_id: PlaceIdSchema,
-      birth_place_full: z.string().trim().min(2).max(200).optional(),
-      birth_place_country: CountryCodeSchema,
+      birth_place_full: OptionalPlaceFull,
+      birth_place_country: CountrySchema,
       birth_place_admin1: OptionalAdminText,
       birth_place_admin2: OptionalAdminText,
 
