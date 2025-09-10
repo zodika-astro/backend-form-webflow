@@ -1,13 +1,14 @@
+// payments/mercadoPago/router.webhook.js
 'use strict';
 
 /**
- * PagBank Webhook Router
- * ----------------------
- * Goals (production-grade):
+ * Mercado Pago Webhook Router
+ * ---------------------------
+ * Production goals:
  *  - Enforce optional path secret before any processing.
- *  - Soft authentication: verify headers/signature but NEVER block delivery.
- *  - Build a minimal metadata envelope (no secrets/PII).
- *  - Always return 200 to avoid unnecessary provider retries (service is idempotent).
+ *  - Soft authentication: verify signature but NEVER block delivery.
+ *  - Build a minimal, PII-free metadata envelope.
+ *  - Always return 200 (service layer is idempotent).
  *
  * Requirements:
  *  - `req.rawBody` must be available (set in app-level body-parser verify hook).
@@ -22,7 +23,7 @@ const { env } = require('../../config/env');
 
 /* --------------------------------- Helpers ---------------------------------- */
 
-/** Resolve a request correlation id and echo back to the client/proxy. */
+/** Resolve a request correlation id and echo it back to clients/proxies. */
 function getRequestId(req) {
   return req.reqId || req.requestId || req.get('x-request-id') || req.get('x-correlation-id');
 }
@@ -69,39 +70,31 @@ function buildSafeHeaders(req, authFlags) {
   }
 
   // Indicate presence of sensitive headers without leaking values
-  out['x-authenticity-token-present'] = Boolean(req.get('x-authenticity-token'));
   out['x-signature-present'] = Boolean(req.get('x-signature'));
 
   // Compact auth summary flags
   out['auth-summary'] = {
     pathSecretOk: Boolean(authFlags?.pathSecretOk),
-    tokenOk: Boolean(authFlags?.tokenOk),
-    hmacOk: Boolean(authFlags?.hmacOk),
+    signatureOk: Boolean(authFlags?.signatureOk),
   };
 
   return out;
 }
 
-/** Build soft-auth flags (token match + HMAC match). Never throws. */
+/** Build soft-auth flags (HMAC match). Never throws and never blocks. */
 function buildAuthFlags(req) {
   const flags = {
-    provider: 'pagbank',
+    provider: 'mercadopago',
     pathSecretOk: !!(req.webhookAuth && req.webhookAuth.pathSecretOk),
-    tokenOk: false,
-    hmacOk: false,
+    signatureOk: false,
   };
 
-  const tokenHeader = req.get('x-authenticity-token'); // Often the API token itself (per PagBank docs/examples)
-  const signatureHeader = req.get('x-signature');      // base64(HMAC-SHA256(rawBody, token))
-  const secret = env.PAGBANK_API_TOKEN;
-
-  if (tokenHeader && secret && tokenHeader === secret) {
-    flags.tokenOk = true;
-  }
+  const signatureHeader = req.get('x-signature'); // expected: base64(HMAC-SHA256(rawBody, MP_WEBHOOK_SECRET))
+  const secret = env.MP_WEBHOOK_SECRET;
 
   if (signatureHeader && secret && req.rawBody) {
     const expected = hmacB64(req.rawBody, secret);
-    flags.hmacOk = timingSafeEqualB64(signatureHeader, expected);
+    flags.signatureOk = timingSafeEqualB64(signatureHeader, expected);
   }
 
   return flags;
@@ -121,7 +114,7 @@ function buildMeta(req, body, authFlags) {
 /* ------------------------------ Path-secret guard ---------------------------- */
 /**
  * Enforce WEBHOOK_PATH_SECRET (optional). Accepted sources (priority):
- *  - URL param : /webhook/pagbank/:secret
+ *  - URL param : /webhook/mercadopago/:secret
  *  - Query     : ?s=... or ?secret=...
  *  - Header    : x-webhook-secret
  *
@@ -151,15 +144,15 @@ function pathSecretGuard(req, res, next) {
 /* ----------------------------------- Route ---------------------------------- */
 /**
  * Routes:
- *  - POST /webhook/pagbank
- *  - POST /webhook/pagbank/:secret
+ *  - POST /webhook/mercadopago
+ *  - POST /webhook/mercadopago/:secret
  *
  * Order:
  *  1) pathSecretGuard → early reject if path secret mismatches (when configured)
  *  2) soft auth       → set verification flags; never block delivery
  *  3) handler         → forward to service; ALWAYS 200
  */
-router.post('/webhook/pagbank/:secret?', pathSecretGuard, async (req, res, next) => {
+router.post('/webhook/mercadopago/:secret?', pathSecretGuard, async (req, res, next) => {
   const rid = getRequestId(req);
   if (rid) res.set('X-Request-Id', String(rid));
   res.set('Cache-Control', 'no-store');
