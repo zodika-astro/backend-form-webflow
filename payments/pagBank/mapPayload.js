@@ -1,4 +1,3 @@
-// payments/pagBank/mapPayload.js
 'use strict';
 
 /**
@@ -6,7 +5,7 @@
  * -------------------------
  * Canonicalizes PagBank webhook payloads (v1/v2 variants) to a stable shape:
  *   {
- *     eventId,        // stable uid if present (fallback to payload.id or generated)
+ *     eventId,        // stable uid if present (fallback to deterministic or generated)
  *     objectType,     // 'charge' | 'checkout' | 'unknown'
  *     checkoutId,     // when applicable
  *     chargeId,       // when applicable
@@ -23,6 +22,12 @@ function upper(s) {
 function first(...vals) {
   for (const v of vals) if (v != null && v !== '') return v;
   return undefined;
+}
+
+function truncate(str, max = 128) {
+  if (str == null) return undefined;
+  const s = String(str).trim();
+  return s.length > max ? s.slice(0, max) : s;
 }
 
 /**
@@ -51,32 +56,38 @@ function mapCustomer(p) {
   const c = first(p?.customer, p?.data?.customer, p?.buyer);
   if (!c || typeof c !== 'object') return undefined;
 
-  const name = first(c.name, c.full_name);
-  const email = c.email;
+  const name = truncate(first(c.name, c.full_name), 80);
+  const email = c.email ? String(c.email).trim().toLowerCase() : undefined;
   const tax =
     c?.tax_id && typeof c.tax_id === 'object'
       ? first(c.tax_id.number, c.tax_id.value)
       : first(c.tax_id, c.document, c.cpf, c.cnpj);
 
   const out = {};
-  if (name) out.name = String(name);
-  if (email) out.email = String(email).toLowerCase();
-  if (tax) out.tax_id = String(tax);
+  if (name) out.name = name;
+  if (email) out.email = truncate(email, 120);
+  if (tax) out.tax_id = truncate(String(tax), 40);
   return Object.keys(out).length ? out : undefined;
 }
 
 /**
- * Optional canonicalization of provider statuses to our internal vocabulary.
- * Unknown values are returned uppercased as-is.
+ * Canonicalize provider statuses to our internal vocabulary.
  */
 function canonicalizeStatus(rawUpper) {
   if (!rawUpper) return undefined;
 
   // Group common variants into a smaller, stable set
   const PAID = new Set(['PAID', 'PAID_OUT', 'APPROVED', 'AUTHORIZED', 'CAPTURED']);
-  const PENDING = new Set(['PENDING', 'IN_REVIEW', 'IN_ANALYSIS', 'AWAITING_PAYMENT', 'PROCESSING']);
+  const PENDING = new Set([
+    'PENDING',
+    'IN_REVIEW',
+    'IN_ANALYSIS',
+    'AWAITING_PAYMENT',
+    'PROCESSING',
+    'IN_PROGRESS',
+  ]);
   const CANCELED = new Set(['CANCELED', 'CANCELLED', 'DECLINED', 'REFUSED', 'FAILED']);
-  const REFUNDED = new Set(['REFUNDED', 'PARTIALLY_REFUNDED', 'CHARGEBACK']);
+  const REFUNDED = new Set(['REFUNDED', 'PARTIALLY_REFUNDED', 'CHARGEBACK', 'REVERSED']);
 
   if (PAID.has(rawUpper)) return 'PAID';
   if (PENDING.has(rawUpper)) return 'PENDING';
@@ -100,10 +111,9 @@ function mapStatus(p, objectType, { chargeId, checkoutId }) {
     p?.current_status
   );
 
-  // Checkout start-of-flow defaults
   if (!raw) {
     if (objectType === 'checkout') return 'CREATED';
-    if (!chargeId && checkoutId) return 'CREATED'; // fallback if type detection didn't flag "checkout"
+    if (!chargeId && checkoutId) return 'CREATED';
   }
 
   const up = upper(raw);
@@ -114,40 +124,57 @@ function mapStatus(p, objectType, { chargeId, checkoutId }) {
  * Extracts identifiers for charge/checkout/reference.
  */
 function mapIds(p, objectType) {
-  const chargeId = first(
-    p?.charge_id,
-    p?.charge?.id,
-    p?.data?.charge_id,
-    objectType === 'charge' ? p?.data?.id : undefined
+  const chargeId = truncate(
+    first(
+      p?.charge_id,
+      p?.charge?.id,
+      p?.data?.charge_id,
+      objectType === 'charge' ? p?.data?.id : undefined
+    ),
+    80
   );
 
-  const checkoutId = first(
-    p?.checkout_id,
-    p?.checkout?.id,
-    p?.data?.checkout_id,
-    objectType === 'checkout' ? p?.data?.id : undefined
+  const checkoutId = truncate(
+    first(
+      p?.checkout_id,
+      p?.checkout?.id,
+      p?.data?.checkout_id,
+      objectType === 'checkout' ? p?.data?.id : undefined
+    ),
+    80
   );
 
-  const referenceId = first(
-    p?.reference_id,
-    p?.data?.reference_id,
-    p?.charge?.reference_id,
-    p?.checkout?.reference_id
+  const referenceId = truncate(
+    first(
+      p?.reference_id,
+      p?.data?.reference_id,
+      p?.charge?.reference_id,
+      p?.checkout?.reference_id
+    ),
+    100
   );
 
   return { chargeId, checkoutId, referenceId };
 }
 
 /**
- * Builds a stable event id if provided; otherwise falls back to a generated token.
+ * Builds a stable event id if provided; otherwise uses a deterministic fallback.
  */
-function mapEventId(p) {
-  return first(
-    p?.event_id,
-    p?.id,
-    p?.data?.event_id,
-    `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  );
+function mapEventId(p, ids = {}) {
+  const existing = first(p?.event_id, p?.id, p?.data?.event_id);
+  if (existing) return truncate(existing, 100);
+
+  // Deterministic fallback if IDs exist
+  if (ids.chargeId || ids.checkoutId || ids.referenceId) {
+    return [
+      ids.chargeId || 'nocharge',
+      ids.checkoutId || 'nocheckout',
+      ids.referenceId || 'noref',
+    ].join('_');
+  }
+
+  // Last resort: random
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 /**
@@ -159,7 +186,7 @@ function mapWebhookPayload(payload) {
   const ids = mapIds(p, objectType);
   const status = mapStatus(p, objectType, ids);
   const customer = mapCustomer(p);
-  const eventId = mapEventId(p);
+  const eventId = mapEventId(p, ids);
 
   return {
     eventId,
