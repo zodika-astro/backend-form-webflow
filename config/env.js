@@ -93,16 +93,18 @@ const env = cleanEnv(
       default: 'https://sandbox.api.pagseguro.com',
       desc: 'PagBank API base URL (use the production URL in prod)',
     }),
-    PAGBANK_ENABLED: bool({
-      default: false,
-      desc: 'Toggle to enable PagBank return routes',
-    }),
     PAGBANK_WEBHOOK_URL: url({
       default: isProd ? undefined : 'http://localhost:3000/webhook/pagbank',
       desc: 'Public webhook URL configured in PagBank (required in production)',
     }),
 
     // Checkout UX
+
+    PAYMENT_PROVIDER: str({
+      choices: ['MERCADO_PAGO', 'PAGBANK'],
+      default: 'MERCADO_PAGO',
+      desc: 'Primary payment provider (MERCADO_PAGO or PAGBANK).',
+    }),
     PAYMENT_FAILURE_URL: url({
       default: 'https://www.zodika.com.br/payment-fail',
       desc: 'Fallback URL for payment failures',
