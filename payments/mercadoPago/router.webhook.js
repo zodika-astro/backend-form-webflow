@@ -1,40 +1,56 @@
-// payments/mercadoPago/router.webhook.js
 'use strict';
 
 /**
- * Mercado Pago Webhook Router
- * ---------------------------
- * Responsibilities
- * - Receive webhook posts (raw body is configured at app level for /webhook/mercadopago).
- * - Enforce optional path secret (WEBHOOK_PATH_SECRET) before any heavy work.
- * - Authenticate via middleware (signature/time-skew), but never drop provider delivery
- *   due to internal errors — service layer is idempotent.
- * - Build a minimal, PII-free metadata envelope for the service.
- * - Always return 200 to avoid unnecessary provider retries.
+ * PagBank Webhook Router
+ * ----------------------
+ * Goals (production-grade):
+ *  - Enforce optional path secret before any processing.
+ *  - Soft authentication: verify headers/signature but NEVER block delivery.
+ *  - Build a minimal metadata envelope (no secrets/PII).
+ *  - Always return 200 to avoid unnecessary provider retries (service is idempotent).
+ *
+ * Requirements:
+ *  - `req.rawBody` must be available (set in app-level body-parser verify hook).
  */
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 const service = require('./service');
-const mpWebhookAuth = require('../../middlewares/mpWebhookAuth'); // signature/anti-replay
-const { env } = require('../../config/env'); // provides WEBHOOK_PATH_SECRET
+const { env } = require('../../config/env');
 
-// --------------------------------- Helpers ----------------------------------
+/* --------------------------------- Helpers ---------------------------------- */
 
-/** Echo a single, stable correlation id back to clients/proxies. */
+/** Resolve a request correlation id and echo back to the client/proxy. */
 function getRequestId(req) {
   return req.reqId || req.requestId || req.get('x-request-id') || req.get('x-correlation-id');
 }
 
-/** Pick a safe subset of headers for audit/diagnostics (no PII). */
-function buildSafeHeaders(req) {
+/** Constant-time compare for base64 signatures. */
+function timingSafeEqualB64(a, b) {
+  try {
+    const A = Buffer.from(String(a) || '', 'base64');
+    const B = Buffer.from(String(b) || '', 'base64');
+    if (A.length !== B.length) return false;
+    return crypto.timingSafeEqual(A, B);
+  } catch {
+    return false;
+  }
+}
+
+/** Compute base64(HMAC-SHA256(rawBody, secret)). */
+function hmacB64(rawBody, secret) {
+  return crypto.createHmac('sha256', String(secret || '')).update(rawBody || '').digest('base64');
+}
+
+/** Build a safe header snapshot for auditing (no secret values). */
+function buildSafeHeaders(req, authFlags) {
   const src = req.headers || {};
   const allow = new Set([
     'x-request-id',
     'x-correlation-id',
     'x-idempotency-key',
-    'x-signature',          // value is sanitized/redacted downstream
     'content-type',
     'user-agent',
   ]);
@@ -45,67 +61,79 @@ function buildSafeHeaders(req) {
     if (allow.has(key)) out[key] = v;
   }
 
-  // Ensure correlation id is present/consistent
+  // Normalize correlation id presence
   const rid = getRequestId(req);
   if (rid) {
     out['x-request-id'] = String(rid);
     out['x-correlation-id'] = String(rid);
   }
+
+  // Indicate presence of sensitive headers without leaking values
+  out['x-authenticity-token-present'] = Boolean(req.get('x-authenticity-token'));
+  out['x-signature-present'] = Boolean(req.get('x-signature'));
+
+  // Compact auth summary flags
+  out['auth-summary'] = {
+    pathSecretOk: Boolean(authFlags?.pathSecretOk),
+    tokenOk: Boolean(authFlags?.tokenOk),
+    hmacOk: Boolean(authFlags?.hmacOk),
+  };
+
   return out;
 }
 
-/** Merge auth flags from path-secret guard (this router) and mpWebhookAuth (req.mpSig). */
+/** Build soft-auth flags (token match + HMAC match). Never throws. */
 function buildAuthFlags(req) {
-  const base = req.webhookAuth || {};
-  const sig = req.mpSig || null;
-
-  // Interpret mpWebhookAuth outcome:
-  // - Valid / stale: no `verify` field, carries ids; treat as signatureOk=true (stale flagged).
-  // - Soft-fail: has `verify: 'soft-fail'`.
-  const signatureOk = !!(sig && !sig.verify && (sig.id || sig.ts || sig.v1));
-  const signatureStale = !!(sig && sig.stale);
-
-  return {
-    provider: 'mercadopago',
-    pathSecretOk: !!base.pathSecretOk,
-    signatureOk,
-    signatureStale,
-    reason: base.reason || (sig && sig.verify ? sig.verify : undefined),
+  const flags = {
+    provider: 'pagbank',
+    pathSecretOk: !!(req.webhookAuth && req.webhookAuth.pathSecretOk),
+    tokenOk: false,
+    hmacOk: false,
   };
+
+  const tokenHeader = req.get('x-authenticity-token'); // Often the API token itself (per PagBank docs/examples)
+  const signatureHeader = req.get('x-signature');      // base64(HMAC-SHA256(rawBody, token))
+  const secret = env.PAGBANK_API_TOKEN;
+
+  if (tokenHeader && secret && tokenHeader === secret) {
+    flags.tokenOk = true;
+  }
+
+  if (signatureHeader && secret && req.rawBody) {
+    const expected = hmacB64(req.rawBody, secret);
+    flags.hmacOk = timingSafeEqualB64(signatureHeader, expected);
+  }
+
+  return flags;
 }
 
-/** Build the metadata object passed to the service layer (kept lean, no PII). */
-function buildMeta(req, body) {
+/** Build the metadata object passed to the service layer (lean, PII-free). */
+function buildMeta(req, body, authFlags) {
   return {
-    headers: buildSafeHeaders(req),
+    headers: buildSafeHeaders(req, authFlags),
     query: req.query || {},
     topic: body?.type || req.query?.topic || undefined,
     action: body?.action || undefined,
-    auth: buildAuthFlags(req),
+    auth: authFlags,
   };
 }
 
-// ------------------------------ Path-secret guard ----------------------------
-
+/* ------------------------------ Path-secret guard ---------------------------- */
 /**
- * Guard that enforces an optional path secret before signature verification.
- * Sources (in order of precedence):
- *   - URL param : /webhook/mercadopago/:secret
- *   - Query     : ?s=... or ?secret=...
- *   - Header    : x-webhook-secret
+ * Enforce WEBHOOK_PATH_SECRET (optional). Accepted sources (priority):
+ *  - URL param : /webhook/pagbank/:secret
+ *  - Query     : ?s=... or ?secret=...
+ *  - Header    : x-webhook-secret
  *
- * Behavior:
- *   - If WEBHOOK_PATH_SECRET is unset/empty -> pass-through (no enforcement).
- *   - If set and mismatch -> respond 404 (conceal route) + no-store.
- *   - If set and matches -> mark `req.webhookAuth.pathSecretOk = true` and continue.
+ * If configured and mismatched, respond 404 (hide route) with no-store caching.
  */
 function pathSecretGuard(req, res, next) {
   const expected = String(env.WEBHOOK_PATH_SECRET || '').trim();
-  if (!expected) return next(); // not configured -> no-op
+  if (!expected) return next(); // not configured
 
   const provided =
     (req.params && req.params.secret && String(req.params.secret).trim()) ||
-    (req.query && (String(req.query.s || req.query.secret || '').trim())) ||
+    (req.query && String(req.query.s || req.query.secret || '').trim()) ||
     (req.get('x-webhook-secret') && String(req.get('x-webhook-secret')).trim()) ||
     '';
 
@@ -116,47 +144,39 @@ function pathSecretGuard(req, res, next) {
     return next();
   }
 
-  // Conceal the route and avoid cache
   res.set('Cache-Control', 'no-store');
   return res.status(404).send('Not found');
 }
 
-// ----------------------------------- Route ----------------------------------
-
+/* ----------------------------------- Route ---------------------------------- */
 /**
- * Route shape:
- *   POST /webhook/mercadopago
- *   POST /webhook/mercadopago/:secret
+ * Routes:
+ *  - POST /webhook/pagbank
+ *  - POST /webhook/pagbank/:secret
  *
- * Order matters:
- *   1) pathSecretGuard   → cheap rejection if secret mismatch (when configured)
- *   2) mpWebhookAuth     → signature + anti-replay (uses req.rawBody)
- *   3) handler           → forwards to service (always returns 200)
+ * Order:
+ *  1) pathSecretGuard → early reject if path secret mismatches (when configured)
+ *  2) soft auth       → set verification flags; never block delivery
+ *  3) handler         → forward to service; ALWAYS 200
  */
-router.post('/webhook/mercadopago/:secret?',
-  pathSecretGuard,
-  mpWebhookAuth,
-  async (req, res, next) => {
-    // Observability headers
-    const rid = getRequestId(req);
-    if (rid) res.set('X-Request-Id', String(rid));
-    res.set('Cache-Control', 'no-store');
+router.post('/webhook/pagbank/:secret?', pathSecretGuard, async (req, res, next) => {
+  const rid = getRequestId(req);
+  if (rid) res.set('X-Request-Id', String(rid));
+  res.set('Cache-Control', 'no-store');
 
-    try {
-      // Body is parsed by mpWebhookAuth from the raw buffer
-      const body = req.body || {};
-      const meta = buildMeta(req, body);
-      const ctx = { requestId: rid, log: req.log };
+  try {
+    const body = req.body || {};
+    const authFlags = buildAuthFlags(req);
+    const meta = buildMeta(req, body, authFlags);
+    const ctx = { requestId: rid, log: req.log };
 
-      const out = await service.processWebhook(body, meta, ctx);
-      // Always 200 (service/repo layers are idempotent)
-      res.status(200).json(out || { ok: true });
-    } catch (err) {
-      // Still respond 200 to avoid provider retry storms; delegate logging upstream
-      try { res.status(200).json({ ok: false }); } catch (_) {}
-      next(err);
-    }
+    const out = await service.processWebhook(body, meta, ctx);
+    res.status(200).json(out || { ok: true });
+  } catch (err) {
+    // Never block provider delivery; still surface to error pipeline for observability.
+    try { res.status(200).json({ ok: false }); } catch (_) {}
+    next(err);
   }
-);
+});
 
 module.exports = router;
