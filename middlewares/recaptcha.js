@@ -1,22 +1,28 @@
-//middlewares/recaptcha.js
+// middlewares/recaptcha.js
 'use strict';
 
 /**
  * reCAPTCHA verification middleware
  * ---------------------------------
- * Supports reCAPTCHA v3 (classic) by default, with optional Enterprise mode.
- * It validates the token sent by the client, enforces a minimum score, and can
- * optionally verify the expected action and hostname.
+ * Validates client tokens against Google reCAPTCHA.
+ * - Supports v3 "classic" (default) and Enterprise (compat) via RECAPTCHA_MODE.
+ * - Enforces a minimum score (v3), optional expected action, and optional hostname.
+ * - Attaches verification details to req.recaptcha on success.
+ *
+ * Requirements:
+ * - Node.js 18+ (global fetch, AbortController available).
+ * - Express behind a correctly configured proxy (set "app.set('trust proxy', <hops>)")
+ *   if you want accurate client IP forwarded to Google.
  *
  * Environment variables:
  *  - RECAPTCHA_MODE          : 'classic' (default) | 'enterprise'
- *  - RECAPTCHA_SECRET        : required; must match the key type used on the frontend
+ *  - RECAPTCHA_SECRET        : required; must match the key type used by the frontend
  *  - RECAPTCHA_MIN_SCORE     : optional; minimum score threshold (default: 0.5)
  *  - RECAPTCHA_EXPECT_ACTION : optional; enforce a specific action (e.g., 'birthchart_submit')
  *  - RECAPTCHA_EXPECT_HOST   : optional; enforce the hostname returned by Google
  *  - RECAPTCHA_BYPASS        : 'true' to bypass verification (DEV only)
  *
- * Example usage:
+ * Example:
  *   router.post('/birthchart/birthchartsubmit-form', recaptchaVerify(), controller.processForm);
  */
 
@@ -25,16 +31,16 @@ const DEFAULT_MIN_SCORE = Number.isFinite(Number(process.env.RECAPTCHA_MIN_SCORE
   ? Number(process.env.RECAPTCHA_MIN_SCORE)
   : 0.5;
 
-const VERIFY_URLS = {
+// Google siteverify endpoints (classic / enterprise compatibility)
+const VERIFY_URLS = Object.freeze({
   classic: 'https://www.google.com/recaptcha/api/siteverify',
   enterprise: 'https://www.google.com/recaptcha/enterprise/siteverify',
-};
-
+});
 const VERIFY_URL = VERIFY_URLS[MODE] || VERIFY_URLS.classic;
 
 /**
- * Mirrors a request identifier back in the response headers if present.
- * Returns the resolved request id (or undefined).
+ * Mirrors a request identifier in the response (useful for tracing across systems).
+ * @returns {string|undefined} The request id echoed, if any.
  */
 function echoRequestId(req, res) {
   const rid = req.requestId || req.get?.('x-request-id') || req.get?.('x-correlation-id');
@@ -43,31 +49,36 @@ function echoRequestId(req, res) {
 }
 
 /**
- * Extracts the reCAPTCHA token from common request body keys.
- * Prioritizes keys used by the current frontend.
+ * Extracts the reCAPTCHA token from common body keys (frontend-compatible).
+ * @param {Record<string, any>} [body]
+ * @returns {string|null}
  */
 function pickCaptchaToken(body = {}) {
-  const c =
+  const candidate =
     body.recaptcha_token ??
     body.recaptchaToken ??
     body['g-recaptcha-response'] ??
     body.captcha ??
     null;
 
-  if (c == null) return null;
-  const s = String(c).trim();
-  return s.length ? s : null;
+  if (candidate == null) return null;
+  const token = String(candidate).trim();
+  return token.length ? token : null;
 }
 
 /**
- * Extracts the expected action, if provided by the client.
+ * Extracts the expected action provided by the client (if any).
+ * @param {Record<string, any>} [reqBody]
+ * @returns {string|undefined}
  */
 function pickExpectedAction(reqBody = {}) {
   return reqBody.recaptcha_action || reqBody.action || undefined;
 }
 
 /**
- * Attempts to resolve the client IP address in a proxy-aware manner.
+ * Attempts to resolve the client IP in a proxy-aware manner.
+ * Note: ensure Express trust proxy is set to get the correct client IP.
+ * @returns {string|undefined}
  */
 function getClientIp(req) {
   return (
@@ -80,7 +91,7 @@ function getClientIp(req) {
 
 /**
  * Calls Google's siteverify endpoint with the provided token and secret.
- * Returns a normalized transport result { ok, data, status }.
+ * @returns {Promise<{ ok: boolean, data: any, status: number }>}
  */
 async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }) {
   const params = new URLSearchParams();
@@ -89,44 +100,47 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
   if (remoteip) params.append('remoteip', String(remoteip));
 
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), Number(timeoutMs));
+  const timer = setTimeout(() => ctrl.abort(), Number(timeoutMs));
 
-  let resp;
   try {
-    resp = await fetch(VERIFY_URL, {
+    const resp = await fetch(VERIFY_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
       body: params.toString(),
       signal: ctrl.signal,
     });
-  } finally {
-    clearTimeout(t);
-  }
 
-  let data = {};
-  try {
-    data = await resp.json();
-  } catch {
-    /* swallow JSON errors and keep data empty */
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch {
+      // Keep empty data on JSON parse errors; caller will handle.
+    }
+
+    return { ok: resp.ok, data, status: resp.status };
+  } finally {
+    clearTimeout(timer);
   }
-  return { ok: resp.ok, data, status: resp.status };
 }
 
 /**
  * Normalizes Google's response into a single shape:
- *  {
- *    success: boolean,
- *    score?: number,
- *    action?: string,
- *    hostname?: string,
- *    challenge_ts?: string,
- *    error_codes?: string[]
- *  }
+ * {
+ *   success: boolean,
+ *   score?: number,
+ *   action?: string,
+ *   hostname?: string,
+ *   challenge_ts?: string,
+ *   error_codes?: string[]
+ * }
  */
 function normalizeGoogleResponse(raw) {
   if (!raw || typeof raw !== 'object') return { success: false };
 
-  // Enterprise: values live under tokenProperties and riskAnalysis
+  // Enterprise (compat siteverify) response fields
   if (MODE === 'enterprise' && raw.tokenProperties) {
     const { valid, action, hostname, createTime } = raw.tokenProperties;
     const score = raw.riskAnalysis?.score;
@@ -153,10 +167,10 @@ function normalizeGoogleResponse(raw) {
 
 /**
  * Factory that returns the Express middleware which validates reCAPTCHA.
- * - Validates presence of secret and token
- * - Verifies token with Google
- * - Enforces minimum score, action, and hostname (if configured)
- * - Attaches verification info to req.recaptcha on success
+ * - Validates presence of secret and token.
+ * - Verifies token with Google.
+ * - Enforces minimum score, action, and hostname (if configured).
+ * - Attaches verification info to req.recaptcha on success.
  */
 function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}) {
   return async function recaptchaVerifyMiddleware(req, res, next) {
@@ -199,7 +213,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         timeoutMs,
       });
 
-      // Treat network/server issues as 400 to preserve CORS behavior across proxies
+      // Use 4xx to preserve CORS behavior across proxies/load balancers
       if (!ok) {
         return res.status(400).json({
           error: 'recaptcha_unavailable',
@@ -247,7 +261,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      // Attach verification details for downstream handlers
+      // Attach verification details for downstream handlers (for logging/auditing)
       req.recaptcha = {
         success: true,
         mode: MODE,
@@ -260,6 +274,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
 
       return next();
     } catch (err) {
+      // Return 4xx to avoid downstream proxies stripping CORS on 5xx
       const isAbort = err?.name === 'AbortError';
       return res.status(400).json({
         error: isAbort ? 'recaptcha_timeout' : 'recaptcha_error',
