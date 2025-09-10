@@ -1,26 +1,25 @@
 // payments/pagBank/repository.js
 'use strict';
 
+const crypto = require('crypto');
 const db = require('../../db/db');
 
 /**
  * Repository: PagBank
  * -------------------
- * Security & integrity principles:
- * - Never persist secrets/tokens/signatures in DB (redact headers & JSON).
- * - Keep canonical business fields in typed columns; store provider "raw" JSON sanitized.
- * - Enforce idempotency at the DB layer:
- *     * pagbank_events(provider_event_uid)  => UNIQUE (append-only; ignore duplicates)
- *     * pagbank_payments(charge_id)         => UNIQUE (UPSERT)
- *     * pagbank_request(checkout_id)        => UNIQUE (UPSERT)
+ * Security & integrity:
+ * - Do not store secrets/tokens/signatures (redact headers & JSON).
+ * - Keep canonical fields in columns; store sanitized provider JSON in `raw`.
+ * - Enforce DB-level idempotency via UNIQUE constraints.
  *
- * NOTE: The SQL assumes proper UNIQUE constraints exist. If they don’t,
- *       please add them in migrations to guarantee idempotency.
+ * Expected tables (with UNIQUE):
+ *   - pagbank_events(provider_event_uid)
+ *   - pagbank_payments(charge_id)
+ *   - pagbank_request(checkout_id)
  */
 
 // --------------------------------- Sanitization helpers ---------------------------------
 
-// Case-insensitive header names that must be redacted
 const SENSITIVE_HEADER_SET = new Set([
   'authorization',
   'cookie',
@@ -28,10 +27,9 @@ const SENSITIVE_HEADER_SET = new Set([
   'x-api-key',
   'x-access-token',
   'x-client-secret',
-  'x-signature', // HMAC/signature headers should not be fully stored
+  'x-signature',
 ]);
 
-/** Redact sensitive HTTP headers. Keeps non-sensitive headers as-is. */
 function sanitizeHeaders(headers) {
   if (!headers || typeof headers !== 'object') return null;
   const out = {};
@@ -46,7 +44,6 @@ function sanitizeHeaders(headers) {
   return out;
 }
 
-// Keys inside JSON payloads that should be fully redacted (case-insensitive match)
 const SENSITIVE_JSON_KEYS = [
   'authorization',
   'access_token',
@@ -69,7 +66,6 @@ const SENSITIVE_JSON_KEYS = [
   'card',
 ];
 
-// Keys that carry PII we want to softly mask
 const PII_KEYS = [
   'email',
   'e-mail',
@@ -84,7 +80,6 @@ const PII_KEYS = [
   'whatsapp',
 ];
 
-/** Mask helpers for PII (keep minimal debugging signal) */
 function maskEmail(value) {
   const s = String(value || '');
   const [user, domain] = s.split('@');
@@ -95,55 +90,32 @@ function maskEmail(value) {
   );
   return `${u}@${d}`;
 }
-
 function maskDigits(value, visible = 2) {
   const s = String(value || '').replace(/\D+/g, '');
   if (!s) return '[REDACTED_DIGITS]';
   const keep = Math.min(visible, s.length);
   return '*'.repeat(s.length - keep) + s.slice(-keep);
 }
+function maskPhone(value) { return maskDigits(value, 4); }
+function maskTaxId(value) { return maskDigits(value, 3); }
 
-function maskPhone(value) {
-  return maskDigits(value, 4);
-}
-
-function maskTaxId(value) {
-  // CPF/CNPJ: keep last 3 digits
-  return maskDigits(value, 3);
-}
-
-// Decide how to mask a value based on the key semantics
 function maskValueByKey(key, value) {
   const k = String(key).toLowerCase();
-
   if (SENSITIVE_JSON_KEYS.includes(k)) return '[REDACTED]';
-
   if (PII_KEYS.includes(k)) {
     if (k.includes('email') || k === 'mail' || k === 'e-mail') return maskEmail(value);
     if (k.includes('phone') || k === 'mobile' || k === 'whatsapp') return maskPhone(value);
     if (k === 'tax_id' || k === 'document' || k === 'cpf' || k === 'cnpj') return maskTaxId(value);
     return '[REDACTED_PII]';
   }
-
   return value;
 }
 
-/**
- * Recursively sanitize an arbitrary JSON-like structure.
- * - Redacts sensitive keys entirely
- * - Masks PII fields
- * - Limits depth to avoid pathological objects
- */
 function sanitizeJson(value, depth = 0) {
   if (value == null) return value;
   if (depth > 8) return '[TRUNCATED_DEPTH]';
-
   if (typeof value !== 'object') return value;
-
-  if (Array.isArray(value)) {
-    return value.map((v) => sanitizeJson(v, depth + 1));
-  }
-
+  if (Array.isArray(value)) return value.map((v) => sanitizeJson(v, depth + 1));
   const out = {};
   for (const [k, v] of Object.entries(value)) {
     const masked = maskValueByKey(k, v);
@@ -152,32 +124,40 @@ function sanitizeJson(value, depth = 0) {
   return out;
 }
 
-/** Safe stringify for diagnostic storage (never throws) */
 function safeJsonStringify(obj) {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return String(obj);
-  }
+  try { return JSON.stringify(obj); } catch { return String(obj); }
 }
 
-/** Public sanitizers used by the repository functions */
-function sanitizeForStorage(obj) {
-  return sanitizeJson(obj);
-}
-function sanitizeQuery(obj) {
-  return sanitizeJson(obj);
-}
+function sanitizeForStorage(obj) { return sanitizeJson(obj); }
+function sanitizeQuery(obj) { return sanitizeJson(obj); }
 
 const toNumberOrNull = (v) => (v == null || v === '' ? null : Number(v));
+
+// --------------------------------- Hash helpers (bytea) ---------------------------------
+
+function sha256Buffer(input) {
+  return crypto.createHash('sha256').update(input).digest();
+}
+function hashEmail(email) {
+  if (!email) return null;
+  const normalized = String(email).trim().toLowerCase();
+  if (!normalized) return null;
+  return sha256Buffer(normalized);
+}
+function onlyDigits(s) { return String(s || '').replace(/\D+/g, ''); }
+function hashTaxId(doc) {
+  const digits = onlyDigits(doc);
+  if (!digits) return null;
+  return sha256Buffer(digits);
+}
 
 // ------------------------------------- Repository API -------------------------------------
 
 /**
  * createCheckout
  * --------------
- * Upsert the checkout record in pagbank_request. Idempotent by UNIQUE(checkout_id).
- * Sanitizes "customer" and "raw" to avoid persisting secrets/PII in arbitrary JSON.
+ * Upsert checkout in pagbank_request (UNIQUE by checkout_id).
+ * Overwrites `raw` with the latest snapshot.
  */
 async function createCheckout({
   request_id,
@@ -224,21 +204,18 @@ async function createCheckout({
 /**
  * updateCheckoutStatusById
  * ------------------------
- * Update checkout status by checkout_id. Idempotent per row.
- * Uses COALESCE to avoid wiping existing raw when a null is passed.
+ * Update status by checkout_id; raw is overwritten with the latest snapshot.
  */
 async function updateCheckoutStatusById(checkout_id, status, raw) {
   const sql = `
     UPDATE pagbank_request
        SET status = $2,
-           raw    = COALESCE($3, pagbank_request.raw),
+           raw    = $3,
            updated_at = NOW()
      WHERE checkout_id = $1
     RETURNING *;
   `;
-
   const safeRaw = raw ? sanitizeForStorage(raw) : null;
-
   const values = [checkout_id, status, safeRaw];
   const { rows } = await db.query(sql, values);
   return rows[0] || null;
@@ -247,8 +224,8 @@ async function updateCheckoutStatusById(checkout_id, status, raw) {
 /**
  * logEvent
  * --------
- * Immutable event log (pagbank_events). Idempotent by UNIQUE(provider_event_uid).
- * Returns the inserted row; returns null if it was a duplicate (DO NOTHING).
+ * Append-only event log (UNIQUE by provider_event_uid).
+ * Returns the inserted row; null if duplicate.
  */
 async function logEvent({
   event_uid,
@@ -285,14 +262,16 @@ async function logEvent({
     safePayload || null,
   ];
   const { rows } = await db.query(sql, values);
-  return rows[0] || null; // null => duplicate
+  return rows[0] || null;
 }
 
 /**
  * upsertPaymentByChargeId
  * -----------------------
- * Idempotent UPSERT by UNIQUE(charge_id).
- * Sanitizes address JSON and raw snapshot before persistence.
+ * UPSERT by UNIQUE(charge_id).
+ * - Masks PII into text columns.
+ * - Best-effort: updates *_hash columns (bytea) if they exist (no hard dependency).
+ * - Overwrites `raw` with the latest snapshot.
  */
 async function upsertPaymentByChargeId({
   charge_id,
@@ -302,6 +281,16 @@ async function upsertPaymentByChargeId({
   customer,
   raw,
 }) {
+  const maskedName  = customer?.name ?? null; // keep as-is; can be masked if required
+  const maskedEmail = customer?.email ? maskEmail(customer.email) : null;
+  const maskedTaxId = customer?.tax_id ? maskTaxId(customer.tax_id) : null;
+
+  const emailHash = customer?.email ? hashEmail(customer.email) : null;
+  const taxIdHash = customer?.tax_id ? hashTaxId(customer.tax_id) : null;
+
+  const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+
   const sql = `
     INSERT INTO pagbank_payments (
       charge_id, checkout_id, status, request_ref,
@@ -330,19 +319,15 @@ async function upsertPaymentByChargeId({
     RETURNING *;
   `;
 
-  // Keep canonical columns explicit; sanitize only the arbitrary JSON fields
-  const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
-  const safeRaw = raw ? sanitizeForStorage(raw) : null;
-
   const values = [
     charge_id,
     checkout_id ?? null,
     status ?? null,
     request_ref ?? null,
 
-    customer?.name ?? null,
-    customer?.email ?? null,
-    customer?.tax_id ?? null,
+    maskedName,
+    maskedEmail,
+    maskedTaxId,
 
     customer?.phone_country ?? null,
     customer?.phone_area ?? null,
@@ -351,17 +336,31 @@ async function upsertPaymentByChargeId({
     safeAddress,
     safeRaw,
   ];
+
   const { rows } = await db.query(sql, values);
-  return rows[0];
+  const row = rows[0];
+
+  // Best-effort: update *_hash columns if present; ignore errors if columns do not exist.
+  if (emailHash || taxIdHash) {
+    try {
+      await db.query(
+        `UPDATE pagbank_payments
+            SET customer_email_hash = COALESCE($1, customer_email_hash),
+                customer_tax_id_hash = COALESCE($2, customer_tax_id_hash),
+                updated_at = NOW()
+          WHERE charge_id = $3`,
+        [emailHash, taxIdHash, charge_id]
+      );
+    } catch (_) { /* column may not exist yet; intentionally ignored */ }
+  }
+
+  return row;
 }
 
 /**
  * findByChargeId
  * --------------
- * Fetch a consolidated payment by charge_id and join related request data.
- * - Primary join by checkout_id (preferred).
- * - Secondary join by request_ref -> request_id.
- *   To avoid type mismatches between TEXT and INT, cast request_id to TEXT on join.
+ * Fetch a payment by charge_id and join related request (checkout_id or request_ref).
  */
 async function findByChargeId(charge_id) {
   const sql = `
@@ -383,7 +382,6 @@ async function findByChargeId(charge_id) {
 /**
  * findByCheckoutId
  * ----------------
- * Fetch checkout record by checkout_id.
  */
 async function findByCheckoutId(checkout_id) {
   const sql = `
@@ -397,9 +395,7 @@ async function findByCheckoutId(checkout_id) {
 }
 
 /**
- * findBirthchartRequestById (legacy)
- * ----------------------------------
- * Used in return flows, if applicable.
+ * findBirthchartRequestById (legacy helper for return flows)
  */
 async function findBirthchartRequestById(requestId) {
   const sql = `
@@ -419,6 +415,5 @@ module.exports = {
   upsertPaymentByChargeId,
   findByChargeId,
   findByCheckoutId,
-
   findBirthchartRequestById,
 };
