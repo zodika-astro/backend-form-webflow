@@ -19,6 +19,10 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const diag = require('./middlewares/diag');
+app.use(diag());
+
+
 /* -------------------------------- Proxy trust -------------------------------- */
 
 function resolveTrustProxySetting() {
