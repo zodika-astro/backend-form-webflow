@@ -1,4 +1,3 @@
-// db/db.js
 'use strict';
 
 /**
@@ -48,6 +47,11 @@ function toBool(v, d) {
   return d;
 }
 
+/** Escape value as a safe SQL string literal (single quotes doubled). */
+function sqlStringLiteral(s) {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+
 /** Resolve SSL config from env with safe defaults for common managed PG. */
 function resolveSslConfig() {
   const mode = (process.env.PGSSLMODE || '').toLowerCase().trim();
@@ -92,8 +96,7 @@ async function initPool() {
       max: resolvePoolMax(),
       idleTimeoutMillis: toInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30_000),
       connectionTimeoutMillis: toInt(process.env.DB_CONNECT_TIMEOUT_MS, 5_000),
-      // query_timeout: client-side timer per query (ms). pg will abort & reject promise.
-      // We'll set server-side timeouts too via session SETs (see pool 'connect' below).
+      // client-side timer per query (ms). pg will abort & reject promise.
       query_timeout: toInt(process.env.DB_QUERY_TIMEOUT_MS, 25_000),
       // pg >= 8.11: recycle a client after N uses to avoid long-lived issues (disabled by default)
       maxUses: toInt(process.env.DB_POOL_MAX_USES, 0) || undefined,
@@ -105,21 +108,22 @@ async function initPool() {
     // Apply session guardrails on connect (server-side timeouts)
     pool.on('connect', (client) => {
       // These settings are per-connection. Keep values conservative for API workloads.
-      const stmTimeoutMs = toInt(process.env.DB_STATEMENT_TIMEOUT_MS, 20_000); // server kills long queries
-      const lockTimeoutMs = toInt(process.env.DB_LOCK_TIMEOUT_MS, 10_000);     // wait for locks at most N ms
-      const idleTxTimeoutMs = toInt(process.env.DB_IDLE_IN_TX_TIMEOUT_MS, 15_000); // kill idle-in-tx sessions
+      const stmTimeoutMs = Math.max(0, toInt(process.env.DB_STATEMENT_TIMEOUT_MS, 20_000)); // server kills long queries
+      const lockTimeoutMs = Math.max(0, toInt(process.env.DB_LOCK_TIMEOUT_MS, 10_000));     // wait for locks at most N ms
+      const idleTxTimeoutMs = Math.max(0, toInt(process.env.DB_IDLE_IN_TX_TIMEOUT_MS, 15_000)); // kill idle-in-tx sessions
       const appName = process.env.DB_APP_NAME || 'zodika-backend';
 
-      // Fire-and-forget SETs; failures are non-fatal but logged.
-      client
-        .query(
-          `SET application_name = $1;
-           SET statement_timeout = $2;
-           SET lock_timeout = $3;
-           SET idle_in_transaction_session_timeout = $4;`,
-          [appName, stmTimeoutMs, lockTimeoutMs, idleTxTimeoutMs]
-        )
-        .catch((e) => logger.warn({ msg: 'failed to set session timeouts', err: e.message }));
+      // IMPORTANT: PostgreSQL does not support $-placeholders in SET commands.
+      // Use safe literal interpolation for strings and plain numeric literals for timeouts.
+      const setSql =
+        `SET application_name = ${sqlStringLiteral(appName)}; ` +
+        `SET statement_timeout = ${stmTimeoutMs}; ` +
+        `SET lock_timeout = ${lockTimeoutMs}; ` +
+        `SET idle_in_transaction_session_timeout = ${idleTxTimeoutMs};`;
+
+      client.query(setSql).catch((e) => {
+        logger.warn({ msg: 'failed to set session timeouts', err: e.message });
+      });
     });
 
     // Pool-level error handler (idle client errors)
