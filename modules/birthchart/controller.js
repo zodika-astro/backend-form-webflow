@@ -48,7 +48,7 @@ function pick(input, allowedKeys) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* NEW: Minimal, in-file normalizers (no extra imports to avoid breakage).    */
+/* Normalizers                                                                */
 /* -------------------------------------------------------------------------- */
 /**
  * Accepts common consent field shapes from the frontend and maps to boolean.
@@ -73,7 +73,7 @@ function normalizeConsent(body = {}) {
 
 /**
  * Picks the most likely reCAPTCHA token field sent by the frontend.
- * Supports: recaptcha_token, recaptchaToken, g-recaptcha-response, etc.
+ * Supports: recaptcha_token, recaptchaToken, captcha_token, g-recaptcha-response, etc.
  */
 function pickCaptchaToken(body = {}) {
   return (
@@ -90,12 +90,12 @@ function pickCaptchaToken(body = {}) {
 
 /**
  * Feature flag: by default captcha is required unless explicitly disabled via env.
- * We intentionally read from process.env to avoid depending on envalid schema changes.
+ * Intentionally read from process.env to avoid envalid schema changes.
  */
 const RECAPTCHA_REQUIRED =
   String(process.env.RECAPTCHA_REQUIRED ?? 'true').trim().toLowerCase() !== 'false';
 
-/** Allowed public form fields (whitelist). Extra fields (e.g., CAPTCHA) are ignored here. */
+/** Allowed public form fields (whitelist). */
 const ALLOWED_FORM_KEYS = [
   'name',
   'social_name',
@@ -118,25 +118,34 @@ const ALLOWED_FORM_KEYS = [
   'product_type',
 ];
 
+/* --------------------------- Payment provider select ------------------------------ */
+/**
+ * Select payment provider from env.
+ * Accepted values (case-insensitive): "MERCADO_PAGO" | "PAGBANK"
+ * Default: "MERCADO_PAGO"
+ */
+function getPaymentProvider() {
+  const raw =
+    (typeof process !== 'undefined' && process.env && process.env.PAYMENT_PROVIDER)
+      ? process.env.PAYMENT_PROVIDER
+      : env && env.PAYMENT_PROVIDER;
+
+  const v = String(raw || 'MERCADO_PAGO').trim().toUpperCase();
+  if (v === 'PAGBANK') return 'PAGBANK';
+  return 'MERCADO_PAGO';
+}
+
 /**
  * POST /birthchart/birthchartsubmit-form (public)
  * Body: validated by Zod in validateBirthchartPayload (normalized on return)
- *
- * Security:
- * - Router middlewares may enforce CAPTCHA/Privacy; we additionally normalize
- *   and enforce here to be robust against field-name drift on the frontend.
- * - We still ignore unexpected fields before validation/persistence.
  */
 async function processForm(req, res, next) {
-  // Derive a request-scoped logger (keeps correlation-id from middleware)
   const logger = (req.log || baseLogger).child('processForm', { rid: req.requestId });
 
   try {
-    /* ----------------------- NEW: consent & captcha guards ---------------------- */
-    // Normalize privacy consent from multiple possible field names.
+    /* ----------------------- consent & captcha guards ----------------------- */
     const privacyConsent = normalizeConsent(req.body);
     if (!privacyConsent) {
-      // Use 400 to indicate client-side correction needed.
       throw new AppError(
         'privacy_consent_required',
         'Privacy Policy consent is required to submit this form.',
@@ -145,7 +154,6 @@ async function processForm(req, res, next) {
       );
     }
 
-    // Extract captcha token in a tolerant way; require it unless explicitly disabled.
     const captchaToken = pickCaptchaToken(req.body);
     if (RECAPTCHA_REQUIRED && !captchaToken) {
       throw new AppError(
@@ -158,21 +166,23 @@ async function processForm(req, res, next) {
 
     logger.info(
       {
-        hasCaptchaHeader: !!req.captcha,     // from middleware (if any)
-        hasCaptchaToken: !!captchaToken,     // from body
+        hasCaptchaHeader: !!req.captcha, // from middleware (if any)
+        hasCaptchaToken: !!captchaToken, // from body
       },
       'consent/captcha normalized'
     );
-    /* -------------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------- */
 
-    // 1) Filter raw body (avoid mass assignment) and validate/normalize
+    // 1) Filter raw body and include captcha for schema compatibility.
     const filtered = pick(req.body, ALLOWED_FORM_KEYS);
 
-    // If your validators already throw AppError.validation, this will bubble up intact.
-    // If they throw a plain error, we convert to AppError in the catch block below.
+    // Satisfy current validator shape: pass captcha as `captcha_token` (not persisted).
+    if (captchaToken) filtered.captcha_token = String(captchaToken);
+
+    // 2) Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
 
-    // 2) Resolve timezone (no PII in logs)
+    // 3) Resolve timezone (no PII in logs)
     const googleApiKey = await getSecret('GOOGLE_MAPS_API_KEY').catch((e) => {
       throw AppError.fromUpstream('secret_fetch_failed', 'Failed to load Google API key', e, { provider: 'secrets' });
     });
@@ -188,14 +198,12 @@ async function processForm(req, res, next) {
     });
 
     if (!tz || !tz.tzId || typeof tz.offsetMin !== 'number') {
-      // NOTE: keeping existing semantics; AppError.internal may not exist in your class,
-      // so keep using a standard AppError with 500 to avoid breaking.
       throw new AppError('tz_invalid', 'Resolved timezone is invalid', 500, { got: tz ? Object.keys(tz) : null });
     }
 
     logger.info({ tzId: tz.tzId, offsetMin: tz.offsetMin }, 'timezone resolved');
 
-    // 3) Persist request (minimal payload in logs; avoid PII)
+    // 4) Persist request (minimal payload in logs; avoid PII)
     const newRequest = await createBirthchartRequest({
       name:                 input.name,
       social_name:          input.social_name,
@@ -222,7 +230,7 @@ async function processForm(req, res, next) {
 
     logger.info({ requestId: newRequest.request_id, productType: newRequest.product_type }, 'request persisted');
 
-    // 4) Compose product for checkout
+    // 5) Compose product for checkout
     const product = {
       productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
@@ -233,7 +241,6 @@ async function processForm(req, res, next) {
         allow_card: true,
         max_installments: 1,
       },
-      // Used by Mercado Pago back_urls (success page)
       returnUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${newRequest.request_id}`,
       metadata: {
         source: 'webflow',
@@ -241,14 +248,14 @@ async function processForm(req, res, next) {
       },
     };
 
-    // 5) Route to PSP (feature flag validated by envalid)
-    const usePagBank = env.PAGBANK_ENABLED === true;
-    logger.info({ provider: usePagBank ? 'pagbank' : 'mercadopago' }, 'selecting PSP');
+    // 6) Route to PSP using PAYMENT_PROVIDER env
+    const provider = getPaymentProvider();
+    logger.info({ provider }, 'selecting PSP');
 
     const ctx = { requestId: req.requestId, log: req.log || baseLogger };
     let paymentResponse;
 
-    if (usePagBank) {
+    if (provider === 'PAGBANK') {
       paymentResponse = await pagbankService.createCheckout({
         requestId:    newRequest.request_id,
         name:         newRequest.name,
@@ -270,6 +277,7 @@ async function processForm(req, res, next) {
         'pagbank checkout created'
       );
     } else {
+      // Default: MERCADO_PAGO
       paymentResponse = await mpService.createCheckout({
         requestId:    newRequest.request_id,
         name:         newRequest.name,
@@ -294,7 +302,7 @@ async function processForm(req, res, next) {
       );
     }
 
-    // 6) Contract expected by the frontend
+    // 7) Contract expected by the frontend
     return res.status(200).json({ url: paymentResponse.url });
   } catch (err) {
     // Normalize non-AppError validation failures (e.g., Zod)
