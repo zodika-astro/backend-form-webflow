@@ -30,10 +30,6 @@ const cors = require('cors');
 const NODE_ENV = (process.env.NODE_ENV || 'production').toLowerCase();
 const IS_PROD = NODE_ENV === 'production';
 
-//remover
-// no seu middleware CORS atual, garanta:
-res.set('Access-Control-Max-Age', '600'); // 10 min
-//remover
 
 const {
   exactOrigins: EXACT_ORIGINS,
