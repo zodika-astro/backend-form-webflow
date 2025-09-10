@@ -8,8 +8,9 @@
  * - Sensible defaults (timeouts, JSON handling, keep-alive via undici pools).
  * - Robust retries with exponential backoff + jitter for transient failures.
  * - Optional respect for `Retry-After`.
- * - HTTPS-only with an allowlist of hosts to reduce misconfig/SSRF risk.
- * - Optional response size guard based on Content-Length.
+ * - HTTPS-only with a strict allowlist of hosts.
+ * - Optional response size guard (Content-Length).
+ * - Correlation propagation (X-Request-Id/X-Correlation-Id).
  * - Never logs secrets; only returns response headers/data to the caller.
  *
  * API (unchanged):
@@ -24,11 +25,13 @@
  */
 
 const { fetch, Headers } = require('undici');
+const crypto = require('crypto');
 
 /* -------------------------------- Defaults -------------------------------- */
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRIES = 2;
+
 // Retry on these HTTP status codes (transient or rate-limited)
 const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
@@ -37,14 +40,17 @@ const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const DEFAULT_MAX_RESPONSE_BYTES = 1_500_000; // ~1.5MB
 
 // Allowlist of HTTPS hosts we consider safe to call from this backend.
-// You can override via env HTTP_ALLOWED_HOSTS="api.mercadopago.com,api.pagbank.com.br"
-const DEFAULT_ALLOWED_HOSTS = new Set([
+// You can override via env: HTTP_ALLOWED_HOSTS="api.mercadopago.com,api.pagbank.com.br"
+const HARDCODED_ALLOWED_HOSTS = new Set([
   'api.mercadopago.com',
   'api.pagbank.com.br',
   'sandbox.api.pagseguro.com',
 ]);
 
 /* ------------------------------- Small utils ------------------------------- */
+
+const genId = () =>
+  (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
 
 function parseRetryAfterMs(hdr) {
   if (!hdr) return null;
@@ -65,9 +71,18 @@ function sanitizeHeadersForReturn(headers) {
   return out;
 }
 
-/** Normalize & validate a URL:
+function getAllowedHostsFromEnv(defaultSet) {
+  const raw = process.env.HTTP_ALLOWED_HOSTS;
+  if (!raw || !raw.trim()) return new Set(defaultSet);
+  return new Set(
+    raw.split(',').map(s => s.trim()).filter(Boolean)
+  );
+}
+
+/**
+ * Validate and normalize a URL:
  *  - Must be https://
- *  - Host must be present in the allowlist (or end with one of them if you prefer suffix matching)
+ *  - Host must be present in the allowlist
  */
 function validateHttpsUrl(url, allowedHosts) {
   let u;
@@ -77,8 +92,6 @@ function validateHttpsUrl(url, allowedHosts) {
   }
   const host = u.host; // includes hostname[:port]
   if (!host) throw new Error('URL missing host');
-
-  // Strict host allowlist
   if (!allowedHosts.has(host)) {
     throw new Error(`Destination host not allowed: ${host}`);
   }
@@ -104,6 +117,7 @@ function isNetworkLikeError(err) {
  * - Validates HTTPS + allowed host.
  * - Optionally guards response size using Content-Length header.
  * - Parses JSON when content-type includes application/json, else returns text.
+ * - Optionally controls following redirects (default: follow).
  */
 async function doFetch(method, url, {
   data,
@@ -111,8 +125,9 @@ async function doFetch(method, url, {
   timeout,
   timeoutMs,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
-  allowedHosts = DEFAULT_ALLOWED_HOSTS,
+  allowedHosts = HARDCODED_ALLOWED_HOSTS,
   userAgent = 'ZodikaBackend/1.0 (+https://www.zodika.com.br) httpClient',
+  followRedirects = true,
 } = {}) {
   // Validate URL before any network I/O
   const safeUrl = validateHttpsUrl(url, allowedHosts);
@@ -126,28 +141,38 @@ async function doFetch(method, url, {
   try {
     const baseHeaders = new Headers(headers);
 
+    // Correlation propagation (generate if absent)
+    const corr = baseHeaders.get('x-request-id') || baseHeaders.get('x-correlation-id') || genId();
+    if (!baseHeaders.has('x-request-id')) baseHeaders.set('x-request-id', corr);
+    if (!baseHeaders.has('x-correlation-id')) baseHeaders.set('x-correlation-id', corr);
+
     // Default headers
     if (!baseHeaders.has('accept')) baseHeaders.set('accept', 'application/json');
     if (!baseHeaders.has('user-agent')) baseHeaders.set('user-agent', userAgent);
 
+    // Body handling
     const hasBody = data !== undefined && data !== null && method !== 'GET' && method !== 'HEAD';
-    if (hasBody && !baseHeaders.has('content-type') && typeof data === 'object' && !(data instanceof Buffer)) {
-      baseHeaders.set('content-type', 'application/json');
+    let body;
+    if (hasBody) {
+      const ct = baseHeaders.get('content-type');
+      if (typeof data === 'string' || data instanceof Buffer) {
+        // Respect caller-provided content-type for raw/string payloads
+        body = data;
+      } else if (!ct || ct.includes('application/json')) {
+        baseHeaders.set('content-type', 'application/json');
+        body = JSON.stringify(data);
+      } else {
+        // Caller set another content-type but passed an object; we stringify anyway
+        body = JSON.stringify(data);
+      }
     }
-
-    const body = hasBody
-      ? (typeof data === 'string' || data instanceof Buffer ? data : JSON.stringify(data))
-      : undefined;
 
     const res = await fetch(safeUrl, {
       method,
       headers: baseHeaders,
       body,
       signal: controller.signal,
-      // keep-alive: undici enables connection pooling by default
-      redirect: 'follow', // we’ll validate final URL below
-      // Note: if you prefer to prevent off-allowlist redirects entirely,
-      // switch to 'manual' and implement step-by-step checks.
+      redirect: followRedirects ? 'follow' : 'manual',
     });
 
     // If redirected, ensure the final URL host is still allowed
@@ -184,6 +209,7 @@ async function doFetch(method, url, {
     const errPayload = ct.includes('application/json')
       ? await res.json().catch(() => ({}))
       : await res.text();
+
     const error = new Error(`HTTP ${res.status} ${res.statusText}`);
     error.response = { status: res.status, data: errPayload, headers: retHeaders };
     throw error;
@@ -218,20 +244,13 @@ async function request(method, url, opts = {}) {
     allowedHosts,
     maxResponseBytes,
     userAgent,
+    followRedirects,
   } = opts;
 
-  // Resolve allowlist from env (comma-separated) or use defaults
-  let hosts = DEFAULT_ALLOWED_HOSTS;
-  if (allowedHosts && allowedHosts instanceof Set) {
-    hosts = allowedHosts;
-  } else if (typeof process.env.HTTP_ALLOWED_HOSTS === 'string' && process.env.HTTP_ALLOWED_HOSTS.trim()) {
-    hosts = new Set(
-      process.env.HTTP_ALLOWED_HOSTS
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean)
-    );
-  }
+  // Resolve allowlist from env or use defaults
+  const hosts = allowedHosts instanceof Set
+    ? allowedHosts
+    : getAllowedHostsFromEnv(HARDCODED_ALLOWED_HOSTS);
 
   const backoff = Array.isArray(retryBackoffMs) && retryBackoffMs.length
     ? retryBackoffMs
@@ -248,6 +267,7 @@ async function request(method, url, opts = {}) {
         allowedHosts: hosts,
         maxResponseBytes: maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
         userAgent,
+        followRedirects: followRedirects !== false, // default true
       });
     } catch (err) {
       lastErr = err;
