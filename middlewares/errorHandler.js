@@ -10,12 +10,9 @@
  *  - Avoid leaking stack traces in production.
  *  - Respect Retry-After hints (when provided by upstream mappings).
  *  - Never crash if logger/err objects are stubs.
- *
- * Contract
- *  - Expects AppError-like objects (err.isAppError || err.name === 'AppError') but
- *    gracefully handles any error shape.
  */
 
+const crypto = require('crypto');
 const rootLogger = require('../utils/logger');
 
 // Prefer a namespaced child logger if available
@@ -33,10 +30,20 @@ function normalizeStatus(v) {
 }
 
 /** Convert retryAfterMs to whole seconds (minimum 0). */
-function toRetryAfterSeconds(details) {
-  const ms = details?.retryAfterMs;
+function toRetryAfterSeconds(source) {
+  const ms = source?.retryAfterMs ?? source;
   if (!Number.isFinite(ms)) return null;
   return Math.max(0, Math.ceil(ms / 1000));
+}
+
+/** Generate a correlation id if missing */
+function ensureRequestId(req) {
+  return (
+    req?.requestId ||
+    req?.get?.('x-request-id') ||
+    req?.get?.('x-correlation-id') ||
+    (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))
+  );
 }
 
 module.exports = function errorHandler(err, req, res, next) {
@@ -50,65 +57,61 @@ module.exports = function errorHandler(err, req, res, next) {
   const code   = String(err?.code || (status >= 500 ? 'internal_error' : 'request_error'));
 
   // Correlation
-  const rid = req?.requestId || req?.get?.('x-request-id') || null;
+  const rid = ensureRequestId(req);
   if (rid) res.set('X-Request-Id', String(rid));
 
-  // Honor Retry-After hints surfaced by upstream mappers (e.g., Mercado Pago / PagBank)
-  const retryAfterSec = toRetryAfterSeconds(err?.details);
+  // Honor Retry-After hints if coherent with status
+  const retryAfterSec = toRetryAfterSeconds(err?.details) ?? toRetryAfterSeconds(err);
   if (retryAfterSec != null && [429, 502, 503, 504].includes(status)) {
     res.set('Retry-After', String(retryAfterSec));
   }
 
-  // Defensive no-cache on error responses to avoid proxy/browser caching
+  // Defensive no-cache headers
   res.set('Cache-Control', 'no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
 
-  // Choose message: never echo raw internal messages for 5xx
+  // Choose safe message
   const message = status >= 500
     ? 'Internal server error'
-    : (err?.message || 'Request error');
+    : (err?.message ? String(err.message) : 'Request error');
 
-  // Build log payload (safe, minimal)
+  // Log payload (never log raw body/PII)
   const logBase = {
     rid,
     status,
     code,
     method: req?.method,
     path: req?.originalUrl || req?.url,
-    msg: err?.message,
+    msg: err?.message ? String(err.message) : undefined,
   };
 
-  // Include safe details for observability (never log raw payloads/PII here)
   if (isAppErr && err?.details !== undefined) {
     logBase.details = err.details;
   }
-
   if (!isProd && err?.stack) {
     logBase.stack = err.stack;
   }
 
-  // Log using request-scoped logger when available
+  // Structured logging
   const parentLog = req?.log || baseLogger;
   const log = (typeof parentLog?.child === 'function') ? parentLog.child('handler') : parentLog;
-
   if (typeof log?.error === 'function') {
     log.error(logBase, 'request failed');
   } else {
-    // Last-resort logging
     // eslint-disable-next-line no-console
     console.error('[errorHandler]', logBase);
   }
 
-  // Build client-safe body
+  // Client-safe body
   const body = {
     error: {
       code,
       message,
-      request_id: rid || undefined,
+      request_id: rid,
     },
   };
 
-  // In non-production, expose stack & (safe) details to aid debugging
+  // In non-production, expose stack & safe details
   if (!isProd) {
     if (err?.stack) body.error.stack = err.stack;
     if (isAppErr && err?.details !== undefined) body.error.details = err.details;
