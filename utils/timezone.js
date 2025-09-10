@@ -1,208 +1,226 @@
 'use strict';
 
 /**
- * Historical Timezone Resolution
- * ------------------------------
- * Business rule:
- *   Astrology requires the timezone/offset that applied at the *birth moment*,
- *   not the current offset for the location.
+ * Historical timezone resolution (Astrology-grade)
+ * -----------------------------------------------
+ * Strategy:
+ *  1) Prefer GeoNames (historical offsets by date) using "timezoneJSON".
+ *  2) Fallback to Google Time Zone API (timestamp-based), if a valid API key was provided.
+ *  3) Final fallback: static env values TZ_FALLBACK_ID + TZ_FALLBACK_OFFSET_MIN (minutes).
  *
- * Strategy (prefer → fallback):
- *   1) GeoNames timezoneJSON (supports historical offsets by date).
- *      - URL: https://api.geonames.org/timezoneJSON
- *      - Params: lat, lng, date=YYYY-MM-DD, username=GEONAMES_USERNAME
- *      - Output: { timezoneId, gmtOffset, dstOffset, rawOffset, ... }
- *      - We use gmtOffset (hours) on the given date → offsetMin.
- *   2) Google Time Zone API (compatible with existing code) when GeoNames
- *      username is not provided:
- *      - URL: https://maps.googleapis.com/maps/api/timezone/json
- *      - Params: location, timestamp=UnixSeconds, key=GOOGLE_MAPS_API_KEY
- *      - Output: rawOffset + dstOffset (seconds) → offsetMin.
+ * Input:
+ *  - lat, lng: numbers (or coercible) — REQUIRED for external lookups
+ *  - birthDate: 'YYYY-MM-DD' — REQUIRED for historical resolution
+ *  - birthTime: 'HH:MM'      — REQUIRED to build a mid-exact timestamp
+ *  - apiKey: Google Maps Time Zone API key (optional; used in fallback)
  *
- * Design goals:
- *   - Keep the exported signature unchanged: getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey })
- *   - Be resilient: strict timeouts, safe parsing, and clean fallbacks.
- *   - Never throw here; return { tzId:null, offsetMin:null } on failure (controller handles errors).
+ * Output:
+ *  { tzId: string|null, offsetMin: number|null }
+ *
+ * Notes:
+ *  - Each provider call has its own short timeout (default 6s) to avoid request pile-ups.
+ *  - Offsets are returned in minutes (integer), including DST where applicable.
  */
 
-const DEFAULT_TIMEOUT_MS = Number.isFinite(Number(process.env.TZ_HTTP_TIMEOUT_MS))
-  ? Number(process.env.TZ_HTTP_TIMEOUT_MS)
-  : 6000; // 6s hard timeout for external lookups
+const DEFAULT_PROVIDER_TIMEOUT_MS = toInt(process.env.TZ_PROVIDER_TIMEOUT_MS, 6000);
 
-const GEONAMES_USERNAME = (process.env.GEONAMES_USERNAME || '').trim() || null;
-const GEONAMES_HOST = (process.env.GEONAMES_HOST || 'https://api.geonames.org').replace(/\/+$/, '');
+// Final static fallback (optional)
+const FALLBACK_TZ = orNull(process.env.TZ_FALLBACK_ID);
+const FALLBACK_OFF = toInt(process.env.TZ_FALLBACK_OFFSET_MIN, null);
 
-const FALLBACK_TZ = process.env.TZ_FALLBACK_ID || null;
-const FALLBACK_OFF = Number.isFinite(Number(process.env.TZ_FALLBACK_OFFSET_MIN))
-  ? Number(process.env.TZ_FALLBACK_OFFSET_MIN)
-  : null;
+// GeoNames (preferred source for historical offsets)
+const GEONAMES_USERNAME = orNull(process.env.GEONAMES_USERNAME);
 
-/** Abortable fetch with a hard timeout. */
-async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { ...opts, signal: ctrl.signal });
-    return resp;
-  } finally {
-    clearTimeout(to);
+// ----------------------------- Public API ------------------------------
+
+/**
+ * Resolve the timezone at a given birth moment (historical).
+ * Falls back gracefully across providers and static envs.
+ */
+async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
+  // Basic guards: we need coordinates and a date+time to do any real lookup
+  const latNum = toNum(lat);
+  const lngNum = toNum(lng);
+  if (!isFiniteNum(latNum) || !isFiniteNum(lngNum) || !isIsoDate(birthDate) || !isHHmm(birthTime)) {
+    return staticFallbackOrNull();
   }
+
+  // Provider #1: GeoNames
+  if (GEONAMES_USERNAME) {
+    const g = await geonamesLookup({
+      lat: latNum,
+      lng: lngNum,
+      date: birthDate,
+      username: GEONAMES_USERNAME,
+      timeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
+    });
+    if (g) return g;
+  }
+
+  // Provider #2: Google Time Zone API
+  if (apiKey) {
+    const tsSec = toUnixTimestampSec(birthDate, birthTime);
+    const gg = await googleTzLookup({
+      lat: latNum,
+      lng: lngNum,
+      timestampSec: tsSec,
+      apiKey,
+      timeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
+    });
+    if (gg) return gg;
+  }
+
+  // Final fallback (static), or nulls to signal failure
+  return staticFallbackOrNull();
 }
 
-/** Round to nearest integer minute safely. */
-function toMinutes(valueInHours) {
-  const n = Number(valueInHours);
-  if (!Number.isFinite(n)) return null;
-  return Math.round(n * 60);
-}
+module.exports = { getTimezoneAtMoment };
 
-/** Builds a UNIX timestamp (seconds) from birth date/time (local naive input). */
-function toUnixSeconds(birthDate, birthTime) {
-  try {
-    const dt = new Date(`${birthDate}T${birthTime}:00`);
-    const ts = Math.floor(dt.getTime() / 1000);
-    return Number.isFinite(ts) ? ts : null;
-  } catch {
+// ----------------------------- Providers ------------------------------
+
+/**
+ * GeoNames historical timezone.
+ * API: http://api.geonames.org/timezoneJSON?lat=..&lng=..&date=YYYY-MM-DD&username=...
+ * Relevant fields (example):
+ *   - time: "2025-08-04 10:31"
+ *   - dstOffset: -3   (hours)
+ *   - gmtOffset: -3   (hours)
+ *   - rawOffset: -3   (hours)
+ *   - timezoneId: "America/Sao_Paulo"
+ *
+ * We prefer computing offset = rawOffset (+ DST if present). In practice:
+ *   If dstOffset differs from gmtOffset, daylight saving may be active.
+ */
+async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
+  const qs = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    date, // YYYY-MM-DD
+    username,
+  });
+
+  const url = `http://api.geonames.org/timezoneJSON?${qs.toString()}`;
+
+  const data = await fetchJson(url, { timeoutMs });
+  if (!data) return null;
+
+  if (data.status && data.status.message) {
+    // Known GeoNames error shape
     return null;
   }
+
+  const tzId = orNull(data.timezoneId);
+  // GeoNames returns offsets in HOURS (number). Use dstOffset when present, else gmtOffset.
+  // Documentation: dstOffset is “offset to GMT during Daylight Saving Time”, gmtOffset is “offset to GMT”.
+  const hasDstOffset = isFiniteNum(data.dstOffset);
+  const baseOffsetHours = isFiniteNum(data.gmtOffset) ? data.gmtOffset : data.rawOffset; // hours
+  let finalHours = isFiniteNum(baseOffsetHours) ? baseOffsetHours : null;
+
+  // Some responses provide both gmtOffset and dstOffset; if different, prefer dstOffset (DST active).
+  if (hasDstOffset && isFiniteNum(baseOffsetHours) && data.dstOffset !== data.gmtOffset) {
+    finalHours = data.dstOffset;
+  }
+
+  if (!tzId || !isFiniteNum(finalHours)) return null;
+
+  const offsetMin = Math.round(Number(finalHours) * 60);
+  return { tzId, offsetMin };
 }
 
-/** Minimal validation that we have lat/lng and a birth moment. */
-function canLookup({ lat, lng, birthDate, birthTime }) {
-  const okLat = lat !== undefined && lat !== null && !Number.isNaN(Number(lat));
-  const okLng = lng !== undefined && lng !== null && !Number.isNaN(Number(lng));
-  return !!(okLat && okLng && birthDate && birthTime);
+/**
+ * Google Time Zone API (fallback).
+ * API: https://maps.googleapis.com/maps/api/timezone/json?location=LAT,LNG&timestamp=UNIX&key=API_KEY
+ * Returns:
+ *  - timeZoneId
+ *  - rawOffset (seconds)
+ *  - dstOffset (seconds)
+ */
+async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
+  const qs = new URLSearchParams({
+    location: `${lat},${lng}`,
+    timestamp: String(timestampSec),
+    key: apiKey,
+  });
+
+  const url = `https://maps.googleapis.com/maps/api/timezone/json?${qs.toString()}`;
+  const data = await fetchJson(url, { timeoutMs });
+  if (!data || data.status !== 'OK') return null;
+
+  const tzId = orNull(data.timeZoneId);
+  const totalOffsetSec = toNum(data.rawOffset, 0) + toNum(data.dstOffset, 0);
+  if (!tzId || !isFiniteNum(totalOffsetSec)) return null;
+
+  const offsetMin = Math.round(totalOffsetSec / 60);
+  return { tzId, offsetMin };
 }
 
-/** Returns the configured fallback (or an empty result). */
-function fallbackResult() {
-  if (FALLBACK_TZ && FALLBACK_OFF !== null) {
-    return { tzId: FALLBACK_TZ, offsetMin: FALLBACK_OFF };
+// ----------------------------- Utilities ------------------------------
+
+/** Static fallback or null if not configured. */
+function staticFallbackOrNull() {
+  if (FALLBACK_TZ && isFiniteNum(FALLBACK_OFF)) {
+    return { tzId: FALLBACK_TZ, offsetMin: Number(FALLBACK_OFF) };
   }
   return { tzId: null, offsetMin: null };
 }
 
-/* -------------------------------------------------------------------------- */
-/* GeoNames lookup (historical by date)                                       */
-/* -------------------------------------------------------------------------- */
-
-async function resolveViaGeoNames({ lat, lng, birthDate, timeoutMs }) {
-  if (!GEONAMES_USERNAME) return null;
-
-  // GeoNames uses "date" = YYYY-MM-DD; it returns gmtOffset for that day.
-  const url =
-    `${GEONAMES_HOST}/timezoneJSON?` +
-    `lat=${encodeURIComponent(Number(lat))}` +
-    `&lng=${encodeURIComponent(Number(lng))}` +
-    `&date=${encodeURIComponent(birthDate)}` +
-    `&username=${encodeURIComponent(GEONAMES_USERNAME)}`;
-
+/** Fetch JSON with a hard timeout (AbortController). Returns parsed object or null on any failure. */
+async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body } = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, timeoutMs);
-    let data = {};
-    try { data = await resp.json(); } catch { data = {}; }
-
-    // GeoNames returns HTTP 200 even on some errors; check for "status" field.
-    if (!resp.ok || data.status || (!data.timezoneId && data.gmtOffset == null)) {
-      // Log only high-level info; avoid leaking coordinates on failure logs in verbose environments.
-      console.error('[TZ][GeoNames][ERR]', {
-        http: resp.status,
-        geonamesStatus: data.status?.message || data.status || 'invalid_payload',
-      });
-      return null;
-    }
-
-    const tzId = (data.timezoneId && String(data.timezoneId)) || null;
-
-    // Prefer gmtOffset (hours) for the *date* provided. Falls back to rawOffset/dstOffset if needed.
-    let offsetMin = null;
-
-    if (data.gmtOffset != null) {
-      offsetMin = toMinutes(data.gmtOffset);
-    } else if (data.rawOffset != null || data.dstOffset != null) {
-      const rawH = Number(data.rawOffset) || 0;
-      const dstH = Number(data.dstOffset) || 0;
-      offsetMin = toMinutes(rawH + dstH);
-    }
-
-    if (tzId && Number.isFinite(offsetMin)) {
-      return { tzId, offsetMin };
-    }
+    const resp = await fetch(url, {
+      method,
+      headers: { Accept: 'application/json', ...(headers || {}) },
+      body,
+      signal: ctrl.signal,
+    });
+    const ctOk = resp.headers.get('content-type')?.includes('application/json');
+    const data = ctOk ? await resp.json().catch(() => null) : null;
+    if (!resp.ok) return null;
+    return data || null;
+  } catch {
     return null;
-  } catch (e) {
-    console.error('[TZ][GeoNames][NET]', e?.message || e);
-    return null;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Google Time Zone API (fallback when GeoNames is not configured)            */
-/* -------------------------------------------------------------------------- */
-
-async function resolveViaGoogle({ lat, lng, birthDate, birthTime, apiKey, timeoutMs }) {
-  if (!apiKey) return null;
-
-  const ts = toUnixSeconds(birthDate, birthTime);
-  if (!Number.isFinite(ts)) return null;
-
-  const url =
-    'https://maps.googleapis.com/maps/api/timezone/json' +
-    `?location=${encodeURIComponent(Number(lat))},${encodeURIComponent(Number(lng))}` +
-    `&timestamp=${encodeURIComponent(ts)}` +
-    `&key=${encodeURIComponent(apiKey)}`;
-
-  try {
-    const resp = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, timeoutMs);
-    let data = {};
-    try { data = await resp.json(); } catch { data = {}; }
-
-    if (!resp.ok || data.status !== 'OK') {
-      console.error('[TZ][Google][ERR]', {
-        http: resp.status,
-        status: data.status,
-        message: data.errorMessage || data.message,
-      });
-      return null;
-    }
-
-    const totalOffsetSec = (Number(data.rawOffset) || 0) + (Number(data.dstOffset) || 0);
-    const offsetMin = Math.round(totalOffsetSec / 60);
-    const tzId = (data.timeZoneId && String(data.timeZoneId)) || null;
-
-    if (tzId && Number.isFinite(offsetMin)) {
-      return { tzId, offsetMin };
-    }
-    return null;
-  } catch (e) {
-    console.error('[TZ][Google][NET]', e?.message || e);
-    return null;
-  }
+/** Convert ISO date + HH:MM to UNIX seconds (UTC-safe). */
+function toUnixTimestampSec(yyyyMMdd, hhmm) {
+  // Build a local naive date; timezone API will interpret timestamp as UTC reference.
+  const [h, m] = String(hhmm).split(':').map((n) => parseInt(n, 10));
+  const d = new Date(`${yyyyMMdd}T${pad2(h)}:${pad2(m)}:00Z`); // use Z to avoid local TZ skew
+  return Math.floor(d.getTime() / 1000);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Public API                                                                 */
-/* -------------------------------------------------------------------------- */
-
-/**
- * getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey })
- * - Returns { tzId, offsetMin } or a fallback/nulls when not resolvable.
- * - apiKey is used only for the Google fallback; GeoNames uses GEONAMES_USERNAME.
- */
-async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
-  if (!canLookup({ lat, lng, birthDate, birthTime })) {
-    return fallbackResult();
-  }
-
-  // 1) Prefer GeoNames (historical by date)
-  const gn = await resolveViaGeoNames({ lat, lng, birthDate, timeoutMs: DEFAULT_TIMEOUT_MS });
-  if (gn) return gn;
-
-  // 2) Fallback to Google Time Zone API (requires apiKey)
-  const gg = await resolveViaGoogle({ lat, lng, birthDate, birthTime, apiKey, timeoutMs: DEFAULT_TIMEOUT_MS });
-  if (gg) return gg;
-
-  // 3) Final fallback (configured static default or nulls)
-  return fallbackResult();
+function pad2(n) {
+  const s = String(n);
+  return s.length === 1 ? `0${s}` : s;
 }
 
-module.exports = { getTimezoneAtMoment };
+function isIsoDate(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function isHHmm(s) {
+  if (typeof s !== 'string' || !/^\d{2}:\d{2}$/.test(s)) return false;
+  const [h, m] = s.split(':').map((n) => parseInt(n, 10));
+  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+}
+
+function toInt(v, def) {
+  const n = Number.parseInt(String(v ?? ''), 10);
+  return Number.isFinite(n) ? n : def;
+}
+function toNum(v, def = NaN) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+function isFiniteNum(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+function orNull(v) {
+  const s = (v ?? '').toString().trim();
+  return s ? s : null;
+}
