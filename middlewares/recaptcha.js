@@ -1,46 +1,55 @@
 'use strict';
 
-// Add a temporary logger to help debug the environment.
-const debugLogger = require('console');
-
 /**
- * reCAPTCHA Enterprise (compat) verification middleware
- * -----------------------------------------------------
- * What it does
- * - Extracts the captcha token from common client keys.
- * - Calls Google's Enterprise siteverify endpoint with RECAPTCHA_SECRET.
- * - Enforces a minimum score (configurable via RECAPTCHA_MIN_SCORE).
- * - Optionally enforces the expected "action" when the client provides one.
+ * reCAPTCHA verification middleware
+ * ---------------------------------
+ * Supports reCAPTCHA v3 (classic) by default, with optional Enterprise mode.
+ * It validates the token sent by the client, enforces a minimum score, and can
+ * optionally verify the expected action and hostname.
  *
- * Environment
- * - RECAPTCHA_SECRET      → MUST be the Secret Key of the SAME Enterprise key used on the frontend.
- * - RECAPTCHA_MIN_SCORE   → optional (default: 0.5)
+ * Environment variables:
+ *  - RECAPTCHA_MODE          : 'classic' (default) | 'enterprise'
+ *  - RECAPTCHA_SECRET        : required; must match the key type used on the frontend
+ *  - RECAPTCHA_MIN_SCORE     : optional; minimum score threshold (default: 0.5)
+ *  - RECAPTCHA_EXPECT_ACTION : optional; enforce a specific action (e.g., 'birthchart_submit')
+ *  - RECAPTCHA_EXPECT_HOST   : optional; enforce the hostname returned by Google
+ *  - RECAPTCHA_BYPASS        : 'true' to bypass verification (DEV only)
  *
- * Usage
- * router.post('/birthchartsubmit-form', recaptchaVerify(), controller.processForm)
+ * Example usage:
+ *   router.post('/birthchart/birthchartsubmit-form', recaptchaVerify(), controller.processForm);
  */
 
+const MODE = (process.env.RECAPTCHA_MODE || 'classic').toLowerCase(); // 'classic' | 'enterprise'
 const DEFAULT_MIN_SCORE = Number.isFinite(Number(process.env.RECAPTCHA_MIN_SCORE))
   ? Number(process.env.RECAPTCHA_MIN_SCORE)
   : 0.5;
 
-// Enterprise "compat" verification endpoint
-const VERIFY_URL = 'https://www.google.com/recaptcha/enterprise/siteverify';
+const VERIFY_URLS = {
+  classic: 'https://www.google.com/recaptcha/api/siteverify',
+  enterprise: 'https://www.google.com/recaptcha/enterprise/siteverify',
+};
 
+const VERIFY_URL = VERIFY_URLS[MODE] || VERIFY_URLS.classic;
+
+/**
+ * Mirrors a request identifier back in the response headers if present.
+ * Returns the resolved request id (or undefined).
+ */
 function echoRequestId(req, res) {
   const rid = req.requestId || req.get?.('x-request-id') || req.get?.('x-correlation-id');
   if (rid) res.set('X-Request-Id', String(rid));
   return rid;
 }
 
+/**
+ * Extracts the reCAPTCHA token from common request body keys.
+ * Prioritizes keys used by the current frontend.
+ */
 function pickCaptchaToken(body = {}) {
   const c =
     body.recaptcha_token ??
     body.recaptchaToken ??
-    body.captcha_token ??
-    body.captchaToken ??
     body['g-recaptcha-response'] ??
-    body.g_recaptcha_response ??
     body.captcha ??
     null;
 
@@ -49,10 +58,29 @@ function pickCaptchaToken(body = {}) {
   return s.length ? s : null;
 }
 
-function getClientIp(req) {
-  return req.ip || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.connection?.remoteAddress || undefined;
+/**
+ * Extracts the expected action, if provided by the client.
+ */
+function pickExpectedAction(reqBody = {}) {
+  return reqBody.recaptcha_action || reqBody.action || undefined;
 }
 
+/**
+ * Attempts to resolve the client IP address in a proxy-aware manner.
+ */
+function getClientIp(req) {
+  return (
+    req.ip ||
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.connection?.remoteAddress ||
+    undefined
+  );
+}
+
+/**
+ * Calls Google's siteverify endpoint with the provided token and secret.
+ * Returns a normalized transport result { ok, data, status }.
+ */
 async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }) {
   const params = new URLSearchParams();
   params.append('secret', String(secret));
@@ -75,22 +103,72 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
   }
 
   let data = {};
-  try { data = await resp.json(); } catch { /* keep empty */ }
+  try {
+    data = await resp.json();
+  } catch {
+    /* swallow JSON errors and keep data empty */
+  }
   return { ok: resp.ok, data, status: resp.status };
 }
 
+/**
+ * Normalizes Google's response into a single shape:
+ *  {
+ *    success: boolean,
+ *    score?: number,
+ *    action?: string,
+ *    hostname?: string,
+ *    challenge_ts?: string,
+ *    error_codes?: string[]
+ *  }
+ */
+function normalizeGoogleResponse(raw) {
+  if (!raw || typeof raw !== 'object') return { success: false };
+
+  // Enterprise: values live under tokenProperties and riskAnalysis
+  if (MODE === 'enterprise' && raw.tokenProperties) {
+    const { valid, action, hostname, createTime } = raw.tokenProperties;
+    const score = raw.riskAnalysis?.score;
+    return {
+      success: !!valid,
+      score: Number.isFinite(Number(score)) ? Number(score) : undefined,
+      action,
+      hostname,
+      challenge_ts: createTime,
+      error_codes: Array.isArray(raw['error-codes']) ? raw['error-codes'] : undefined,
+    };
+  }
+
+  // Classic v3 response
+  return {
+    success: !!raw.success,
+    score: Number.isFinite(Number(raw.score)) ? Number(raw.score) : undefined,
+    action: raw.action,
+    hostname: raw.hostname,
+    challenge_ts: raw.challenge_ts,
+    error_codes: Array.isArray(raw['error-codes']) ? raw['error-codes'] : undefined,
+  };
+}
+
+/**
+ * Factory that returns the Express middleware which validates reCAPTCHA.
+ * - Validates presence of secret and token
+ * - Verifies token with Google
+ * - Enforces minimum score, action, and hostname (if configured)
+ * - Attaches verification info to req.recaptcha on success
+ */
 function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}) {
   return async function recaptchaVerifyMiddleware(req, res, next) {
     const rid = echoRequestId(req, res);
-    
-    // START DEBUGGING LOGS
-    debugLogger.log('--- RECAPTCHA DEBUG: Starting verification process ---');
-    debugLogger.log(`RECAPTCHA_SECRET (read from env): ${process.env.RECAPTCHA_SECRET ? 'SET' : 'NOT SET'}`);
-    debugLogger.log(`RECAPTCHA_MIN_SCORE (read from env): ${process.env.RECAPTCHA_MIN_SCORE}`);
-    
+
+    // Explicit opt-out for local development only
+    if (String(process.env.RECAPTCHA_BYPASS).toLowerCase() === 'true') {
+      req.recaptcha = { success: true, bypass: true };
+      return next();
+    }
+
     const secret = process.env.RECAPTCHA_SECRET;
     if (!secret) {
-      debugLogger.log('RECAPTCHA DEBUG: Secret is NOT set. Returning 500.');
       return res.status(500).json({
         error: 'recaptcha_misconfigured',
         message: 'Server reCAPTCHA secret not configured',
@@ -99,10 +177,7 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
     }
 
     const token = pickCaptchaToken(req.body || {});
-    debugLogger.log(`RECAPTCHA DEBUG: Token received? ${!!token}`);
-    
     if (!token) {
-      debugLogger.log('RECAPTCHA DEBUG: Token is missing. Returning 400.');
       return res.status(400).json({
         error: 'recaptcha_missing',
         message: 'reCAPTCHA token is missing',
@@ -110,17 +185,21 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
       });
     }
 
-    try {
-      debugLogger.log(`RECAPTCHA DEBUG: Attempting to verify token with Google...`);
-      const remoteip = getClientIp(req);
-      const { ok, data, status } = await verifyWithGoogle({
-        secret, response: token, remoteip, timeoutMs,
-      });
-      debugLogger.log(`RECAPTCHA DEBUG: Google API call complete. Status: ${status}, OK: ${ok}`);
-      debugLogger.log('RECAPTCHA DEBUG: Google API response data:', data);
+    const expectedActionFromBody = pickExpectedAction(req.body || {});
+    const expectedActionFromEnv = process.env.RECAPTCHA_EXPECT_ACTION;
+    const expectedAction = expectedActionFromBody || expectedActionFromEnv || undefined;
 
+    try {
+      const remoteip = getClientIp(req);
+      const { ok, data } = await verifyWithGoogle({
+        secret,
+        response: token,
+        remoteip,
+        timeoutMs,
+      });
+
+      // Treat network/server issues as 400 to preserve CORS behavior across proxies
       if (!ok) {
-        debugLogger.log('RECAPTCHA DEBUG: Response from Google was not OK. Returning 400.');
         return res.status(400).json({
           error: 'recaptcha_unavailable',
           message: 'reCAPTCHA verification unavailable, please try again',
@@ -128,62 +207,65 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      if (!data || data.success !== true) {
-        debugLogger.log('RECAPTCHA DEBUG: Verification failed. Data success is not true.');
-        debugLogger.log('RECAPTCHA DEBUG: Error codes:', data?.['error-codes']);
+      const norm = normalizeGoogleResponse(data);
+
+      if (!norm.success) {
         return res.status(400).json({
           error: 'recaptcha_failed',
           message: 'reCAPTCHA verification failed',
-          details: Array.isArray(data?.['error-codes']) ? { codes: data['error-codes'] } : undefined,
+          details: norm.error_codes ? { codes: norm.error_codes } : undefined,
           request_id: rid,
         });
       }
 
-      const score = Number(data.score);
-      if (Number.isFinite(score) && score < Number(minScore)) {
-        debugLogger.log(`RECAPTCHA DEBUG: Low score. Score: ${score}, Min Score: ${minScore}.`);
+      if (Number.isFinite(norm.score) && norm.score < Number(minScore)) {
         return res.status(400).json({
           error: 'recaptcha_low_score',
           message: 'reCAPTCHA score too low',
-          details: { score },
+          details: { score: norm.score },
           request_id: rid,
         });
       }
 
-      const expectedAction =
-        (req.body && (req.body.recaptcha_action || req.body.action)) || undefined;
-      if (expectedAction && data.action && String(data.action) !== String(expectedAction)) {
-        debugLogger.log(`RECAPTCHA DEBUG: Action mismatch. Expected: ${expectedAction}, Got: ${data.action}.`);
+      if (expectedAction && norm.action && String(norm.action) !== String(expectedAction)) {
         return res.status(400).json({
           error: 'recaptcha_action_mismatch',
           message: 'reCAPTCHA action mismatch',
-          details: { expected: String(expectedAction), got: String(data.action) },
+          details: { expected: String(expectedAction), got: String(norm.action) },
           request_id: rid,
         });
       }
 
-      debugLogger.log(`RECAPTCHA DEBUG: Verification SUCCESSFUL! Score: ${score}`);
+      const expectHost = process.env.RECAPTCHA_EXPECT_HOST;
+      if (expectHost && norm.hostname && String(norm.hostname) !== String(expectHost)) {
+        return res.status(400).json({
+          error: 'recaptcha_hostname_mismatch',
+          message: 'reCAPTCHA hostname mismatch',
+          details: { expected: String(expectHost), got: String(norm.hostname) },
+          request_id: rid,
+        });
+      }
+
+      // Attach verification details for downstream handlers
       req.recaptcha = {
         success: true,
-        score: Number.isFinite(score) ? score : undefined,
-        action: data.action || undefined,
-        timestamp: data.challenge_ts || undefined,
-        hostname: data.hostname || undefined,
+        mode: MODE,
+        score: norm.score,
+        action: norm.action,
+        timestamp: norm.challenge_ts,
+        hostname: norm.hostname,
+        remoteip,
       };
 
       return next();
     } catch (err) {
       const isAbort = err?.name === 'AbortError';
-      debugLogger.error(`RECAPTCHA DEBUG: Caught error: ${err.message}, isAbort: ${isAbort}`);
-      
-      // Return 400 to avoid proxies stripping CORS headers on 5xx.
       return res.status(400).json({
         error: isAbort ? 'recaptcha_timeout' : 'recaptcha_error',
         message: isAbort ? 'reCAPTCHA verification timed out' : 'reCAPTCHA verification error',
         request_id: rid,
       });
     }
-    // END DEBUGGING LOGS
   };
 }
 
