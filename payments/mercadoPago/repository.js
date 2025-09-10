@@ -1,21 +1,21 @@
 // payments/mercadoPago/repository.js
 'use strict';
 
+const crypto = require('crypto');
 const db = require('../../db/db');
 
 /**
  * Repository: Mercado Pago
  * ------------------------
- * Security & integrity principles:
- * - Never persist secrets/tokens/signatures in DB (redact headers & JSON).
- * - Keep canonical business fields in typed columns; store provider "raw" JSON sanitized.
- * - Enforce idempotency at the DB layer:
- *     * mp_events(provider_event_uid)        => UNIQUE (append-only; ignore duplicates)
- *     * mp_payments(payment_id)              => UNIQUE (UPSERT)
- *     * mp_request(preference_id)            => UNIQUE (UPSERT)
+ * Security & integrity:
+ * - Do not store secrets/tokens/signatures (redact headers & JSON).
+ * - Keep canonical fields in columns; store sanitized provider JSON in `raw`.
+ * - Enforce DB-level idempotency via UNIQUE constraints.
  *
- * NOTE: The SQL here assumes proper UNIQUE constraints exist. If they don’t,
- *       please add them in migrations to guarantee idempotency.
+ * Tables expected:
+ *   - mp_events(provider_event_uid) UNIQUE
+ *   - mp_payments(payment_id) UNIQUE
+ *   - mp_request(preference_id) UNIQUE
  */
 
 // ------------------------------- Sanitization helpers --------------------------------
@@ -98,13 +98,8 @@ function maskDigits(value, visible = 2) {
   const keep = Math.min(visible, s.length);
   return '*'.repeat(s.length - keep) + s.slice(-keep);
 }
-
-function maskPhone(value) {
-  return maskDigits(value, 4);
-}
-function maskTaxId(value) {
-  return maskDigits(value, 3);
-}
+function maskPhone(value) { return maskDigits(value, 4); }
+function maskTaxId(value) { return maskDigits(value, 3); }
 
 function maskValueByKey(key, value) {
   const k = String(key).toLowerCase();
@@ -139,27 +134,53 @@ function safeJsonStringify(obj) {
   }
 }
 
-function sanitizeForStorage(obj) {
-  return sanitizeJson(obj);
-}
-function sanitizeQuery(obj) {
-  return sanitizeJson(obj);
-}
+function sanitizeForStorage(obj) { return sanitizeJson(obj); }
+function sanitizeQuery(obj) { return sanitizeJson(obj); }
 
 const toNumberOrNull = (v) => (v == null || v === '' ? null : Number(v));
+
+// ------------------------------- Hashing helpers (bytea) --------------------------------
+
+/**
+ * SHA-256 digest (Buffer) for low-trust PII lookups.
+ * - email: lowercased and trimmed
+ * - tax_id: digits-only
+ */
+function sha256Buffer(input) {
+  return crypto.createHash('sha256').update(input).digest();
+}
+
+function hashEmail(email) {
+  if (!email) return null;
+  const normalized = String(email).trim().toLowerCase();
+  if (!normalized) return null;
+  return sha256Buffer(normalized);
+}
+
+function onlyDigits(s) {
+  return String(s || '').replace(/\D+/g, '');
+}
+function hashTaxId(doc) {
+  const digits = onlyDigits(doc);
+  if (!digits) return null;
+  return sha256Buffer(digits);
+}
+
+// ------------------------------- Date helpers --------------------------------
+
+function toDateOrNull(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
 
 // -------------------------------- Repository functions --------------------------------
 
 /**
  * createCheckout
  * --------------
- * Upsert the "created preference" record in mp_request.
- * Idempotent by UNIQUE(preference_id).
- *
- * Expected fields:
- *  - request_id (int FK to your application request)
- *  - external_reference (TEXT from MP; do not coerce to int)
- *  - product_type, preference_id, status, value (cents), link, customer (json), raw (json)
+ * Upsert the "created preference" record in mp_request (UNIQUE by preference_id).
+ * - Overwrites `raw` with the latest snapshot.
  */
 async function createCheckout({
   request_id,
@@ -212,7 +233,7 @@ async function createCheckout({
  * logEvent
  * --------
  * Append-only log of provider events. Idempotent by UNIQUE(provider_event_uid).
- * Returns the inserted row; returns null if it was a duplicate (DO NOTHING).
+ * Returns inserted row; returns null if duplicate.
  */
 async function logEvent({ event_uid, topic, action, preference_id, payment_id, headers, query, payload }) {
   const sql = `
@@ -235,26 +256,27 @@ async function logEvent({ event_uid, topic, action, preference_id, payment_id, h
     action || null,
     preference_id || null,
     payment_id || null,
-    null, // merchant_order_id is unused for payment webhooks; keep for schema compatibility
+    null, // merchant_order_id unused (kept for schema compatibility)
     safeHeaders || null,
     safeQuery || null,
     safePayload || null,
   ];
 
   const { rows } = await db.query(sql, params);
-  return rows[0] || null; // null => duplicate
+  return rows[0] || null;
 }
 
 /**
  * updateRequestStatusByPreferenceId
  * ---------------------------------
- * Update mp_request by preference_id (idempotent per row).
+ * Overwrite `raw` with latest snapshot; DO NOT preserve old raw here
+ * (history lives in mp_events).
  */
 async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
   const sql = `
     UPDATE mp_request
        SET status = $2,
-           raw = COALESCE($3, mp_request.raw),
+           raw = $3,
            updated_at = NOW()
      WHERE preference_id = $1
     RETURNING *;
@@ -267,14 +289,13 @@ async function updateRequestStatusByPreferenceId(preference_id, status, raw) {
 /**
  * updateRequestStatusByRequestId (legacy/internal)
  * -----------------------------------------------
- * Update mp_request by INTERNAL request_id (int FK).
- * Prefer using updateRequestStatusByExternalReference for MP-facing flows.
+ * Overwrite `raw` with latest snapshot; marked as legacy.
  */
 async function updateRequestStatusByRequestId(request_id, status, raw) {
   const sql = `
     UPDATE mp_request
        SET status = $2,
-           raw = COALESCE($3, mp_request.raw),
+           raw = $3,
            updated_at = NOW()
      WHERE request_id = $1
     RETURNING *;
@@ -287,13 +308,13 @@ async function updateRequestStatusByRequestId(request_id, status, raw) {
 /**
  * updateRequestStatusByExternalReference (preferred)
  * -------------------------------------------------
- * Update mp_request by EXTERNAL reference (TEXT from MP).
+ * Overwrite `raw` with latest snapshot.
  */
 async function updateRequestStatusByExternalReference(external_reference, status, raw) {
   const sql = `
     UPDATE mp_request
        SET status = $2,
-           raw = COALESCE($3, mp_request.raw),
+           raw = $3,
            updated_at = NOW()
      WHERE external_reference = $1
     RETURNING *;
@@ -306,8 +327,10 @@ async function updateRequestStatusByExternalReference(external_reference, status
 /**
  * upsertPaymentByPaymentId
  * ------------------------
- * Idempotent UPSERT by UNIQUE(payment_id).
- * IMPORTANT: keep parameter order aligned with the INSERT.
+ * UPSERT by UNIQUE(payment_id).
+ * - Masks PII before storing in text columns.
+ * - Stores SHA-256 hashes (Buffer) in *_hash columns for lookups without PII.
+ * - Overwrites `raw` with latest snapshot.
  */
 async function upsertPaymentByPaymentId({
   payment_id,
@@ -322,19 +345,33 @@ async function upsertPaymentByPaymentId({
   date_last_updated, // ISO string or Date
   raw,
 }) {
+  // Prepare sanitized customer fields (text columns receive masked values)
+  const maskedName   = customer?.name ?? null; // name can be stored as-is (not unique PII); mask if desired
+  const maskedEmail  = customer?.email ? maskEmail(customer.email) : null;
+  const maskedTaxId  = customer?.tax_id ? maskTaxId(customer.tax_id) : null;
+
+  // Prepare secure hashes from original values (for deterministic lookups)
+  const emailHash = customer?.email ? hashEmail(customer.email) : null;          // bytea
+  const taxIdHash = customer?.tax_id ? hashTaxId(customer.tax_id) : null;        // bytea
+
+  const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
+  const safeRaw = raw ? sanitizeForStorage(raw) : null;
+
   const sql = `
     INSERT INTO mp_payments (
       payment_id, preference_id, status, status_detail, external_reference,
       customer_name, customer_email, customer_tax_id,
       customer_phone_country, customer_phone_area, customer_phone_number,
       customer_address_json, transaction_amount,
-      date_created, date_approved, date_last_updated, raw
+      date_created, date_approved, date_last_updated, raw,
+      customer_email_hash, customer_tax_id_hash
     ) VALUES (
       $1,$2,$3,$4,$5,
       $6,$7,$8,
       $9,$10,$11,
       $12,$13,
-      $14,$15,$16,$17
+      $14,$15,$16,$17,
+      $18,$19
     )
     ON CONFLICT (payment_id) DO UPDATE SET
       status                 = EXCLUDED.status,
@@ -353,12 +390,11 @@ async function upsertPaymentByPaymentId({
       customer_address_json  = COALESCE(EXCLUDED.customer_address_json, mp_payments.customer_address_json),
       transaction_amount     = COALESCE(EXCLUDED.transaction_amount, mp_payments.transaction_amount),
       raw                    = EXCLUDED.raw,
+      customer_email_hash    = COALESCE(EXCLUDED.customer_email_hash, mp_payments.customer_email_hash),
+      customer_tax_id_hash   = COALESCE(EXCLUDED.customer_tax_id_hash, mp_payments.customer_tax_id_hash),
       updated_at             = NOW()
     RETURNING *;
   `;
-
-  const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
-  const safeRaw = raw ? sanitizeForStorage(raw) : null;
 
   const values = [
     payment_id,
@@ -367,9 +403,9 @@ async function upsertPaymentByPaymentId({
     status_detail ?? null,
     external_reference ?? null,
 
-    customer?.name ?? null,
-    customer?.email ?? null,
-    customer?.tax_id ?? null,
+    maskedName,
+    maskedEmail,
+    maskedTaxId,
 
     customer?.phone_country ?? null,
     customer?.phone_area ?? null,
@@ -378,11 +414,14 @@ async function upsertPaymentByPaymentId({
     safeAddress,
     toNumberOrNull(transaction_amount),
 
-    date_created ?? null,
-    date_approved ?? null,
-    date_last_updated ?? null,
+    toDateOrNull(date_created),
+    toDateOrNull(date_approved),
+    toDateOrNull(date_last_updated),
 
     safeRaw,
+
+    emailHash, // bytea
+    taxIdHash, // bytea
   ];
 
   const { rows } = await db.query(sql, values);
@@ -393,7 +432,6 @@ async function upsertPaymentByPaymentId({
  * findByPaymentId
  * ---------------
  * Fetch a payment and join the related request (by preference_id or external_reference).
- * Uses external_reference join to avoid int/text casts and to match MP semantics.
  */
 async function findByPaymentId(payment_id) {
   const sql = `
@@ -458,7 +496,7 @@ async function findByExternalReference(external_reference) {
 /**
  * attachPaymentToPreference
  * -------------------------
- * Attach a payment to a preference after-the-fact (when discovered later).
+ * Attach a payment to a preference discovered later.
  */
 async function attachPaymentToPreference(payment_id, preference_id) {
   const sql = `
@@ -478,7 +516,7 @@ module.exports = {
   logEvent,
   updateRequestStatusByPreferenceId,
   updateRequestStatusByRequestId,          // legacy/internal
-  updateRequestStatusByExternalReference,  // preferred for MP
+  updateRequestStatusByExternalReference,  // preferred
   findByExternalReference,
 
   // payments
