@@ -28,6 +28,7 @@ const SENSITIVE_HEADER_SET = new Set([
   'x-access-token',
   'x-client-secret',
   'x-signature',
+  'x-authenticity-token', // PagBank signature header must never be persisted
 ]);
 
 function sanitizeHeaders(headers) {
@@ -135,20 +136,16 @@ const toNumberOrNull = (v) => (v == null || v === '' ? null : Number(v));
 
 // --------------------------------- Hash helpers (bytea) ---------------------------------
 
-function sha256Buffer(input) {
-  return crypto.createHash('sha256').update(input).digest();
-}
-function hashEmail(email) {
-  if (!email) return null;
-  const normalized = String(email).trim().toLowerCase();
-  if (!normalized) return null;
-  return sha256Buffer(normalized);
+function sha256BufferNormalizedLower(value) {
+  if (!value) return null;
+  const buf = Buffer.from(String(value).trim().toLowerCase(), 'utf8');
+  return crypto.createHash('sha256').update(buf).digest(); // Buffer (bytea)
 }
 function onlyDigits(s) { return String(s || '').replace(/\D+/g, ''); }
-function hashTaxId(doc) {
-  const digits = onlyDigits(doc);
+function sha256BufferDigits(value) {
+  const digits = onlyDigits(value);
   if (!digits) return null;
-  return sha256Buffer(digits);
+  return crypto.createHash('sha256').update(Buffer.from(digits, 'utf8')).digest();
 }
 
 // ------------------------------------- Repository API -------------------------------------
@@ -204,13 +201,13 @@ async function createCheckout({
 /**
  * updateCheckoutStatusById
  * ------------------------
- * Update status by checkout_id; raw is overwritten with the latest snapshot.
+ * Update status by checkout_id; raw is preserved unless a non-null is provided.
  */
 async function updateCheckoutStatusById(checkout_id, status, raw) {
   const sql = `
     UPDATE pagbank_request
        SET status = $2,
-           raw    = $3,
+           raw    = COALESCE($3, pagbank_request.raw),
            updated_at = NOW()
      WHERE checkout_id = $1
     RETURNING *;
@@ -269,8 +266,8 @@ async function logEvent({
  * upsertPaymentByChargeId
  * -----------------------
  * UPSERT by UNIQUE(charge_id).
- * - Masks PII into text columns.
- * - Best-effort: updates *_hash columns (bytea) if they exist (no hard dependency).
+ * - Persist canonical customer columns (not masked) for reconciliation.
+ * - Also persist privacy-preserving hashes (bytea): customer_email_hash / customer_tax_id_hash.
  * - Overwrites `raw` with the latest snapshot.
  */
 async function upsertPaymentByChargeId({
@@ -281,27 +278,26 @@ async function upsertPaymentByChargeId({
   customer,
   raw,
 }) {
-  const maskedName  = customer?.name ?? null; // keep as-is; can be masked if required
-  const maskedEmail = customer?.email ? maskEmail(customer.email) : null;
-  const maskedTaxId = customer?.tax_id ? maskTaxId(customer.tax_id) : null;
-
-  const emailHash = customer?.email ? hashEmail(customer.email) : null;
-  const taxIdHash = customer?.tax_id ? hashTaxId(customer.tax_id) : null;
-
   const safeAddress = customer?.address_json ? sanitizeForStorage(customer.address_json) : null;
   const safeRaw = raw ? sanitizeForStorage(raw) : null;
+
+  // Hashes (bytea) — normalized lowercased email; digits-only tax id
+  const emailHash = sha256BufferNormalizedLower(customer?.email);
+  const taxIdHash = sha256BufferDigits(customer?.tax_id);
 
   const sql = `
     INSERT INTO pagbank_payments (
       charge_id, checkout_id, status, request_ref,
       customer_name, customer_email, customer_tax_id,
       customer_phone_country, customer_phone_area, customer_phone_number,
-      customer_address_json, raw
+      customer_address_json, raw,
+      customer_email_hash, customer_tax_id_hash
     ) VALUES (
       $1,$2,$3,$4,
       $5,$6,$7,
       $8,$9,$10,
-      $11,$12
+      $11,$12,
+      $13,$14
     )
     ON CONFLICT (charge_id) DO UPDATE SET
       status                 = EXCLUDED.status,
@@ -315,6 +311,8 @@ async function upsertPaymentByChargeId({
       customer_phone_number  = COALESCE(EXCLUDED.customer_phone_number, pagbank_payments.customer_phone_number),
       customer_address_json  = COALESCE(EXCLUDED.customer_address_json, pagbank_payments.customer_address_json),
       raw                    = EXCLUDED.raw,
+      customer_email_hash    = COALESCE(EXCLUDED.customer_email_hash, pagbank_payments.customer_email_hash),
+      customer_tax_id_hash   = COALESCE(EXCLUDED.customer_tax_id_hash, pagbank_payments.customer_tax_id_hash),
       updated_at             = NOW()
     RETURNING *;
   `;
@@ -325,9 +323,9 @@ async function upsertPaymentByChargeId({
     status ?? null,
     request_ref ?? null,
 
-    maskedName,
-    maskedEmail,
-    maskedTaxId,
+    customer?.name ?? null,
+    customer?.email ?? null,
+    customer?.tax_id ?? null,
 
     customer?.phone_country ?? null,
     customer?.phone_area ?? null,
@@ -335,26 +333,13 @@ async function upsertPaymentByChargeId({
 
     safeAddress,
     safeRaw,
+
+    emailHash,
+    taxIdHash,
   ];
 
   const { rows } = await db.query(sql, values);
-  const row = rows[0];
-
-  // Best-effort: update *_hash columns if present; ignore errors if columns do not exist.
-  if (emailHash || taxIdHash) {
-    try {
-      await db.query(
-        `UPDATE pagbank_payments
-            SET customer_email_hash = COALESCE($1, customer_email_hash),
-                customer_tax_id_hash = COALESCE($2, customer_tax_id_hash),
-                updated_at = NOW()
-          WHERE charge_id = $3`,
-        [emailHash, taxIdHash, charge_id]
-      );
-    } catch (_) { /* column may not exist yet; intentionally ignored */ }
-  }
-
-  return row;
+  return rows[0];
 }
 
 /**
