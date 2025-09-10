@@ -1,45 +1,45 @@
-// payments/pagBank/router.return.js
+// payments/pagbank/router.return.js
 'use strict';
 
 /**
  * PagBank Return Router
  * ---------------------
- * Purpose
- *  - Handle user redirections coming back from PagBank after checkout.
- *  - Delegate the actual processing to the controller (no business logic here).
- *  - Keep responses non-cacheable and echo a stable correlation id header.
+ * - Handle user redirections after checkout.
+ * - No business logic here: delegate to controller.
+ * - Production niceties: async error capture, HEAD support, no-store caching.
  *
- * Mount point (important):
- *  - This router is mounted under /pagBank (capital B) in the main app:
- *      app.use('/pagBank', pagbankReturnRouter);
+ * Mount point:
+ *   app.use('/pagBank', pagbankReturnRouter);
  *
- * Route
- *  - GET /pagBank/return
+ * Routes:
+ *   GET|HEAD /pagBank/return[/]
  */
 
 const express = require('express');
 const router = express.Router();
-
 const pagbankController = require('./controller');
 
-// Observability middleware: echo correlation id and disable caches
-router.use((req, res, next) => {
-  // Support both properties just in case (req.reqId from correlation middleware; req.requestId used elsewhere)
-  const rid =
-    req.reqId ||
-    req.requestId ||
-    req.get('x-request-id') ||
-    req.get('x-correlation-id');
+/** Wrap async handlers to propagate errors to Express error pipeline. */
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+/** Observability/security headers for all responses from this router. */
+router.use((req, res, next) => {
+  const rid = req.reqId || req.requestId || req.get('x-request-id') || req.get('x-correlation-id');
   if (rid) {
     res.set('X-Request-Id', String(rid));
     res.set('X-Correlation-Id', String(rid));
   }
   res.set('Cache-Control', 'no-store');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Referrer-Policy', 'no-referrer');
   next();
 });
 
-// Main return endpoint (controller decides how to render/redirect)
-router.get('/return', pagbankController.handleReturn);
+/** GET/HEAD aliases (tolerate trailing slash). */
+router.get(['/return', '/return/'], asyncHandler(pagbankController.handleReturn));
+router.head(['/return', '/return/'], asyncHandler(pagbankController.handleReturn));
+
+/** 405 for unsupported methods under this mount. */
+router.all('*', (req, res) => res.status(405).json({ error: 'method_not_allowed' }));
 
 module.exports = router;
