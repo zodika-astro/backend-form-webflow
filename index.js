@@ -19,6 +19,11 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+//remover
+const diag = require('./middlewares/diag');
+app.use(diag());
+//remover
+
 /* -------------------------------- Proxy trust -------------------------------- */
 
 function resolveTrustProxySetting() {
