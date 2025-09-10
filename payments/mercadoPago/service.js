@@ -1,5 +1,3 @@
-// payments/mercadoPago/service.js
-
 'use strict';
 
 /**
@@ -11,7 +9,8 @@
  *   - Emit domain events ("payment:paid") on APPROVED.
  *
  * Non-functional
- *   - Exponential backoff (utils/httpClient) + explicit timeouts.
+ *   - Explicit per-attempt timeout with tight retry policy (fail fast).
+ *   - Deterministic idempotency key based on requestId (dedupe).
  *   - HTTPS URL normalization and length bounds for safety.
  *   - Structured logging with request correlation (no PII).
  *   - Optional Prometheus metrics (gracefully disabled if absent).
@@ -91,14 +90,21 @@ function mapPreferenceStatusFromPayment(paymentStatus) {
   }
 }
 
+/** Build a deterministic idempotency key to dedupe provider retries/resubmits. */
+function buildIdempotencyKey(requestId) {
+  // Keep it short and stable per logical request.
+  return `mp-pref-${String(requestId).slice(0, 64)}`;
+}
+
 /* --------------------------------- API calls --------------------------------------- */
 
 /**
  * Create a hosted checkout preference on Mercado Pago.
  * Notes:
  *   - Amount is provided in cents; we convert to BRL with 2 decimals.
- *   - Boleto is excluded by default (only PIX + credit card).
- *   - Idempotency via `X-Idempotency-Key` to avoid duplicate preferences.
+ *   - PIX and/or credit card; boleto excluded by default.
+ *   - Deterministic idempotency key to avoid duplicate preferences.
+ *   - Tight timeout/retry budget to prevent client-side 499s.
  */
 async function createCheckout(input, ctx = {}) {
   const {
@@ -109,18 +115,30 @@ async function createCheckout(input, ctx = {}) {
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
 
-  if (!requestId) throw AppError.fromUnexpected('mp_checkout_failed', 'requestId is required', { status: 400 });
+  if (!requestId) {
+    throw AppError.fromUnexpected('mp_checkout_failed', 'requestId is required', { status: 400 });
+  }
 
+  // Configuration guardrails — fail early if missing critical secrets.
+  const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN;
+  if (!MP_ACCESS_TOKEN) {
+    throw AppError.fromUnexpected('mp_config_missing', 'MP_ACCESS_TOKEN is not configured', { status: 500 });
+  }
+
+  // Amount comes in cents (integer > 0).
   const valueNum = Number(productValue);
-  if (!Number.isFinite(valueNum) || valueNum <= 0) {
-    throw AppError.fromUnexpected('mp_checkout_failed', 'invalid productValue (cents, integer > 0)', { status: 400 });
+  if (!Number.isFinite(valueNum) || valueNum <= 0 || !Number.isInteger(valueNum)) {
+    throw AppError.fromUnexpected(
+      'mp_checkout_failed',
+      'invalid productValue (must be integer cents > 0)',
+      { status: 400 }
+    );
   }
 
   const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://backend-form-webflow-production.up.railway.app';
 
   // back_urls (validated) + notification target
   const FAILURE_URL = process.env.PAYMENT_FAILURE_URL;
-  // IMPORTANT: match the mount path in index.js -> app.use('/mercadoPago', mpReturnRouter)
   const success = normalizeHttpsUrl(returnUrl) || normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadoPago/return/success`);
   const failure = normalizeHttpsUrl(FAILURE_URL || `${PUBLIC_BASE_URL}/payment-fail`);
   const pending = normalizeHttpsUrl(`${PUBLIC_BASE_URL}/mercadoPago/return/pending`);
@@ -135,31 +153,41 @@ async function createCheckout(input, ctx = {}) {
   // Accept PIX and/or Credit Card; explicitly exclude boleto.
   const allowPix  = !!(paymentOptions && paymentOptions.allow_pix);
   const allowCard = !!(paymentOptions && paymentOptions.allow_card);
-  const maxInst   = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
+  const maxInstRaw = Number((paymentOptions && paymentOptions.max_installments) ?? 1);
+  const maxInst = Number.isFinite(maxInstRaw) ? Math.min(Math.max(1, maxInstRaw), 12) : 1;
 
-  const excluded_payment_types = [{ id: 'ticket' }];
+  const excluded_payment_types = [{ id: 'ticket' }]; // exclude boleto
   if (!allowCard) excluded_payment_types.push({ id: 'credit_card' });
 
   const excluded_payment_methods = [];
   if (!allowPix) excluded_payment_methods.push({ id: 'pix' });
 
+  const payer =
+    (name || email)
+      ? {
+          // Trim to safe lengths for provider UI
+          name: name ? String(name).trim().slice(0, 120) : undefined,
+          email: email ? String(email).trim().slice(0, 180) : undefined,
+        }
+      : undefined;
+
   const payment_methods = {
     excluded_payment_types,
     excluded_payment_methods,
     installments: maxInst,
-    default_installments: Math.min(Math.max(1, maxInst), 12),
+    default_installments: maxInst,
   };
 
   const preferencePayload = {
     external_reference: String(requestId),
     items: [{
-      title: productName || productType || 'Produto',
+      title: (productName || productType || 'Produto').toString().slice(0, 150),
       quantity: 1,
       unit_price: amount,
       currency_id: currency || 'BRL',
       ...(picture_url ? { picture_url } : {}),
     }],
-    payer: (name || email) ? { name, email } : undefined,
+    payer,
     back_urls: { success, failure, pending },
     auto_return: 'approved',
     notification_url: notification_url || undefined,
@@ -172,17 +200,22 @@ async function createCheckout(input, ctx = {}) {
   const t0 = process.hrtime.bigint();
   const url = 'https://api.mercadopago.com/checkout/preferences';
 
+  // Tight budget: 12s per attempt, 1 retry → worst-case ~24s.
+  const PER_ATTEMPT_TIMEOUT_MS = 12_000;
+  const RETRIES = 1;
+
   try {
     const res = await httpClient.post(url, preferencePayload, {
       headers: {
-        Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN || env.MP_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'X-Idempotency-Key': uuid(),
+        // Deterministic idempotency key (per requestId) to dedupe duplicates
+        'X-Idempotency-Key': buildIdempotencyKey(requestId),
       },
-      timeout: 20_000,
-      retries: 2,
-      retryBackoffMs: [0, 250, 700],
+      timeout: PER_ATTEMPT_TIMEOUT_MS,
+      retries: RETRIES,
+      retryBackoffMs: [0, 250], // quick retry only once
     });
 
     observe(op, res?.status, t0);
@@ -202,7 +235,7 @@ async function createCheckout(input, ctx = {}) {
       status: 'CREATED',
       value: valueNum,
       link: initPoint,
-      customer: (name || email) ? { name, email } : null,
+      customer: (payer ? { name: payer.name, email: payer.email } : null),
       raw: data,
     });
 
@@ -227,6 +260,7 @@ async function createCheckout(input, ctx = {}) {
   } catch (e) {
     observe(op, e?.response?.status || 'ERR', t0);
     log.error({ status: e?.response?.status, msg: e?.message }, 'create preference failed');
+
     // Normalize upstream error into AppError with standardized code
     throw AppError.fromUpstream(
       'mp_checkout_failed',
