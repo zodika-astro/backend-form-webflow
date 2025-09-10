@@ -283,4 +283,6 @@ module.exports = function corsPolicy(req, res, next) {
 
   // 4) Delegate to CORS to emit headers (will reflect only if origin is allowed)
   return applyCorsHeaders(req, res, next, normalizedOrigin);
+
+  res.set('Access-Control-Max-Age', '600'); // 10 min
 };
