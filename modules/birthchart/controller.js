@@ -1,13 +1,18 @@
+// modules/birthchart/controller.js
 'use strict';
 
 /**
  * Birthchart Controller
  * ---------------------
- * Responsibilities
+ * Responsibilities (fast path)
  *  - Validate and normalize public form input.
- *  - Resolve timezone at the given birth moment (Google/GeoNames).
- *  - Persist the request record.
+ *  - Persist the request record (with timezone placeholders).
  *  - Create a checkout on the selected PSP (PagBank or Mercado Pago).
+ *  - Return the checkout URL immediately (do not block on timezone).
+ *
+ * Deferred work
+ *  - Timezone resolution is deferred to the post-payment workflow (e.g., payment-approved webhook).
+ *    This keeps form submission fast and avoids long upstream waits on external providers.
  *
  * Non-functional
  *  - Structured logging with request correlation (no PII).
@@ -22,8 +27,12 @@
 
 const { validateBirthchartPayload } = require('./validators');
 const { createBirthchartRequest } = require('./repository');
-const { getTimezoneAtMoment } = require('../../utils/timezone');
-const { get: getSecret } = require('../../config/secretProvider');
+
+// Note: timezone resolution is now deferred. Imports are kept to avoid breaking other flows
+// that may still rely on these modules elsewhere in the app.
+const { getTimezoneAtMoment } = require('../../utils/timezone'); // intentionally unused here (deferred)
+const { get: getSecret } = require('../../config/secretProvider'); // intentionally unused here (deferred)
+
 const { env } = require('../../config/env');
 const { AppError } = require('../../utils/appError');
 
@@ -185,26 +194,10 @@ async function processForm(req, res, next) {
     // 2) Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
 
-    // 3) Resolve timezone (no PII in logs)
-    const googleApiKey = await getSecret('GOOGLE_MAPS_API_KEY').catch((e) => {
-      throw AppError.fromUpstream('secret_fetch_failed', 'Failed to load Google API key', e, { provider: 'secrets' });
-    });
-
-    const tz = await getTimezoneAtMoment({
-      lat: Number(input.birth_place_lat),
-      lng: Number(input.birth_place_lng),
-      birthDate: input.birth_date,
-      birthTime: input.birth_time,
-      apiKey: googleApiKey,
-    }).catch((e) => {
-      throw AppError.fromUpstream('tz_lookup_failed', 'Failed to resolve timezone', e, { provider: 'google_timezone' });
-    });
-
-    if (!tz || !tz.tzId || typeof tz.offsetMin !== 'number') {
-      throw new AppError('tz_invalid', 'Resolved timezone is invalid', 500, { got: tz ? Object.keys(tz) : null });
-    }
-
-    logger.info({ tzId: tz.tzId, offsetMin: tz.offsetMin }, 'timezone resolved');
+    // 3) DEFER timezone resolution to post-payment workflow.
+    //    Persist placeholders now; a webhook/worker should compute and update later.
+    const tz = { tzId: null, offsetMin: null, deferred: true };
+    logger.info({ deferred: true }, 'timezone resolution deferred');
 
     // 4) Persist request (minimal payload in logs; avoid PII)
     const newRequest = await createBirthchartRequest({
@@ -225,6 +218,7 @@ async function processForm(req, res, next) {
       birth_place_lng:      input.birth_place_lng,
       birth_place_json:     input.birth_place_json,
 
+      // placeholders (to be filled after payment approval)
       birth_timezone_id:    tz.tzId,
       birth_utc_offset_min: tz.offsetMin,
     }).catch((e) => {
