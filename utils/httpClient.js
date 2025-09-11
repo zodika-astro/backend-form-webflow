@@ -6,18 +6,17 @@
  * ---------------------------------------------------
  * Goals:
  * - Sensible defaults (timeouts, JSON handling, keep-alive via undici pools).
- * - Robust retries with exponential backoff + jitter for transient failures.
- * - Optional respect for `Retry-After`.
+ * - Opt-in retries with exponential backoff + jitter for transient failures.
+ * - Optional respect for `Retry-After` on 429/5xx/408.
  * - HTTPS-only with a strict allowlist of hosts.
  * - Optional response size guard (Content-Length).
  * - Correlation propagation (X-Request-Id/X-Correlation-Id).
- * - Never logs secrets; only returns response headers/data to the caller.
+ * - Respects upstream AbortSignal (`opts.signal`) for cooperative cancellation.
  *
  * API (unchanged):
  *   const http = require('./utils/httpClient');
- *   await http.get(url, { headers, timeout, retries });
- *   await http.post(url, body, { headers, timeout, retries });
- *   await http.put/patch/delete(...)
+ *   await http.get(url, { headers, timeout, retries, signal });
+ *   await http.post(url, body, { headers, timeout, retries, signal });
  *
  * Return shape (unchanged):
  *   { status, data, headers } on success
@@ -29,18 +28,17 @@ const crypto = require('crypto');
 
 /* -------------------------------- Defaults -------------------------------- */
 
-const DEFAULT_TIMEOUT_MS = 20_000;
-const DEFAULT_RETRIES = 2;
+// Safer defaults para evitar estouro de SLA quando o caller não define timeout/retry.
+const DEFAULT_TIMEOUT_MS = toInt(process.env.HTTP_DEFAULT_TIMEOUT_MS, 10_000); // 10s
+const DEFAULT_RETRIES    = toInt(process.env.HTTP_DEFAULT_RETRIES, 0);        // opt-in
 
-// Retry on these HTTP status codes (transient or rate-limited)
+// Status HTTP típicos para retry (transientes/rate-limited)
 const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-// Maximum allowed response size (based only on Content-Length header).
-// If Content-Length is missing, we don't enforce a hard cap here.
+// Máximo permitido via Content-Length (se ausente, não limitamos).
 const DEFAULT_MAX_RESPONSE_BYTES = 1_500_000; // ~1.5MB
 
-// Allowlist of HTTPS hosts we consider safe to call from this backend.
-// You can override via env: HTTP_ALLOWED_HOSTS="api.mercadopago.com,api.pagbank.com.br"
+// Allowlist de hosts HTTPS (pode sobrescrever via HTTP_ALLOWED_HOSTS)
 const HARDCODED_ALLOWED_HOSTS = new Set([
   'api.mercadopago.com',
   'api.pagbank.com.br',
@@ -63,7 +61,7 @@ function parseRetryAfterMs(hdr) {
   }
   return null;
 }
-function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+function sleep(ms) { return new Promise(res => setTimeout(res, Math.max(0, Number(ms) || 0))); }
 
 function sanitizeHeadersForReturn(headers) {
   const out = {};
@@ -74,9 +72,7 @@ function sanitizeHeadersForReturn(headers) {
 function getAllowedHostsFromEnv(defaultSet) {
   const raw = process.env.HTTP_ALLOWED_HOSTS;
   if (!raw || !raw.trim()) return new Set(defaultSet);
-  return new Set(
-    raw.split(',').map(s => s.trim()).filter(Boolean)
-  );
+  return new Set(raw.split(',').map(s => s.trim()).filter(Boolean));
 }
 
 /**
@@ -90,9 +86,10 @@ function validateHttpsUrl(url, allowedHosts) {
   if ((u.protocol || '').toLowerCase() !== 'https:') {
     throw new Error('Only HTTPS URLs are allowed');
   }
-  const host = u.host; // includes hostname[:port]
+  const host = u.host; // hostname[:port]
   if (!host) throw new Error('URL missing host');
-  if (!allowedHosts.has(host)) {
+  if (!allowedHosts.has(host) && !allowedHosts.has(u.hostname)) {
+    // Accept either "host" or "hostname" forms in allowlist (resilient to ":443")
     throw new Error(`Destination host not allowed: ${host}`);
   }
   return u.toString();
@@ -114,29 +111,37 @@ function isNetworkLikeError(err) {
 /**
  * Perform a single HTTP request (no retries here).
  * - Enforces timeout via AbortController.
+ * - Respects upstream AbortSignal (`upstream`) for cooperative cancellation.
  * - Validates HTTPS + allowed host.
- * - Optionally guards response size using Content-Length header.
+ * - Optional guard for response size using Content-Length header.
  * - Parses JSON when content-type includes application/json, else returns text.
- * - Optionally controls following redirects (default: follow).
+ * - Optionally controls redirects (default: follow). Validates redirect target host.
  */
 async function doFetch(method, url, {
   data,
   headers = {},
   timeout,
   timeoutMs,
+  upstream,                      // <-- new: upstream AbortSignal
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   allowedHosts = HARDCODED_ALLOWED_HOSTS,
   userAgent = 'ZodikaBackend/1.0 (+https://www.zodika.com.br) httpClient',
   followRedirects = true,
 } = {}) {
-  // Validate URL before any network I/O
   const safeUrl = validateHttpsUrl(url, allowedHosts);
 
   const controller = new AbortController();
-  const to = setTimeout(
+  const timer = setTimeout(
     () => controller.abort(new Error('Request timed out')),
     Number(timeoutMs ?? timeout ?? DEFAULT_TIMEOUT_MS)
   );
+
+  // Encadeia cancelamento do chamador (controller, req abort, etc.)
+  const onUpstreamAbort = () => controller.abort(upstream?.reason || new Error('Aborted by upstream'));
+  if (upstream) {
+    if (upstream.aborted) onUpstreamAbort();
+    else upstream.addEventListener('abort', onUpstreamAbort, { once: true });
+  }
 
   try {
     const baseHeaders = new Headers(headers);
@@ -156,13 +161,12 @@ async function doFetch(method, url, {
     if (hasBody) {
       const ct = baseHeaders.get('content-type');
       if (typeof data === 'string' || data instanceof Buffer) {
-        // Respect caller-provided content-type for raw/string payloads
-        body = data;
+        body = data; // caller provided raw payload
       } else if (!ct || ct.includes('application/json')) {
         baseHeaders.set('content-type', 'application/json');
         body = JSON.stringify(data);
       } else {
-        // Caller set another content-type but passed an object; we stringify anyway
+        // caller set another content-type but passed an object; still stringify
         body = JSON.stringify(data);
       }
     }
@@ -175,22 +179,29 @@ async function doFetch(method, url, {
       redirect: followRedirects ? 'follow' : 'manual',
     });
 
-    // If redirected, ensure the final URL host is still allowed
+    // Validate redirect target host is still allowed
     try {
       const final = new URL(res.url);
-      if ((final.protocol || '').toLowerCase() !== 'https:' || !allowedHosts.has(final.host)) {
+      if ((final.protocol || '').toLowerCase() !== 'https:') {
+        const err = new Error('Redirected to non-HTTPS URL');
+        err.response = { status: 497, data: 'Disallowed redirect (non-HTTPS)', headers: sanitizeHeadersForReturn(res.headers) };
+        throw err;
+      }
+      const finalHostAllowed =
+        allowedHosts.has(final.host) || allowedHosts.has(final.hostname);
+      if (!finalHostAllowed) {
         const err = new Error('Redirected to a disallowed host');
         err.response = { status: 497, data: 'Disallowed redirect target', headers: sanitizeHeadersForReturn(res.headers) };
         throw err;
       }
     } catch {
-      // ignore URL parsing issues; undici normally provides a valid res.url
+      // ignore URL parsing issues (undici usually provides a valid res.url)
     }
 
     const ct = res.headers.get('content-type') || '';
     const retHeaders = sanitizeHeadersForReturn(res.headers);
 
-    // Optional response size guard (based on Content-Length only)
+    // Optional response size guard
     const cl = res.headers.get('content-length');
     if (cl && maxResponseBytes && Number(cl) > maxResponseBytes) {
       const error = new Error('Response too large');
@@ -205,7 +216,7 @@ async function doFetch(method, url, {
       return { status: res.status, data: parsed, headers: retHeaders };
     }
 
-    // Non-2xx: build error object with parsed payload (JSON or text)
+    // Non-2xx: include parsed payload (JSON or text)
     const errPayload = ct.includes('application/json')
       ? await res.json().catch(() => ({}))
       : await res.text();
@@ -214,7 +225,8 @@ async function doFetch(method, url, {
     error.response = { status: res.status, data: errPayload, headers: retHeaders };
     throw error;
   } finally {
-    clearTimeout(to);
+    clearTimeout(timer);
+    if (upstream) upstream.removeEventListener?.('abort', onUpstreamAbort);
   }
 }
 
@@ -225,12 +237,7 @@ async function doFetch(method, url, {
  * Retries on:
  *  - 408, 425, 429, 5xx responses
  *  - network/timeout errors
- *
- * Backoff schedule (ms) with jitter:
- *   attempt 0 → 0
- *   attempt 1 → 200-300
- *   attempt 2 → 500-750
- *   attempt 3 → 1000-1500
+ * Respects `opts.signal` for cooperative cancellation across retries.
  */
 async function request(method, url, opts = {}) {
   const {
@@ -245,9 +252,9 @@ async function request(method, url, opts = {}) {
     maxResponseBytes,
     userAgent,
     followRedirects,
+    signal, // <-- upstream AbortSignal suportado
   } = opts;
 
-  // Resolve allowlist from env or use defaults
   const hosts = allowedHosts instanceof Set
     ? allowedHosts
     : getAllowedHostsFromEnv(HARDCODED_ALLOWED_HOSTS);
@@ -264,13 +271,17 @@ async function request(method, url, opts = {}) {
         headers,
         timeout,
         timeoutMs,
+        upstream: signal, // <-- encadeia cancelamento
         allowedHosts: hosts,
         maxResponseBytes: maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
         userAgent,
-        followRedirects: followRedirects !== false, // default true
+        followRedirects: followRedirects !== false, // default: follow
       });
     } catch (err) {
       lastErr = err;
+
+      // Se cancelado pelo upstream, não faz sentido continuar tentando
+      if (signal?.aborted) break;
 
       const status = err?.response?.status;
       const isRetryableStatus = status ? RETRY_STATUS.has(status) : false;
@@ -286,7 +297,7 @@ async function request(method, url, opts = {}) {
       await sleep(delay);
     }
   }
-  throw lastErr;
+  throw lastErr || new Error('http_request_failed_unknown');
 }
 
 /* --------------------------------- Exports --------------------------------- */
@@ -298,3 +309,10 @@ module.exports = {
   patch: (url, data, opts) => request('PATCH', url, { ...opts, data }),
   delete: (url, opts) => request('DELETE', url, opts),
 };
+
+/* --------------------------------- Internals -------------------------------- */
+
+function toInt(v, def) {
+  const n = Number.parseInt(String(v ?? ''), 10);
+  return Number.isFinite(n) ? n : def;
+}
