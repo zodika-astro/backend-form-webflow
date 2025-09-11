@@ -2,21 +2,18 @@
 'use strict';
 
 /**
- * reCAPTCHA verification middleware
- * ---------------------------------
- * Validates client tokens against Google reCAPTCHA.
- * - Supports v3 "classic" (default) and Enterprise (compat) via RECAPTCHA_MODE.
- * - Enforces a minimum score (v3), optional expected action, and optional hostname.
+ * reCAPTCHA v3 verification middleware (classic)
+ * ----------------------------------------------
+ * Validates client tokens against Google reCAPTCHA v3.
+ * - Enforces a minimum score, optional expected action, and optional hostname.
  * - Attaches verification details to req.recaptcha on success.
  *
  * Requirements:
  * - Node.js 18+ (global fetch, AbortController available).
- * - Express behind a correctly configured proxy (set "app.set('trust proxy', <hops>)")
- *   if you want accurate client IP forwarded to Google.
+ * - If behind a proxy/load balancer, configure Express trust proxy to forward client IP.
  *
  * Environment variables:
- *  - RECAPTCHA_MODE          : 'classic' (default) | 'enterprise'
- *  - RECAPTCHA_SECRET        : required; must match the key type used by the frontend
+ *  - RECAPTCHA_SECRET        : required (v3 Secret Key from reCAPTCHA admin console)
  *  - RECAPTCHA_MIN_SCORE     : optional; minimum score threshold (default: 0.5)
  *  - RECAPTCHA_EXPECT_ACTION : optional; enforce a specific action (e.g., 'birthchart_submit')
  *  - RECAPTCHA_EXPECT_HOST   : optional; enforce the hostname returned by Google
@@ -26,21 +23,16 @@
  *   router.post('/birthchart/birthchartsubmit-form', recaptchaVerify(), controller.processForm);
  */
 
-const MODE = (process.env.RECAPTCHA_MODE || 'classic').toLowerCase(); // 'classic' | 'enterprise'
 const DEFAULT_MIN_SCORE = Number.isFinite(Number(process.env.RECAPTCHA_MIN_SCORE))
   ? Number(process.env.RECAPTCHA_MIN_SCORE)
   : 0.5;
 
-// Google siteverify endpoints (classic / enterprise compatibility)
-const VERIFY_URLS = Object.freeze({
-  classic: 'https://www.google.com/recaptcha/api/siteverify',
-  enterprise: 'https://www.google.com/recaptcha/enterprise/siteverify',
-});
-const VERIFY_URL = VERIFY_URLS[MODE] || VERIFY_URLS.classic;
+// Google reCAPTCHA v3 siteverify endpoint (classic)
+const VERIFY_URL = 'https://www.google.com/recaptcha/api/siteverify';
 
 /**
- * Mirrors a request identifier in the response (useful for tracing across systems).
- * @returns {string|undefined} The request id echoed, if any.
+ * Echo a request identifier in the response for cross-system tracing.
+ * @returns {string|undefined}
  */
 function echoRequestId(req, res) {
   const rid = req.requestId || req.get?.('x-request-id') || req.get?.('x-correlation-id');
@@ -49,7 +41,7 @@ function echoRequestId(req, res) {
 }
 
 /**
- * Extracts the reCAPTCHA token from common body keys (frontend-compatible).
+ * Extract the reCAPTCHA token from common body keys (frontend-compatible).
  * @param {Record<string, any>} [body]
  * @returns {string|null}
  */
@@ -67,7 +59,7 @@ function pickCaptchaToken(body = {}) {
 }
 
 /**
- * Extracts the expected action provided by the client (if any).
+ * Extract the expected action provided by the client (if any).
  * @param {Record<string, any>} [reqBody]
  * @returns {string|undefined}
  */
@@ -76,8 +68,7 @@ function pickExpectedAction(reqBody = {}) {
 }
 
 /**
- * Attempts to resolve the client IP in a proxy-aware manner.
- * Note: ensure Express trust proxy is set to get the correct client IP.
+ * Resolve the client IP in a proxy-aware manner.
  * @returns {string|undefined}
  */
 function getClientIp(req) {
@@ -90,7 +81,7 @@ function getClientIp(req) {
 }
 
 /**
- * Calls Google's siteverify endpoint with the provided token and secret.
+ * Call Google's siteverify endpoint with the provided token/secret.
  * @returns {Promise<{ ok: boolean, data: any, status: number }>}
  */
 async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }) {
@@ -127,7 +118,7 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
 }
 
 /**
- * Normalizes Google's response into a single shape:
+ * Normalize Google's v3 response into a single shape:
  * {
  *   success: boolean,
  *   score?: number,
@@ -139,22 +130,6 @@ async function verifyWithGoogle({ secret, response, remoteip, timeoutMs = 6000 }
  */
 function normalizeGoogleResponse(raw) {
   if (!raw || typeof raw !== 'object') return { success: false };
-
-  // Enterprise (compat siteverify) response fields
-  if (MODE === 'enterprise' && raw.tokenProperties) {
-    const { valid, action, hostname, createTime } = raw.tokenProperties;
-    const score = raw.riskAnalysis?.score;
-    return {
-      success: !!valid,
-      score: Number.isFinite(Number(score)) ? Number(score) : undefined,
-      action,
-      hostname,
-      challenge_ts: createTime,
-      error_codes: Array.isArray(raw['error-codes']) ? raw['error-codes'] : undefined,
-    };
-  }
-
-  // Classic v3 response
   return {
     success: !!raw.success,
     score: Number.isFinite(Number(raw.score)) ? Number(raw.score) : undefined,
@@ -166,7 +141,7 @@ function normalizeGoogleResponse(raw) {
 }
 
 /**
- * Factory that returns the Express middleware which validates reCAPTCHA.
+ * Factory that returns the Express middleware which validates reCAPTCHA v3.
  * - Validates presence of secret and token.
  * - Verifies token with Google.
  * - Enforces minimum score, action, and hostname (if configured).
@@ -261,10 +236,9 @@ function recaptchaVerify({ minScore = DEFAULT_MIN_SCORE, timeoutMs = 6000 } = {}
         });
       }
 
-      // Attach verification details for downstream handlers (for logging/auditing)
+      // Attach verification details for downstream handlers (logging/auditing)
       req.recaptcha = {
         success: true,
-        mode: MODE,
         score: norm.score,
         action: norm.action,
         timestamp: norm.challenge_ts,
