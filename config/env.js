@@ -9,6 +9,7 @@
  * - Treats sensitive keys as required in production (no defaults); in dev, allows safe defaults.
  * - Adds knobs for future secret providers and rate-limit tuning.
  * - Replaces TRUST_PROXY with TRUST_PROXY_HOPS to safely control Express proxy hops.
+ * - Migrates from classic reCAPTCHA to reCAPTCHA Enterprise (removes RECAPTCHA_SECRET).
  */
 
 const isProd = process.env.NODE_ENV === 'production';
@@ -99,7 +100,6 @@ const env = cleanEnv(
     }),
 
     // Checkout UX
-
     PAYMENT_PROVIDER: str({
       choices: ['MERCADO_PAGO', 'PAGBANK'],
       default: 'MERCADO_PAGO',
@@ -131,15 +131,30 @@ const env = cleanEnv(
         'Do NOT use true/trust-all.',
     }),
 
-    // Captcha
-    CAPTCHA_PROVIDER: str({
-      default: '',
-      choices: ['', 'recaptcha', 'turnstile'],
-      desc: 'Captcha provider to validate user submissions',
-    }),
-    RECAPTCHA_SECRET: str({
+    // reCAPTCHA Enterprise (replaces classic reCAPTCHA)
+    RECAPTCHA_PROJECT_ID: str({
       default: isProd ? undefined : '',
-      desc: 'reCAPTCHA secret key (required in production when CAPTCHA_PROVIDER=recaptcha)',
+      desc: 'GCP Project ID or number that owns the Enterprise site key (required in production)',
+    }),
+    RECAPTCHA_API_KEY: str({
+      default: isProd ? undefined : '',
+      desc: 'Server API key restricted to "reCAPTCHA Enterprise API" (required in production)',
+    }),
+    RECAPTCHA_SITE_KEY: str({
+      default: isProd ? undefined : '',
+      desc: 'Enterprise site key used on the frontend (required in production)',
+    }),
+    RECAPTCHA_EXPECT_ACTION: str({
+      default: '',
+      desc: 'Optional: enforce an expected action (e.g., "birthchart_submit")',
+    }),
+    RECAPTCHA_MIN_SCORE: num({
+      default: 0.5,
+      desc: 'Optional: minimum acceptable score (0.0–1.0)',
+    }),
+    RECAPTCHA_HTTP_TIMEOUT_MS: num({
+      default: 4000,
+      desc: 'HTTP timeout budget for Enterprise verification (ms)',
     }),
   },
   {
@@ -160,9 +175,13 @@ if (isProd && env.ALLOW_UNSIGNED_WEBHOOKS) {
   throw new Error('Security violation: ALLOW_UNSIGNED_WEBHOOKS must be false in production.');
 }
 
-// Guardrails for reCAPTCHA
-if (isProd && env.CAPTCHA_PROVIDER === 'recaptcha' && !env.RECAPTCHA_SECRET) {
-  throw new Error('Security violation: RECAPTCHA_SECRET is required in production when CAPTCHA_PROVIDER=recaptcha.');
+// Guardrails for reCAPTCHA Enterprise (all required in production)
+if (isProd) {
+  if (!env.RECAPTCHA_PROJECT_ID || !env.RECAPTCHA_API_KEY || !env.RECAPTCHA_SITE_KEY) {
+    throw new Error(
+      'Security violation: RECAPTCHA_PROJECT_ID, RECAPTCHA_API_KEY, and RECAPTCHA_SITE_KEY are required in production.'
+    );
+  }
 }
 
 // Soft deprecation notice for old TRUST_PROXY var (if still present)
@@ -172,6 +191,12 @@ if (process.env.TRUST_PROXY && !process.env.TRUST_PROXY_HOPS) {
     '[env] TRUST_PROXY is deprecated. Use TRUST_PROXY_HOPS (number of hops, e.g., 1). ' +
       "Example: TRUST_PROXY_HOPS=1 in production, TRUST_PROXY_HOPS=0 or 'false' in dev."
   );
+}
+
+// Soft deprecation notice for classic reCAPTCHA secret if still present
+if (process.env.RECAPTCHA_SECRET) {
+  // eslint-disable-next-line no-console
+  console.warn('[env] RECAPTCHA_SECRET is deprecated. This project now uses reCAPTCHA Enterprise variables.');
 }
 
 module.exports = { env, isProd };
