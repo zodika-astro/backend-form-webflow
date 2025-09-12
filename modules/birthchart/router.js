@@ -28,7 +28,7 @@ const express = require('express');
 const router = express.Router();
 
 const refererAuth = require('../../middlewares/refererAuth');
-const verifyRecaptcha = require('../../middlewares/recaptcha'); // expects: body.privacyConsent + body.recaptcha_token|recaptchaToken
+const recaptchaVerify = require('../../middlewares/recaptcha'); // expects: body.privacyConsent + body.recaptcha_token|recaptchaToken
 const controller = require('./controller');
 
 /**
