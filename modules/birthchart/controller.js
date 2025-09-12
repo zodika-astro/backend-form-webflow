@@ -84,29 +84,6 @@ function normalizeConsent(body = {}) {
   return s === 'true' || s === 'on' || s === 'yes' || s === '1' || s === 'checked';
 }
 
-/**
- * Pick the most likely reCAPTCHA token field from the request body.
- */
-function pickCaptchaToken(body = {}) {
-  return (
-    body.recaptcha_token ??
-    body.recaptchaToken ??
-    body.captcha_token ??
-    body.captchaToken ??
-    body['g-recaptcha-response'] ??
-    body.g_recaptcha_response ??
-    body.captcha ??
-    null
-  );
-}
-
-/**
- * Feature flag: captcha is required unless explicitly disabled via env.
- * Read from process.env to avoid changing envalid schema.
- */
-const RECAPTCHA_REQUIRED =
-  String(process.env.RECAPTCHA_REQUIRED ?? 'true').trim().toLowerCase() !== 'false';
-
 /** Allowed public form fields (whitelist). */
 const ALLOWED_FORM_KEYS = [
   'name',
@@ -165,31 +142,6 @@ async function processForm(req, res, next) {
         { field: 'privacyConsent' }
       );
     }
-
-    const captchaToken = pickCaptchaToken(req.body);
-    if (RECAPTCHA_REQUIRED && !captchaToken) {
-      throw new AppError(
-        'recaptcha_token_missing',
-        'reCAPTCHA token is missing.',
-        400,
-        { provider: 'recaptcha_v3' }
-      );
-    }
-
-    logger.info(
-      {
-        hasCaptchaHeader: !!req.captcha, // from middleware (if any)
-        hasCaptchaToken: !!captchaToken, // from body
-      },
-      'consent/captcha normalized'
-    );
-    /* ----------------------------------------------------------------------- */
-
-    // 1) Filter raw body and include captcha for schema compatibility.
-    const filtered = pick(req.body, ALLOWED_FORM_KEYS);
-
-    // Satisfy current validator shape: pass captcha as `captcha_token` (not persisted).
-    if (captchaToken) filtered.captcha_token = String(captchaToken);
 
     // 2) Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
