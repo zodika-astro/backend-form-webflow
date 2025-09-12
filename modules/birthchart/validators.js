@@ -218,16 +218,11 @@ const OptionalPlaceFull = z
 /* ------------------------------- Root schema -------------------------------- */
 /**
  * Wrap the root schema with z.preprocess to:
- * - Consolidate a captcha token into `captcha_token` (mandatory).
  * - Keep the rest of the structure intact (strict mode remains).
  */
 const birthchartSchema = z.preprocess(
   (raw) => {
     const obj = raw && typeof raw === 'object' ? { ...raw } : {};
-    if (!obj.captcha_token) {
-      const tok = pickCaptchaToken(obj);
-      if (tok) obj.captcha_token = tok;
-    }
     return obj;
   },
   z
