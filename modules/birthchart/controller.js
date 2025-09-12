@@ -132,7 +132,7 @@ async function processForm(req, res, next) {
   const logger = (req.log || baseLogger).child('processForm', { rid: req.requestId });
 
   try {
-    /* ----------------------- consent & captcha guards ----------------------- */
+    /* ----------------------- consent & input guards ------------------------ */
     const privacyConsent = normalizeConsent(req.body);
     if (!privacyConsent) {
       throw new AppError(
@@ -143,15 +143,34 @@ async function processForm(req, res, next) {
       );
     }
 
-    // 2) Validate/normalize via schema (may throw)
+    // Build a safe, trimmed, typed object from req.body (replaces older `filtered`)
+    const raw = pick(req.body, ALLOWED_FORM_KEYS);
+    const filtered = {};
+    for (const [k, v] of Object.entries(raw)) {
+      filtered[k] = typeof v === 'string' ? v.trim() : v;
+    }
+
+    // Default product if not provided (keeps downstream stable)
+    if (!filtered.product_type) filtered.product_type = 'birth_chart';
+
+    // Normalize numeric fields
+    if (filtered.birth_place_lat != null && typeof filtered.birth_place_lat === 'string') {
+      const n = Number(filtered.birth_place_lat);
+      if (!Number.isNaN(n)) filtered.birth_place_lat = n;
+    }
+    if (filtered.birth_place_lng != null && typeof filtered.birth_place_lng === 'string') {
+      const n = Number(filtered.birth_place_lng);
+      if (!Number.isNaN(n)) filtered.birth_place_lng = n;
+    }
+
+    // Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
 
-    // 3) DEFER timezone resolution to post-payment workflow.
-    //    Persist placeholders now; a webhook/worker should compute and update later.
+    /* ---------------- time zone resolution deferred (placeholder) --------- */
     const tz = { tzId: null, offsetMin: null, deferred: true };
     logger.info({ deferred: true }, 'timezone resolution deferred');
 
-    // 4) Persist request (minimal payload in logs; avoid PII)
+    /* ------------------- persist request (PII kept out of logs) ----------- */
     const newRequest = await createBirthchartRequest({
       name:                 input.name,
       social_name:          input.social_name,
@@ -179,9 +198,7 @@ async function processForm(req, res, next) {
 
     logger.info({ requestId: newRequest.request_id, productType: newRequest.product_type }, 'request persisted');
 
-    // 5) Compose product for checkout
-    // NOTE: successUrl is documented here (business rule), but NOT sent to the PSP.
-    // PSP return URLs always point back to our backend return controllers.
+    /* ----------------------- compose product for checkout ------------------ */
     const product = {
       productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
@@ -200,7 +217,7 @@ async function processForm(req, res, next) {
       },
     };
 
-    // 6) Route to PSP using PAYMENT_PROVIDER env
+    /* ----------------------- route to the chosen PSP ---------------------- */
     const provider = getPaymentProvider();
     logger.info({ provider }, 'selecting PSP');
 
@@ -254,7 +271,7 @@ async function processForm(req, res, next) {
       );
     }
 
-    // 7) Contract expected by the frontend
+    /* ------------------- contract expected by the frontend ----------------- */
     return res.status(200).json({ url: paymentResponse.url });
   } catch (err) {
     // Normalize non-AppError validation failures (e.g., Zod)
