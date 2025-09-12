@@ -9,7 +9,6 @@
  * - Treats sensitive keys as required in production (no defaults); in dev, allows safe defaults.
  * - Adds knobs for future secret providers and rate-limit tuning.
  * - Replaces TRUST_PROXY with TRUST_PROXY_HOPS to safely control Express proxy hops.
- * - Migrates from classic reCAPTCHA to reCAPTCHA Enterprise (removes RECAPTCHA_SECRET).
  */
 
 const isProd = process.env.NODE_ENV === 'production';
