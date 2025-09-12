@@ -15,7 +15,7 @@ function anySignal(signals) {
   return AbortSignal.any ? AbortSignal.any(signals) : signals.find(s => s);
 }
 
-async function verifyRecaptcha(req, res, next) {
+async function recaptchaVerify(req, res, next) {
   const started = Date.now();
   try {
     const token  = req.body?.recaptcha_token;
