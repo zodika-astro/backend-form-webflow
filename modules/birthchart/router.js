@@ -38,7 +38,6 @@ const controller = require('./controller');
 router.post(
   '/birthchartsubmit-form',
   refererAuth,
-  verifyRecaptcha,
   controller.processForm
 );
 
