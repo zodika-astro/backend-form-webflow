@@ -5,7 +5,6 @@
 /**
  * Normalizers for form submissions.
  * - normalizeConsent(body) → boolean (true if user agreed to Privacy Policy)
- * - pickCaptchaToken(body) → string|null (best-effort extraction)
  *
  * Keep this tiny and dependency-free. It runs on hot paths.
  */
@@ -29,18 +28,5 @@ function normalizeConsent(body = {}) {
   return s === 'true' || s === 'on' || s === 'yes' || s === '1' || s === 'checked';
 }
 
-function pickCaptchaToken(body = {}) {
-  // Accept common client keys for reCAPTCHA v3/v2
-  return (
-    body.recaptcha_token ??
-    body.recaptchaToken ??
-    body.captcha_token ??
-    body.captchaToken ??
-    body['g-recaptcha-response'] ??
-    body.g_recaptcha_response ??
-    body.captcha ??
-    null
-  );
-}
 
-module.exports = { normalizeConsent, pickCaptchaToken };
+module.exports = { normalizeConsent };
