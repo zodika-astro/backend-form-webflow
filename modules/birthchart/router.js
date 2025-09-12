@@ -13,11 +13,7 @@
  * Middleware order (important):
  *   1) refererAuth
  *      - Enforces allowed origins/referers (defense-in-depth).
- *   2) verifyRecaptcha
- *      - Requires explicit privacy consent and validates reCAPTCHA token server-side.
- *      - Removes sensitive fields (consent/token) from req.body and attaches
- *        a minimal result to req.security.recaptcha on success.
- *   3) controller.processForm
+ *   2) controller.processForm
  *      - Business logic: validation, persistence, and payment checkout creation.
  *
  * Security notes:
@@ -28,7 +24,6 @@ const express = require('express');
 const router = express.Router();
 
 const refererAuth = require('../../middlewares/refererAuth');
-const recaptchaVerify = require('../../middlewares/recaptcha'); // expects: body.privacyConsent + body.recaptcha_token|recaptchaToken
 const controller = require('./controller');
 
 /**
@@ -38,7 +33,6 @@ const controller = require('./controller');
 router.post(
   '/birthchartsubmit-form',
   refererAuth,
-  recaptchaVerify,
   controller.processForm
 );
 
