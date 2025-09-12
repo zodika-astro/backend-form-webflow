@@ -16,11 +16,7 @@ const { z } = require('zod');
  * Security/PII
  * - Do not log full public payloads; surface only paths/messages.
  * - Keep messages user-friendly without leaking sensitive details.
- *
- * Business rule
- * - reCAPTCHA token is mandatory. We consolidate it from multiple common keys
- *   and expose it as `captcha_token` for the rest of the application.
- */
+
 
 /* --------------------------------- Helpers --------------------------------- */
 
@@ -70,25 +66,7 @@ function parseOptionalJson(value) {
   return undefined;
 }
 
-/**
- * Consolidate captcha token from multiple common client keys.
- * If absent or empty, returns null (validation will reject it later).
- */
-function pickCaptchaToken(body = {}) {
-  const c =
-    body.captcha_token ??
-    body.captchaToken ??
-    body.recaptcha_token ??
-    body.recaptchaToken ??
-    body['g-recaptcha-response'] ??
-    body.g_recaptcha_response ??
-    body.captcha ??
-    null;
 
-  if (c == null) return null;
-  const s = String(c).trim();
-  return s.length ? s : null;
-}
 
 /* ------------------------------ Reusable pieces ----------------------------- */
 
@@ -279,19 +257,6 @@ const birthchartSchema = z.preprocess(
       birth_timezone_id: OptionalTzId,
       birth_utc_offset_min: OptionalUtcOffsetMin,
 
-      // ===== reCAPTCHA & consent (added to cooperate with strict mode) =====
-      // Consolidated token: REQUIRED
-      captcha_token: z.string().trim().min(1, 'reCAPTCHA token is missing'),
-      // Optional metadata
-      recaptcha_action: z.string().trim().min(1).optional(),
-      captcha_provider: z.string().trim().min(1).optional(),
-      // Allow alternative client keys (optional; ignored if present)
-      recaptcha_token: z.string().optional(),
-      recaptchaToken: z.string().optional(),
-      captchaToken: z.string().optional(),
-      captcha: z.string().optional(),
-      'g-recaptcha-response': z.string().optional(),
-      g_recaptcha_response: z.string().optional(),
 
       // Consent flags (optional; accepted to avoid strict() rejections)
       privacyConsent: z.coerce.boolean().optional(),
