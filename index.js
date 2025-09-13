@@ -19,10 +19,9 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-//remover
-const diag = require('./middlewares/diag');
-app.use(diag());
-//remover
+/* -------------------------------- Orchestrator ------------------------------- */
+require('./payments/orchestrator'); 
+
 
 /* -------------------------------- Proxy trust -------------------------------- */
 
@@ -46,6 +45,7 @@ app.disable('x-powered-by');
 
 const correlationId = require('./middlewares/correlationId');
 app.use(correlationId);
+
 
 /* ---------------------------- Shared middlewares ----------------------------- */
 
