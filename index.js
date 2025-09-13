@@ -10,6 +10,9 @@
  */
 require('./config/env');
 require('./db/db');
+/* -------------------------------- Orchestrator ------------------------------- */
+require('./payments/orchestrator'); 
+
 
 const express = require('express');
 const path = require('path');
@@ -19,8 +22,6 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* -------------------------------- Orchestrator ------------------------------- */
-require('./payments/orchestrator'); 
 
 
 /* -------------------------------- Proxy trust -------------------------------- */
