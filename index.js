@@ -10,9 +10,6 @@
  */
 require('./config/env');
 require('./db/db');
-/* -------------------------------- Orchestrator ------------------------------- */
-require('./payments/orchestrator'); 
-
 
 const express = require('express');
 const path = require('path');
