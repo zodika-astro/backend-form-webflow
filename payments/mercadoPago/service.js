@@ -33,6 +33,7 @@ const baseLogger = require('../../utils/logger').child('payments.mp');
 const { AppError } = require('../../utils/appError');
 const { env } = require('../../config/env');
 const mpRepository = require('./repository');
+const orchestrator = require('../orchestrator');
 
 const events = new EventEmitter();
 
@@ -463,6 +464,32 @@ async function processWebhook(body, meta = {}, ctx = {}) {
         date_last_updated:  payment?.date_last_updated || payment?.last_updated || null,
         raw: payment,
       });
+
+      /* ---- Payment snapshot → zodika_requests ---------------------------------- */
+      // optional: fetch link from mp_request so we can populate payment_link
+      let mpReqLink;
+      if (preference_id) {
+      try {
+        const mpReq = await mpRepository.findByPreferenceId(preference_id);
+              mpReqLink = mpReq?.link || undefined;
+      } catch (e) {
+        log.warn({ msg: e.message }, 'could not read mp_request link');
+      }
+      }
+
+      // guard against NaN when external_reference is not numeric
+      const reqIdNum = Number(payment.external_reference ?? external_reference);
+      const safeRequestId = Number.isFinite(reqIdNum) ? reqIdNum : undefined;
+
+      try {
+        await orchestrator.updateFromMP(payment, {
+          requestId:  safeRequestId,
+          preferenceId: payment.preference_id || preference_id || undefined,
+          link: mpReqLink,
+      });
+      } catch (e) {
+        log.warn({ msg: e.message }, 'payment snapshot skipped');
+      }
 
       const reqStatus = mapPreferenceStatusFromPayment(status);
       let updatedReq = null;
