@@ -275,6 +275,18 @@ async function createCheckout(input, ctx = {}) {
         raw: data,
       });
 
+      try {
+          await orchestrator.snapshotCheckoutCreated({
+                requestId: Number(requestId),
+                checkoutId: preferenceId,
+                link: initPoint,
+                amountCents: valueNum,
+                currency: currency || 'BRL',
+          });
+      } catch (e) {
+             log.warn({ msg: e?.message }, 'could not snapshot CREATED state');
+      }
+
       // Best-effort audit trail
       try {
         await mpRepository.logEvent({
