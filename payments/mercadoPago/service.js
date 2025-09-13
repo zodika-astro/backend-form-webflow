@@ -121,7 +121,7 @@ async function createCheckout(input, ctx = {}) {
     requestId, name, email, productType,
     productValue, productName, paymentOptions,
     currency, productImageUrl, returnUrl, metadata = {},
-    externalReference, // NEW: optional external reference; falls back to requestId
+    externalReference, // optional external reference; falls back to requestId
   } = input || {};
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
@@ -189,7 +189,7 @@ async function createCheckout(input, ctx = {}) {
     default_installments: maxInst,
   };
 
-  // Choose the value we will send to MP and persist locally
+  // External reference we send to MP and persist locally
   const extRef = externalReference != null ? String(externalReference) : String(requestId);
 
   const preferencePayload = {
@@ -264,7 +264,7 @@ async function createCheckout(input, ctx = {}) {
     const persistWork = async () => {
       await mpRepository.createCheckout({
         request_id: String(requestId),
-        external_reference: extRef, // <-- persist for reconciliation
+        external_reference: extRef, // persist for reconciliation
         product_type: productType,
         preference_id: preferenceId,
         status: 'CREATED',
@@ -391,15 +391,56 @@ async function processWebhook(body, meta = {}, ctx = {}) {
       const payment = await fetchPayment(hintedPaymentId, ctx);
       if (!payment) return { ok: true, note: 'payment details not found' };
 
-      const payment_id        = String(payment.id);
-      const status            = payment.status;
-      const status_detail     = payment.status_detail;
+      const payment_id         = String(payment.id);
+      const status             = payment.status;
+      const status_detail      = payment.status_detail;
       const external_reference = payment.external_reference || null;
-      let   preference_id     = payment.preference_id || null;
-      const amount            = Number(payment.transaction_amount || 0);
+      let   preference_id      = payment.preference_id || null;
+      const amount             = Number(payment.transaction_amount || 0);
 
+      // ----- Robust normalization of customer fields -----
+
+      // Prefer values from additional_info when payer lacks them in sandbox flows
+      const aiPayer = payment.additional_info?.payer || {};
       const payer   = payment.payer || {};
-      const billing = payment.additional_info?.payer?.address || null;
+
+      // Name: first try additional_info.payer.first_name (common in sandbox),
+      // then combine payer.first_name + payer.last_name, then payer.name.
+      const nameFromAI = [aiPayer.first_name, aiPayer.last_name].filter(Boolean).join(' ').trim() || null;
+      const nameFromPayer =
+        (payer.first_name || payer.last_name)
+          ? [payer.first_name, payer.last_name].filter(Boolean).join(' ').trim()
+          : (payer.name || null);
+      const normalizedName = nameFromAI || nameFromPayer || null;
+
+      // Email & tax id from canonical payer (when present)
+      const normalizedEmail = payer.email || null;
+      const normalizedTaxId = payer.identification?.number || null;
+
+      // Phone may come as object or string, sometimes only in additional_info
+      let phoneCountry = null;
+      let phoneArea    = null;
+      let phoneNumber  = null;
+
+      const pickPhone = (ph) => {
+        if (!ph) return;
+        if (typeof ph === 'object') {
+          phoneArea    = phoneArea    || ph.area_code || ph.areaCode || null;
+          phoneCountry = phoneCountry || ph.country_code || ph.countryCode || null;
+          phoneNumber  = phoneNumber  || ph.number || ph.phone_number || ph.local_number || null;
+        } else if (typeof ph === 'string') {
+          const digits = ph.replace(/\D+/g, '');
+          if (digits) phoneNumber = phoneNumber || digits;
+        }
+      };
+      pickPhone(payer.phone);
+      pickPhone(aiPayer.phone);
+
+      // Address: prefer additional_info.payer.address; fallback to payer.address
+      const billing =
+        payment.additional_info?.payer?.address
+        || payer.address
+        || null;
 
       await mpRepository.upsertPaymentByPaymentId({
         payment_id,
@@ -408,18 +449,18 @@ async function processWebhook(body, meta = {}, ctx = {}) {
         status_detail,
         external_reference,
         customer: {
-          name:  payer?.first_name || payer?.name || null,
-          email: payer?.email || null,
-          tax_id: payer?.identification?.number || null,
-          phone_country: null,
-          phone_area: null,
-          phone_number: payer?.phone?.number || null,
-          address_json: billing ? billing : null,
+          name:  normalizedName,
+          email: normalizedEmail,
+          tax_id: normalizedTaxId,
+          phone_country: phoneCountry,
+          phone_area:    phoneArea,
+          phone_number:  phoneNumber,
+          address_json:  billing || null,
         },
         transaction_amount: amount,
-        date_created:     payment?.date_created || null,
-        date_approved:    payment?.date_approved || null,
-        date_last_updated: payment?.date_last_updated || payment?.last_updated || null,
+        date_created:       payment?.date_created || null,
+        date_approved:      payment?.date_approved || null,
+        date_last_updated:  payment?.date_last_updated || payment?.last_updated || null,
         raw: payment,
       });
 
@@ -431,9 +472,8 @@ async function processWebhook(body, meta = {}, ctx = {}) {
           preference_id, reqStatus, payment
         );
       } else if (external_reference) {
-        // NOTE: Currently assumes external_reference equals internal request_id.
-        // If you ever diverge (e.g., use a custom code), switch to:
-        // await mpRepository.updateRequestStatusByExternalReference(external_reference, reqStatus, payment);
+        // NOTE: If external_reference ever diverges from internal request_id,
+        // switch to updateRequestStatusByExternalReference().
         updatedReq = await mpRepository.updateRequestStatusByRequestId(
           external_reference, reqStatus, payment
         );
@@ -445,9 +485,9 @@ async function processWebhook(body, meta = {}, ctx = {}) {
 
       if ((status || '').toLowerCase() === 'approved') {
         const record = (
-          payment_id        ? await mpRepository.findByPaymentId(payment_id)
-        : preference_id      ? await mpRepository.findByPreferenceId(preference_id)
-        : external_reference ? await mpRepository.findByRequestId(external_reference)
+          payment_id         ? await mpRepository.findByPaymentId(payment_id)
+        : preference_id       ? await mpRepository.findByPreferenceId(preference_id)
+        : external_reference  ? await mpRepository.findByRequestId(external_reference)
         : null
         );
 
