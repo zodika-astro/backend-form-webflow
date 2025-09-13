@@ -9,7 +9,7 @@ const cors = require('cors');
  * Goals
  * - Allow only trusted Origins for browser requests.
  * - For *public* endpoints (e.g., /birthchart/**), REQUIRE an Origin header (block non-browser).
- * - Validate Referer against an allowlist (defense-in-depth).
+ * - Validate Referer against an allowlist (defense-in-depth) **only** on strict public paths.
  * - Do NOT interfere with server-to-server endpoints (webhooks), health checks, metrics, or static assets.
  *
  * Env
@@ -29,7 +29,6 @@ const cors = require('cors');
 
 const NODE_ENV = (process.env.NODE_ENV || 'production').toLowerCase();
 const IS_PROD = NODE_ENV === 'production';
-
 
 const {
   exactOrigins: EXACT_ORIGINS,
@@ -277,8 +276,9 @@ module.exports = function corsPolicy(req, res, next) {
     return res.status(403).json({ message: 'CORS blocked: origin not allowed' });
   }
 
-  // 3) If Referer exists, validate it (origin or explicit prefixes)
-  if (refererHdr && !validateReferer(refererHdr, normalizedOrigin)) {
+  // 3) If Referer exists, validate it **only on strict paths**
+  //    (Return routes like /mercadoPago/return/* are normal navigations and should not be blocked.)
+  if (isStrict && refererHdr && !validateReferer(refererHdr, normalizedOrigin)) {
     return res.status(403).json({ message: 'CORS blocked: referer not allowed' });
   }
 
