@@ -15,8 +15,13 @@
  *     asynchronously (fire-and-forget) by default to keep the request fast.
  *   - Time budgets are tight to avoid client-side timeouts (499/AbortError).
  *
- * API (unchanged)
+ * API
  *   - createCheckout(input, ctx?) -> { url, preferenceId }
+ *       input fields:
+ *         - requestId (required)
+ *         - externalReference (optional; defaults to requestId)
+ *         - name, email, productType, productValue, productName, paymentOptions,
+ *           currency, productImageUrl, returnUrl, metadata
  *   - processWebhook(body, meta, ctx?) -> { ok, ... }
  *   - events (EventEmitter)
  */
@@ -116,6 +121,7 @@ async function createCheckout(input, ctx = {}) {
     requestId, name, email, productType,
     productValue, productName, paymentOptions,
     currency, productImageUrl, returnUrl, metadata = {},
+    externalReference, // NEW: optional external reference; falls back to requestId
   } = input || {};
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
@@ -183,8 +189,11 @@ async function createCheckout(input, ctx = {}) {
     default_installments: maxInst,
   };
 
+  // Choose the value we will send to MP and persist locally
+  const extRef = externalReference != null ? String(externalReference) : String(requestId);
+
   const preferencePayload = {
-    external_reference: String(requestId),
+    external_reference: extRef,
     items: [{
       title: (productName || productType || 'Produto').toString().slice(0, 150),
       quantity: 1,
@@ -255,6 +264,7 @@ async function createCheckout(input, ctx = {}) {
     const persistWork = async () => {
       await mpRepository.createCheckout({
         request_id: String(requestId),
+        external_reference: extRef, // <-- persist for reconciliation
         product_type: productType,
         preference_id: preferenceId,
         status: 'CREATED',
@@ -421,6 +431,9 @@ async function processWebhook(body, meta = {}, ctx = {}) {
           preference_id, reqStatus, payment
         );
       } else if (external_reference) {
+        // NOTE: Currently assumes external_reference equals internal request_id.
+        // If you ever diverge (e.g., use a custom code), switch to:
+        // await mpRepository.updateRequestStatusByExternalReference(external_reference, reqStatus, payment);
         updatedReq = await mpRepository.updateRequestStatusByRequestId(
           external_reference, reqStatus, payment
         );
@@ -432,8 +445,8 @@ async function processWebhook(body, meta = {}, ctx = {}) {
 
       if ((status || '').toLowerCase() === 'approved') {
         const record = (
-          payment_id      ? await mpRepository.findByPaymentId(payment_id)
-        : preference_id    ? await mpRepository.findByPreferenceId(preference_id)
+          payment_id        ? await mpRepository.findByPaymentId(payment_id)
+        : preference_id      ? await mpRepository.findByPreferenceId(preference_id)
         : external_reference ? await mpRepository.findByRequestId(external_reference)
         : null
         );
