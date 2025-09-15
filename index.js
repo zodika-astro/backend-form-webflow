@@ -124,11 +124,8 @@ app.use('/mercadoPago', mpReturnRouter);
 app.use('/', mpWebhookRouter);
 
 /* -------------------------- Product handlers (boot) -------------------------- */
-/**
- * Birthchart handler wires its event/listener setup on require().
- * Keep provider-specific orchestrators required inside each provider's service
- * as decided, to avoid circular dependencies.
- */
+
+// Birthchart handler wires its event/listener setup on require().
 require('./modules/birthchart/handler');
 
 /* --------------------------- Central error handler --------------------------- */
