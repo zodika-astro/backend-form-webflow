@@ -232,4 +232,37 @@ async function onApprovedEvent(evt) {
         retries: 0,
       });
       makeDur = Date.now() - tMake;
-      makeStatus = makeRes?.status ||
+      makeStatus = makeRes?.status || 0;
+    } catch (e) {
+      makeStatus = e?.response?.status || 0;
+      await repo.markJobFailed(job.job_id, `make_webhook_error:${makeStatus}`);
+      log.warn({ makeStatus }, 'make webhook failed');
+      return;
+    }
+
+    // 7) Finish job
+    await repo.markJobSucceeded(job.job_id, {
+      ephemeris_http_status: ephStatus,
+      webhook_http_status: makeStatus,
+      ephemeris_duration_ms: ephDur,
+      webhook_duration_ms: makeDur,
+    });
+
+    log.info({ jobId: job.job_id, ephStatus, makeStatus }, 'birthchart flow completed');
+  } catch (err) {
+    baseLogger.error({ msg: err?.message }, 'birthchart handler failed');
+  }
+}
+
+// ---- Subscription ----
+// Importing this file wires the listener.
+orchestrator.events.on('payments:status-changed', (evt) => {
+  // evt shape (as emitted by orchestrator):
+  // { requestId, productType, provider, normalizedStatus, statusDetail,
+  //   amountCents, currency, checkoutId, paymentId, authorizedAt, link }
+  if (evt?.normalizedStatus === TRIGGER_APPROVED && evt?.productType === PRODUCT_TYPE) {
+    onApprovedEvent(evt);
+  }
+});
+
+module.exports = { onApprovedEvent };
