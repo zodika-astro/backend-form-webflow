@@ -19,10 +19,7 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-
-
 /* -------------------------------- Proxy trust -------------------------------- */
-
 function resolveTrustProxySetting() {
   const raw = (process.env.TRUST_PROXY_HOPS || '').trim().toLowerCase();
   if (raw === 'false' || raw === '0') return false;
@@ -35,23 +32,18 @@ const TRUST_PROXY_SETTING = resolveTrustProxySetting();
 app.set('trust proxy', TRUST_PROXY_SETTING);
 
 /* ----------------------------- Security headers ------------------------------ */
-
 app.use(helmet({ ieNoOpen: false }));
 app.disable('x-powered-by');
 
 /* ------------------------------- Correlation ID ------------------------------ */
-
 const correlationId = require('./middlewares/correlationId');
 app.use(correlationId);
 
-
 /* ---------------------------- Shared middlewares ----------------------------- */
-
 const corsMiddleware = require('./middlewares/cors');
 const errorHandlerMiddleware = require('./middlewares/errorHandler');
 
 /* --------------------------------- Routers ----------------------------------- */
-
 const birthchartRouter     = require('./modules/birthchart/router');
 const pagbankWebhookRouter = require('./payments/pagBank/router.webhook');
 const pagbankReturnRouter  = require('./payments/pagBank/router.return.js');
@@ -59,11 +51,6 @@ const mpWebhookRouter      = require('./payments/mercadoPago/router.webhook');
 const mpReturnRouter       = require('./payments/mercadoPago/router.return');
 
 /* ----------------------- Raw body for webhook signatures ---------------------- */
-/**
- * Webhooks must validate signatures against the exact raw bytes.
- * 1) Register `express.raw()` BEFORE any JSON parser.
- * 2) Keep reasonable body limits.
- */
 function rawBodySaver(req, res, buf) {
   if (buf && buf.length) req.rawBody = Buffer.from(buf);
 }
@@ -71,12 +58,10 @@ app.use('/webhook/mercadopago', express.raw({ type: '*/*', limit: '1mb', verify:
 app.use('/webhook/pagbank',     express.raw({ type: '*/*', limit: '1mb', verify: rawBodySaver }));
 
 /* -------------------------------- Rate limiting ------------------------------ */
-
 const toInt = (v, d) => {
   const n = parseInt(String(v ?? ''), 10);
   return Number.isFinite(n) ? n : d;
 };
-
 const createRateLimiter = ({ windowMs, limit, message, trustProxy = TRUST_PROXY_SETTING }) =>
   rateLimit({
     windowMs,
@@ -100,11 +85,9 @@ const formLimiter = createRateLimiter({
 });
 
 /* ---------------------------------- CORS ------------------------------------- */
-
 app.use(corsMiddleware);
 
 /* --------------------------- JSON (non-webhook) parser ----------------------- */
-
 app.use(
   express.json({
     type: (req) => !req.path.startsWith('/webhook/'),
@@ -116,7 +99,6 @@ app.use(
 );
 
 /* ---------------------------- Health & metrics -------------------------------- */
-
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 const { metricsMiddleware, metricsRouter } = require('./middlewares/metrics');
@@ -127,26 +109,29 @@ const healthzRouter = require('./observability/healthz');
 app.use('/healthz', healthzRouter);
 
 /* -------------------------------- Static files -------------------------------- */
-
 app.use('/assets', express.static(path.join(__dirname, 'public'), { maxAge: '30d', etag: true }));
 
 /* ------------------------------ Product modules ------------------------------ */
-
 app.use('/birthchart', formLimiter, birthchartRouter);
 
 /* ------------------------------- Payments: PB -------------------------------- */
-
 app.use('/webhook/pagbank', webhookLimiter);
 app.use('/', pagbankWebhookRouter);
 
 /* ------------------------------ Payments: MP --------------------------------- */
-
 app.use('/webhook/mercadopago', webhookLimiter);
 app.use('/mercadoPago', mpReturnRouter);
 app.use('/', mpWebhookRouter);
 
-/* --------------------------- Central error handler --------------------------- */
+/* -------------------------- Product handlers (boot) -------------------------- */
+/**
+ * Birthchart handler wires its event/listener setup on require().
+ * Keep provider-specific orchestrators required inside each provider's service
+ * as decided, to avoid circular dependencies.
+ */
+require('./modules/birthchart/handler');
 
+/* --------------------------- Central error handler --------------------------- */
 app.use(errorHandlerMiddleware);
 
 module.exports = app;
