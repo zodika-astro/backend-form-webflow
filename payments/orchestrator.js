@@ -9,7 +9,7 @@
  * normalized domain event: 'payments:status-changed'.
  *
  * It does NOT trigger product workflows. Product handlers subscribe to
- // * the event bus (see modules/product/handler.js).
+ * the event bus (see modules/product/handler.js).
  */
 
 const { EventEmitter } = require('events');
