@@ -12,15 +12,6 @@
  * - Optional response size guard (Content-Length).
  * - Correlation propagation (X-Request-Id/X-Correlation-Id).
  * - Respects upstream AbortSignal (`opts.signal`) for cooperative cancellation.
- *
- * API (unchanged):
- *   const http = require('./utils/httpClient');
- *   await http.get(url, { headers, timeout, retries, signal });
- *   await http.post(url, body, { headers, timeout, retries, signal });
- *
- * Return shape (unchanged):
- *   { status, data, headers } on success
- *   throw Error with .response = { status, data, headers } on HTTP errors
  */
 
 const { fetch, Headers } = require('undici');
@@ -28,21 +19,21 @@ const crypto = require('crypto');
 
 /* -------------------------------- Defaults -------------------------------- */
 
-// Safer defaults para evitar estouro de SLA quando o caller não define timeout/retry.
-const DEFAULT_TIMEOUT_MS = toInt(process.env.HTTP_DEFAULT_TIMEOUT_MS, 10_000); // 10s
-const DEFAULT_RETRIES    = toInt(process.env.HTTP_DEFAULT_RETRIES, 0);        // opt-in
+const DEFAULT_TIMEOUT_MS = toInt(process.env.HTTP_DEFAULT_TIMEOUT_MS, 10_000);
+const DEFAULT_RETRIES    = toInt(process.env.HTTP_DEFAULT_RETRIES, 0);
 
-// Status HTTP típicos para retry (transientes/rate-limited)
 const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-// Máximo permitido via Content-Length (se ausente, não limitamos).
-const DEFAULT_MAX_RESPONSE_BYTES = 1_500_000; // ~1.5MB
+const DEFAULT_MAX_RESPONSE_BYTES = 1_500_000;
 
-// Allowlist de hosts HTTPS (pode sobrescrever via HTTP_ALLOWED_HOSTS)
+// Baseline allowlist; can be extended via HTTP_ALLOWED_HOSTS env.
 const HARDCODED_ALLOWED_HOSTS = new Set([
   'api.mercadopago.com',
   'api.pagbank.com.br',
   'sandbox.api.pagseguro.com',
+  'ephemeris-api-production.up.railway.app',
+  'hook.us1.make.com',
+  'hook.eu1.make.com',
 ]);
 
 /* ------------------------------- Small utils ------------------------------- */
@@ -89,7 +80,6 @@ function validateHttpsUrl(url, allowedHosts) {
   const host = u.host; // hostname[:port]
   if (!host) throw new Error('URL missing host');
   if (!allowedHosts.has(host) && !allowedHosts.has(u.hostname)) {
-    // Accept either "host" or "hostname" forms in allowlist (resilient to ":443")
     throw new Error(`Destination host not allowed: ${host}`);
   }
   return u.toString();
@@ -98,7 +88,7 @@ function validateHttpsUrl(url, allowedHosts) {
 /** Classify undici/fetch errors that are generally retryable (network-ish). */
 function isNetworkLikeError(err) {
   if (!err) return false;
-  if (err.name === 'AbortError') return true; // timeout/abort
+  if (err.name === 'AbortError') return true;
   const code = err.cause?.code || err.code || '';
   return [
     'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'ETIMEDOUT',
@@ -108,21 +98,12 @@ function isNetworkLikeError(err) {
 
 /* --------------------------- Core fetch with guards ------------------------ */
 
-/**
- * Perform a single HTTP request (no retries here).
- * - Enforces timeout via AbortController.
- * - Respects upstream AbortSignal (`upstream`) for cooperative cancellation.
- * - Validates HTTPS + allowed host.
- * - Optional guard for response size using Content-Length header.
- * - Parses JSON when content-type includes application/json, else returns text.
- * - Optionally controls redirects (default: follow). Validates redirect target host.
- */
 async function doFetch(method, url, {
   data,
   headers = {},
   timeout,
   timeoutMs,
-  upstream,                      // <-- new: upstream AbortSignal
+  upstream,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   allowedHosts = HARDCODED_ALLOWED_HOSTS,
   userAgent = 'ZodikaBackend/1.0 (+https://www.zodika.com.br) httpClient',
@@ -136,7 +117,6 @@ async function doFetch(method, url, {
     Number(timeoutMs ?? timeout ?? DEFAULT_TIMEOUT_MS)
   );
 
-  // Encadeia cancelamento do chamador (controller, req abort, etc.)
   const onUpstreamAbort = () => controller.abort(upstream?.reason || new Error('Aborted by upstream'));
   if (upstream) {
     if (upstream.aborted) onUpstreamAbort();
@@ -146,27 +126,26 @@ async function doFetch(method, url, {
   try {
     const baseHeaders = new Headers(headers);
 
-    // Correlation propagation (generate if absent)
+    // Correlation propagation
     const corr = baseHeaders.get('x-request-id') || baseHeaders.get('x-correlation-id') || genId();
     if (!baseHeaders.has('x-request-id')) baseHeaders.set('x-request-id', corr);
     if (!baseHeaders.has('x-correlation-id')) baseHeaders.set('x-correlation-id', corr);
 
-    // Default headers
+    // Defaults
     if (!baseHeaders.has('accept')) baseHeaders.set('accept', 'application/json');
     if (!baseHeaders.has('user-agent')) baseHeaders.set('user-agent', userAgent);
 
-    // Body handling
+    // Body
     const hasBody = data !== undefined && data !== null && method !== 'GET' && method !== 'HEAD';
     let body;
     if (hasBody) {
       const ct = baseHeaders.get('content-type');
       if (typeof data === 'string' || data instanceof Buffer) {
-        body = data; // caller provided raw payload
+        body = data;
       } else if (!ct || ct.includes('application/json')) {
         baseHeaders.set('content-type', 'application/json');
         body = JSON.stringify(data);
       } else {
-        // caller set another content-type but passed an object; still stringify
         body = JSON.stringify(data);
       }
     }
@@ -194,14 +173,11 @@ async function doFetch(method, url, {
         err.response = { status: 497, data: 'Disallowed redirect target', headers: sanitizeHeadersForReturn(res.headers) };
         throw err;
       }
-    } catch {
-      // ignore URL parsing issues (undici usually provides a valid res.url)
-    }
+    } catch { /* ignore */ }
 
     const ct = res.headers.get('content-type') || '';
     const retHeaders = sanitizeHeadersForReturn(res.headers);
 
-    // Optional response size guard
     const cl = res.headers.get('content-length');
     if (cl && maxResponseBytes && Number(cl) > maxResponseBytes) {
       const error = new Error('Response too large');
@@ -216,7 +192,6 @@ async function doFetch(method, url, {
       return { status: res.status, data: parsed, headers: retHeaders };
     }
 
-    // Non-2xx: include parsed payload (JSON or text)
     const errPayload = ct.includes('application/json')
       ? await res.json().catch(() => ({}))
       : await res.text();
@@ -232,13 +207,6 @@ async function doFetch(method, url, {
 
 /* ----------------------------- Public request API -------------------------- */
 
-/**
- * Core request with retry/backoff.
- * Retries on:
- *  - 408, 425, 429, 5xx responses
- *  - network/timeout errors
- * Respects `opts.signal` for cooperative cancellation across retries.
- */
 async function request(method, url, opts = {}) {
   const {
     data,
@@ -247,12 +215,11 @@ async function request(method, url, opts = {}) {
     timeoutMs,
     retries = DEFAULT_RETRIES,
     retryBackoffMs,
-    // hardening knobs (optional)
     allowedHosts,
     maxResponseBytes,
     userAgent,
     followRedirects,
-    signal, // <-- upstream AbortSignal suportado
+    signal,
   } = opts;
 
   const hosts = allowedHosts instanceof Set
@@ -271,16 +238,15 @@ async function request(method, url, opts = {}) {
         headers,
         timeout,
         timeoutMs,
-        upstream: signal, // <-- encadeia cancelamento
+        upstream: signal,
         allowedHosts: hosts,
         maxResponseBytes: maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
         userAgent,
-        followRedirects: followRedirects !== false, // default: follow
+        followRedirects: followRedirects !== false,
       });
     } catch (err) {
       lastErr = err;
 
-      // Se cancelado pelo upstream, não faz sentido continuar tentando
       if (signal?.aborted) break;
 
       const status = err?.response?.status;
