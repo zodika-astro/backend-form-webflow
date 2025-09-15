@@ -9,19 +9,24 @@
  *  2) Fallback to Google Time Zone API (if key is provided).
  *  3) Final fallback: static env values TZ_FALLBACK_ID + TZ_FALLBACK_OFFSET_MIN.
  *
- * Features:
- *  - Per-request caching (in-memory) with TTL to avoid repeated lookups.
- *  - Each provider call has its own timeout guard.
- *  - Always returns { tzId, offsetMin } — never throws.
+ * Returns:
+ *  { tzId, offsetMin, offsetHours }
+ *    - offsetMin: integer minutes (canonical for DB)
+ *    - offsetHours: decimal hours (for Ephemeris/Make/UI)
+ *
+ * Design:
+ *  - Per-request in-memory cache with TTL.
+ *  - Each provider has its own timeout guard.
+ *  - Never throws; falls back to {tzId:null, offsetMin:null, offsetHours:null}.
  */
 
 const DEFAULT_PROVIDER_TIMEOUT_MS = toInt(process.env.TZ_PROVIDER_TIMEOUT_MS, 6000);
 
 // Final static fallback (optional)
-const FALLBACK_TZ = orNull(process.env.TZ_FALLBACK_ID);
-const FALLBACK_OFF = toInt(process.env.TZ_FALLBACK_OFFSET_MIN, null);
+const FALLBACK_TZ  = orNull(process.env.TZ_FALLBACK_ID);
+const FALLBACK_OFF = toInt(process.env.TZ_FALLBACK_OFFSET_MIN, null); // minutes
 
-// GeoNames (preferred source for historical offsets)
+// GeoNames (preferred for historical offsets)
 const GEONAMES_USERNAME = orNull(process.env.GEONAMES_USERNAME);
 
 // ----------------------------- In-memory cache ------------------------------
@@ -45,7 +50,6 @@ function getCache(key) {
 }
 function setCache(key, value) {
   if (CACHE.size >= CACHE_MAX_ENTRIES) {
-    // evict oldest (FIFO)
     const firstKey = CACHE.keys().next().value;
     if (firstKey) CACHE.delete(firstKey);
   }
@@ -56,9 +60,14 @@ function setCache(key, value) {
 
 /**
  * Resolve the timezone at a given birth moment (historical).
- * Falls back gracefully across providers and static envs.
  *
- * @returns {Promise<{tzId: string|null, offsetMin: number|null}>}
+ * @param {Object} args
+ * @param {number|string} args.lat
+ * @param {number|string} args.lng
+ * @param {string} args.birthDate   - 'YYYY-MM-DD'
+ * @param {string} args.birthTime   - 'HH:MM'
+ * @param {string} [args.apiKey]    - Google Time Zone API key (fallback)
+ * @returns {Promise<{tzId: string|null, offsetMin: number|null, offsetHours: number|null}>}
  */
 async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
   const latNum = toNum(lat);
@@ -107,7 +116,13 @@ async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
   return result;
 }
 
-module.exports = { getTimezoneAtMoment };
+/** Convenience: convert minutes to decimal hours with 3-dec rounding. */
+function toHours(offsetMin) {
+  if (!Number.isFinite(+offsetMin)) return null;
+  return Math.round((Number(offsetMin) / 60) * 1000) / 1000;
+}
+
+module.exports = { getTimezoneAtMoment, toHours };
 
 // ----------------------------- Providers ------------------------------
 
@@ -121,23 +136,22 @@ async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
 
   const data = await fetchJson(url, { timeoutMs });
   if (!data) return null;
-
   if (data.status && data.status.message) return null; // GeoNames error
 
   const tzId = orNull(data.timezoneId);
-  const baseOffsetHours = isFiniteNum(data.gmtOffset)
-    ? data.gmtOffset
-    : data.rawOffset;
-  let finalHours = isFiniteNum(baseOffsetHours) ? baseOffsetHours : null;
 
-  // Prefer dstOffset if present (DST active)
-  if (isFiniteNum(data.dstOffset) && isFiniteNum(baseOffsetHours) && data.dstOffset !== data.gmtOffset) {
-    finalHours = data.dstOffset;
+  // Prefer dstOffset when DST active; else gmtOffset/rawOffset
+  const baseHours = isFiniteNum(data.gmtOffset) ? Number(data.gmtOffset) : Number(data.rawOffset);
+  let finalHours = isFiniteNum(baseHours) ? baseHours : null;
+  if (isFiniteNum(data.dstOffset) && isFiniteNum(baseHours) && data.dstOffset !== data.gmtOffset) {
+    finalHours = Number(data.dstOffset);
   }
 
   if (!tzId || !isFiniteNum(finalHours)) return null;
-  const offsetMin = Math.round(Number(finalHours) * 60);
-  return { tzId, offsetMin };
+
+  const offsetMin = Math.round(finalHours * 60);
+  const offsetHours = toHours(offsetMin);
+  return { tzId, offsetMin, offsetHours };
 }
 
 /**
@@ -150,8 +164,8 @@ async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
     timestamp: String(timestampSec),
     key: apiKey,
   });
-
   const url = `https://maps.googleapis.com/maps/api/timezone/json?${qs.toString()}`;
+
   const data = await fetchJson(url, { timeoutMs });
   if (!data || data.status !== 'OK') return null;
 
@@ -160,16 +174,18 @@ async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
   if (!tzId || !isFiniteNum(totalOffsetSec)) return null;
 
   const offsetMin = Math.round(totalOffsetSec / 60);
-  return { tzId, offsetMin };
+  const offsetHours = toHours(offsetMin);
+  return { tzId, offsetMin, offsetHours };
 }
 
 // ----------------------------- Utilities ------------------------------
 
 function staticFallbackOrNull() {
   if (FALLBACK_TZ && isFiniteNum(FALLBACK_OFF)) {
-    return { tzId: FALLBACK_TZ, offsetMin: Number(FALLBACK_OFF) };
+    const offsetMin = Number(FALLBACK_OFF);
+    return { tzId: FALLBACK_TZ, offsetMin, offsetHours: toHours(offsetMin) };
   }
-  return { tzId: null, offsetMin: null };
+  return { tzId: null, offsetMin: null, offsetHours: null };
 }
 
 async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body } = {}) {
