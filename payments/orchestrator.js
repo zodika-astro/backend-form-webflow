@@ -9,7 +9,7 @@
  * normalized domain event: 'payments:status-changed'.
  *
  * It does NOT trigger product workflows. Product handlers subscribe to
- * the event bus (see modules/*/handler.js).
+ // * the event bus (see modules/product/handler.js).
  */
 
 const { EventEmitter } = require('events');
@@ -19,11 +19,27 @@ const baseLogger = require('../utils/logger').child('payments.orchestrator');
 // Public event bus (singleton)
 const events = new EventEmitter();
 
-/* -------------------------- Status mapping (MP) --------------------------- */
+/* ----------------------- Normalization matrix (v1) ------------------------ *
+ * Canonical statuses we persist & propagage:
+ *   CREATED | PENDING | REQUIRES_ACTION | APPROVED | REJECTED | CANCELED
+ *   | REFUNDED | CHARGED_BACK | EXPIRED | UPDATED
+ *
+ * MP → normalized:
+ *   approved        → APPROVED
+ *   pending         → PENDING
+ *   in_process      → PENDING
+ *   rejected        → REJECTED
+ *   cancelled       → CANCELED
+ *   canceled        → CANCELED
+ *   refunded        → REFUNDED
+ *   charged_back    → CHARGED_BACK
+ *   expired         → EXPIRED
+ *   (others)        → UPDATED
+ * ------------------------------------------------------------------------- */
 
 function mapMpToNormalizedStatus(mpStatus) {
   switch (String(mpStatus || '').toLowerCase()) {
-    case 'approved':       return 'PAID';       // MP "approved" → normalized "PAID"
+    case 'approved':       return 'APPROVED';
     case 'pending':
     case 'in_process':     return 'PENDING';
     case 'rejected':       return 'REJECTED';
@@ -32,17 +48,17 @@ function mapMpToNormalizedStatus(mpStatus) {
     case 'refunded':       return 'REFUNDED';
     case 'charged_back':   return 'CHARGED_BACK';
     case 'expired':        return 'EXPIRED';
-    default:               return 'UPDATED';    // technical fallback (rare)
+    default:               return 'UPDATED';
   }
 }
 
-/* ------------------------------ Helpers ---------------------------------- */
+/* -------------------------------- Helpers -------------------------------- */
 
 function toCents(amount) {
   if (amount == null) return null;
   const n = Number(amount);
   if (!Number.isFinite(n)) return null;
-  return Math.round(n * 100);
+  return Math.round(n * 100); // BRL decimal → integer cents
 }
 
 function toDateOrNull(v) {
@@ -112,9 +128,7 @@ async function snapshotCheckoutCreated({ requestId, checkoutId, link, amountCent
 
   // Best-effort enrichment for event payload (product_type)
   let ctx = null;
-  try {
-    ctx = await getRequestContext({ requestId, checkoutId });
-  } catch (_) { /* ignore */ }
+  try { ctx = await getRequestContext({ requestId, checkoutId }); } catch (_) { /* ignore */ }
 
   // Emit normalized event for downstream product handlers
   try {
@@ -199,7 +213,7 @@ async function updateFromMP(payment, opts = {}) {
   `;
 
   const paramsCommon = [
-    normalizedStatus,                       // $2
+    normalizedStatus,                       // $2 (now 'APPROVED' when MP says 'approved')
     statusDetail,                           // $3
     amountCents,                            // $4
     currency,                               // $5
@@ -211,9 +225,7 @@ async function updateFromMP(payment, opts = {}) {
 
   // Enrich event with product_type / possibly resolve request_id by checkout
   let ctx = null;
-  try {
-    ctx = await getRequestContext({ requestId, checkoutId: preferenceId });
-  } catch (_) { /* ignore */ }
+  try { ctx = await getRequestContext({ requestId, checkoutId: preferenceId }); } catch (_) { /* ignore */ }
 
   const effectiveRequestId = Number.isFinite(requestId)
     ? requestId
@@ -238,7 +250,7 @@ async function updateFromMP(payment, opts = {}) {
       requestId: effectiveRequestId,
       productType: ctx?.product_type || null,
       provider: 'MP',
-      normalizedStatus,               // e.g., 'PAID', 'PENDING', ...
+      normalizedStatus,               // e.g., 'APPROVED', 'PENDING', ...
       statusDetail,
       amountCents,
       currency,
@@ -253,7 +265,7 @@ async function updateFromMP(payment, opts = {}) {
 }
 
 module.exports = {
-  events,                    // <<-- IMPORTANT: exported EventEmitter (fixes the crash)
+  events,                    // exported EventEmitter
   snapshotCheckoutCreated,
   updateFromMP,
 };
