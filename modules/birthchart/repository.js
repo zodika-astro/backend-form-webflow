@@ -122,28 +122,31 @@ async function findByRequestId(requestId) {
 
 /**
  * Update timezone fields only if currently missing/empty.
- * Stores offset in MINUTES in DB (canonical). External payloads use hours.
+ * Stores offset in MINUTES and HOURS (derived) in DB.
  */
 async function updateTimezoneIfMissing(requestId, { tzId, offsetMin }) {
   const sql = `
     UPDATE public.zodika_requests
-       SET birth_timezone_id     = COALESCE(NULLIF(birth_timezone_id, ''), $2),
-           birth_utc_offset_min  = COALESCE(birth_utc_offset_min, $3),
-           updated_at            = NOW()
+       SET birth_timezone_id        = COALESCE(NULLIF(birth_timezone_id, ''), $2),
+           birth_utc_offset_min     = COALESCE(birth_utc_offset_min, $3),
+           birth_utc_offset_hours   = COALESCE(birth_utc_offset_hours, ROUND(($3::numeric / 60.0), 3)),
+           updated_at               = NOW()
      WHERE request_id = $1
-       AND (birth_timezone_id IS NULL OR birth_timezone_id = '' OR birth_utc_offset_min IS NULL)
+       AND (birth_timezone_id IS NULL OR birth_timezone_id = '' OR birth_utc_offset_min IS NULL OR birth_utc_offset_hours IS NULL)
     RETURNING *;
   `;
-  const params = [requestId, tzId ?? null, Number.isFinite(offsetMin) ? Math.trunc(offsetMin) : null];
+  const params = [
+    requestId,
+    tzId ?? null,
+    Number.isFinite(offsetMin) ? Math.trunc(offsetMin) : null,
+  ];
   const { rows } = await db.query(sql, params);
   return rows[0] || null;
 }
 
 /* ---------------------------- Product Jobs (audit) -------------------------- */
 
-/**
- * Return SUCCEEDED job (idempotency gate) if any for (request, product, trigger).
- */
+/** Return SUCCEEDED job (idempotency gate) if any for (request, product, trigger). */
 async function findSucceededJob(requestId, productType, triggerStatus) {
   const sql = `
     SELECT *
@@ -158,9 +161,7 @@ async function findSucceededJob(requestId, productType, triggerStatus) {
   return rows[0] || null;
 }
 
-/**
- * Insert RUNNING job with attempt = last_attempt + 1.
- */
+/** Insert RUNNING job with attempt = last_attempt + 1. */
 async function markJobStart(requestId, productType, triggerStatus) {
   const sql = `
     INSERT INTO public.product_jobs (
@@ -181,9 +182,7 @@ async function markJobStart(requestId, productType, triggerStatus) {
   return rows[0];
 }
 
-/**
- * Optional partial metrics update while RUNNING.
- */
+/** Optional partial metrics update while RUNNING. */
 async function markJobPartialMetrics(jobId, {
   ephemeris_http_status = null,
   webhook_http_status = null,
