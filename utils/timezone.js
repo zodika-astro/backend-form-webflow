@@ -3,28 +3,24 @@
 
 /**
  * Historical timezone resolution (Astrology-grade)
- * ------------------------------------------------
- * 1) Prefer GeoNames (historical offsets by date) — free plan via HTTP.
- * 2) Fallback: Google Time Zone API (if key provided).
- * 3) Final fallback: static env (TZ_FALLBACK_ID + TZ_FALLBACK_OFFSET_MIN).
- *
- * Returns:
- *   { tzId, offsetMin, offsetHours }
- *   - offsetMin: integer minutes (canonical for DB)
- *   - offsetHours: decimal hours (for Ephemeris/Make/UI)
+ * -----------------------------------------------
+ * 1) GeoNames (by date)  2) Google Time Zone (fallback)  3) Static env fallback
+ * Returns { tzId, offsetMin, offsetHours }
  */
+
+const { fetch } = require('undici'); // ensure fetch on Node 16/18/20+
 
 const DEFAULT_PROVIDER_TIMEOUT_MS = toInt(process.env.TZ_PROVIDER_TIMEOUT_MS, 6000);
 
-// Static fallback (optional)
+// Final static fallback (optional)
 const FALLBACK_TZ  = orNull(process.env.TZ_FALLBACK_ID);
 const FALLBACK_OFF = toInt(process.env.TZ_FALLBACK_OFFSET_MIN, null); // minutes
 
 // GeoNames (preferred for historical offsets)
 const GEONAMES_USERNAME = orNull(process.env.GEONAMES_USERNAME);
 
-/* ----------------------------- In-memory cache ----------------------------- */
-/** Key: `${lat},${lng},${birthDate},${birthTime}` */
+/* ----------------------------- Tiny LRU cache ------------------------------ */
+
 const CACHE = new Map();
 const CACHE_TTL_MS = toInt(process.env.TZ_CACHE_TTL_MS, 12 * 60 * 60 * 1000); // 12h
 const CACHE_MAX_ENTRIES = toInt(process.env.TZ_CACHE_MAX_ENTRIES, 500);
@@ -37,27 +33,16 @@ function getCache(key) {
 }
 function setCache(key, value) {
   if (CACHE.size >= CACHE_MAX_ENTRIES) {
-    const firstKey = CACHE.keys().next().value;
-    if (firstKey) CACHE.delete(firstKey);
+    const first = CACHE.keys().next().value;
+    if (first) CACHE.delete(first);
   }
   CACHE.set(key, { value, expireAt: Date.now() + CACHE_TTL_MS });
 }
 
 /* -------------------------------- Public API ------------------------------- */
 
-/**
- * Resolve the timezone at a given birth moment (historical).
- * @param {Object} args
- * @param {number|string} args.lat
- * @param {number|string} args.lng
- * @param {string} args.birthDate - 'YYYY-MM-DD'
- * @param {string} args.birthTime - 'HH:MM'
- * @param {string} [args.apiKey]  - Google Time Zone API key (fallback)
- * @returns {Promise<{tzId: string|null, offsetMin: number|null, offsetHours: number|null}>}
- */
 async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
-  const latNum = toNum(lat);
-  const lngNum = toNum(lng);
+  const latNum = toNum(lat), lngNum = toNum(lng);
   if (!isFiniteNum(latNum) || !isFiniteNum(lngNum) || !isIsoDate(birthDate) || !isHHmm(birthTime)) {
     return staticFallbackOrNull();
   }
@@ -68,41 +53,35 @@ async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
 
   let result = null;
 
-  // Provider #1: GeoNames (FREE plan = HTTP endpoint)
+  // 1) GeoNames (FREE plan = HTTP endpoint)
   if (GEONAMES_USERNAME) {
     try {
       result = await geonamesLookup({
-        lat: latNum,
-        lng: lngNum,
-        date: birthDate,
-        username: GEONAMES_USERNAME,
+        lat: latNum, lng: lngNum, date: birthDate, username: GEONAMES_USERNAME,
         timeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
       });
     } catch { /* swallow */ }
   }
 
-  // Provider #2: Google Time Zone API
+  // 2) Google fallback (needs API key)
   if (!result && apiKey) {
     try {
       const tsSec = toUnixTimestampSec(birthDate, birthTime);
       result = await googleTzLookup({
-        lat: latNum,
-        lng: lngNum,
-        timestampSec: tsSec,
-        apiKey,
+        lat: latNum, lng: lngNum, timestampSec: tsSec, apiKey,
         timeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
       });
     } catch { /* swallow */ }
   }
 
-  // Final fallback (static), or nulls
+  // 3) Static fallback or nulls
   if (!result) result = staticFallbackOrNull();
 
   setCache(cacheKey, result);
   return result;
 }
 
-/** Minutes → decimal hours (3-dec rounding). */
+/** Convert minutes to decimal hours (rounded to 3 decimals). */
 function toHours(offsetMin) {
   if (!Number.isFinite(+offsetMin)) return null;
   return Math.round((Number(offsetMin) / 60) * 1000) / 1000;
@@ -113,8 +92,7 @@ module.exports = { getTimezoneAtMoment, toHours };
 /* -------------------------------- Providers -------------------------------- */
 
 /**
- * GeoNames historical timezone.
- * FREE plan: http://api.geonames.org (HTTPS requires premium).
+ * GeoNames historical timezone (FREE: http).
  * API: http://api.geonames.org/timezoneJSON?lat=..&lng=..&date=YYYY-MM-DD&username=...
  */
 async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
@@ -123,23 +101,32 @@ async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
 
   const data = await fetchJson(url, { timeoutMs });
   if (!data) return null;
-  if (data.status && data.status.message) return null; // GeoNames error
+  if (data.status && data.status.message) return null; // e.g., user not found / limits
 
+  // Try official fields first
   const tzId = orNull(data.timezoneId);
+  const hasGmt = isFiniteNum(data.gmtOffset);
+  const hasRaw = isFiniteNum(data.rawOffset);
+  const hasDst = isFiniteNum(data.dstOffset);
 
-  // Prefer dstOffset when DST active; else gmtOffset/rawOffset
-  const baseHours = isFiniteNum(data.gmtOffset) ? Number(data.gmtOffset) : Number(data.rawOffset);
-  let finalHours = isFiniteNum(baseHours) ? baseHours : null;
-  if (isFiniteNum(data.dstOffset) && isFiniteNum(baseHours) && data.dstOffset !== data.gmtOffset) {
-    finalHours = Number(data.dstOffset);
+  let finalHours = null;
+  if (hasGmt) finalHours = Number(data.gmtOffset);
+  if (hasDst && hasGmt && data.dstOffset !== data.gmtOffset) finalHours = Number(data.dstOffset);
+  if (!hasGmt && hasRaw) finalHours = Number(data.rawOffset);
+
+  // Last-resort: parse dates[].offsetToGmt if present
+  if (!isFiniteNum(finalHours)) {
+    const offStr = Array.isArray(data.dates)
+      ? data.dates.find(d => typeof d?.offsetToGmt === 'string')?.offsetToGmt
+      : null;
+    const offNum = offStr != null ? Number.parseFloat(offStr) : NaN;
+    if (Number.isFinite(offNum)) finalHours = offNum;
   }
 
-  // Accept valid offsets even if timezoneId is missing
   if (!isFiniteNum(finalHours)) return null;
 
   const offsetMin = Math.round(finalHours * 60);
-  const offsetHours = toHours(offsetMin);
-  return { tzId: tzId || null, offsetMin, offsetHours };
+  return { tzId: tzId || null, offsetMin, offsetHours: toHours(offsetMin) };
 }
 
 /**
@@ -147,11 +134,7 @@ async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
  * API: https://maps.googleapis.com/maps/api/timezone/json?location=LAT,LNG&timestamp=UNIX&key=API_KEY
  */
 async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
-  const qs = new URLSearchParams({
-    location: `${lat},${lng}`,
-    timestamp: String(timestampSec),
-    key: apiKey,
-  });
+  const qs = new URLSearchParams({ location: `${lat},${lng}`, timestamp: String(timestampSec), key: apiKey });
   const url = `https://maps.googleapis.com/maps/api/timezone/json?${qs.toString()}`;
 
   const data = await fetchJson(url, { timeoutMs });
@@ -162,8 +145,7 @@ async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
   if (!isFiniteNum(totalOffsetSec)) return null;
 
   const offsetMin = Math.round(totalOffsetSec / 60);
-  const offsetHours = toHours(offsetMin);
-  return { tzId: tzId || null, offsetMin, offsetHours };
+  return { tzId: tzId || null, offsetMin, offsetHours: toHours(offsetMin) };
 }
 
 /* -------------------------------- Utilities -------------------------------- */
@@ -176,11 +158,6 @@ function staticFallbackOrNull() {
   return { tzId: null, offsetMin: null, offsetHours: null };
 }
 
-/**
- * Tolerant JSON fetch:
- * - GeoNames sometimes answers with text/plain or text/javascript but JSON body.
- * - Always read as text and try JSON.parse.
- */
 async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -192,15 +169,9 @@ async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body 
       signal: ctrl.signal,
     });
     if (!resp.ok) return null;
-
-    const text = await resp.text();
-    if (!text) return null;
-    try {
-      const data = JSON.parse(text);
-      return (data && typeof data === 'object') ? data : null;
-    } catch {
-      return null;
-    }
+    const ct = resp.headers.get('content-type') || '';
+    const data = ct.includes('application/json') ? await resp.json().catch(() => null) : null;
+    return data || null;
   } catch {
     return null;
   } finally {
@@ -220,16 +191,7 @@ function isHHmm(s) {
   const [h, m] = s.split(':').map((n) => parseInt(n, 10));
   return h >= 0 && h <= 23 && m >= 0 && m <= 59;
 }
-function toInt(v, def) {
-  const n = Number.parseInt(String(v ?? ''), 10);
-  return Number.isFinite(n) ? n : def;
-}
-function toNum(v, def = NaN) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : def;
-}
+function toInt(v, def) { const n = Number.parseInt(String(v ?? ''), 10); return Number.isFinite(n) ? n : def; }
+function toNum(v, def = NaN) { const n = Number(v); return Number.isFinite(n) ? n : def; }
 function isFiniteNum(v) { return typeof v === 'number' && Number.isFinite(v); }
-function orNull(v) {
-  const s = (v ?? '').toString().trim();
-  return s ? s : null;
-}
+function orNull(v) { const s = (v ?? '').toString().trim(); return s ? s : null; }
