@@ -82,7 +82,7 @@ async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
 
   let result = null;
 
-  // Provider #1: GeoNames
+  // Provider #1: GeoNames (FREE plan uses HTTP endpoint)
   if (GEONAMES_USERNAME) {
     try {
       result = await geonamesLookup({
@@ -128,11 +128,12 @@ module.exports = { getTimezoneAtMoment, toHours };
 
 /**
  * GeoNames historical timezone.
- * API: https://secure.geonames.org/timezoneJSON?lat=..&lng=..&date=YYYY-MM-DD&username=...
+ * FREE plan: use http://api.geonames.org (HTTPS requires premium).
+ * API: http://api.geonames.org/timezoneJSON?lat=..&lng=..&date=YYYY-MM-DD&username=...
  */
 async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
   const qs = new URLSearchParams({ lat: String(lat), lng: String(lng), date, username });
-  const url = `https://secure.geonames.org/timezoneJSON?${qs.toString()}`;
+  const url = `http://api.geonames.org/timezoneJSON?${qs.toString()}`;
 
   const data = await fetchJson(url, { timeoutMs });
   if (!data) return null;
