@@ -267,6 +267,24 @@ async function onApprovedEvent(evt) {
   } catch (err) {
     baseLogger.error({ msg: err?.message }, 'birthchart handler failed');
   }
+
+  if (!Number.isFinite(timezoneHours)) {
+  log.warn({
+    inputs: {
+      lat: Number(request.birth_place_lat),
+      lng: Number(request.birth_place_lng),
+      birthDate: String(request.birth_date),
+      birthTime: String(request.birth_time).slice(0, 5),
+    },
+    envPresence: {
+      GEONAMES_USERNAME: !!process.env.GEONAMES_USERNAME,
+      GOOGLE_MAPS_API_KEY: !!process.env.GOOGLE_MAPS_API_KEY,
+    }
+  }, 'timezone unresolved; aborting');
+  await repo.markJobFailed(job.job_id, 'timezone_unresolved');
+  return;
+}
+
 }
 
 // ---- Subscription ----
