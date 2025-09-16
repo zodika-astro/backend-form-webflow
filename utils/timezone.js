@@ -97,7 +97,7 @@ module.exports = { getTimezoneAtMoment, toHours };
  */
 async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
   const qs = new URLSearchParams({ lat: String(lat), lng: String(lng), date, username });
-  const url = `http://api.geonames.org/timezoneJSON?${qs.toString()}`;
+  const url = `https://api.geonames.org/timezoneJSON?${qs.toString()}`;
 
   const data = await fetchJson(url, { timeoutMs });
   if (!data) return null;
