@@ -23,17 +23,20 @@ const { getTimezoneAtMoment } = require('../../utils/timezone');
 
 // Env
 const MAKE_WEBHOOK_URL_PAID = process.env.MAKE_WEBHOOK_URL_PAID;
-const EPHEMERIS_API_URL     =
+const EPHEMERIS_API_URL =
   process.env.EPHEMERIS_API_URL || 'https://ephemeris-api-production.up.railway.app/api/v1/ephemeris';
-const EPHEMERIS_API_KEY     = process.env.EPHEMERIS_API_KEY;
+const EPHEMERIS_API_KEY = process.env.EPHEMERIS_API_KEY;
 
 // Optional Basic Auth for Ephemeris
 const EPHEMERIS_BASIC_USER = process.env.EPHEMERIS_BASIC_USER || process.env.EPHEMERIS_USER;
 const EPHEMERIS_BASIC_PASS = process.env.EPHEMERIS_BASIC_PASS || process.env.EPHEMERIS_PASSWORD;
 
+// Optional Google fallback for timezone resolution
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || null;
+
 // Timeouts
 const EPHEMERIS_HTTP_TIMEOUT_MS = Number(process.env.EPHEMERIS_HTTP_TIMEOUT_MS || 12000);
-const MAKE_HTTP_TIMEOUT_MS      = Number(process.env.MAKE_HTTP_TIMEOUT_MS || 10000);
+const MAKE_HTTP_TIMEOUT_MS = Number(process.env.MAKE_HTTP_TIMEOUT_MS || 10000);
 
 // Defensive constants
 const PRODUCT_TYPE = 'birth_chart';
@@ -92,9 +95,8 @@ function buildMakePayload({ requestRow, ephemeris, job, providerMeta }) {
       birth_place: requestRow.birth_place,
       birth_place_lat: requestRow.birth_place_lat,
       birth_place_lng: requestRow.birth_place_lng,
-      timezone: (requestRow.birth_utc_offset_min != null)
-        ? Number(requestRow.birth_utc_offset_min) / 60
-        : null,
+      timezone:
+        requestRow.birth_utc_offset_min != null ? Number(requestRow.birth_utc_offset_min) / 60 : null,
       created_at: requestRow.created_at,
       updated_at: requestRow.updated_at,
       payment: {
@@ -132,12 +134,21 @@ async function onApprovedEvent(evt) {
     // 0) Guards
     if (!evt?.requestId || evt.productType !== PRODUCT_TYPE) return;
     if (evt.normalizedStatus !== TRIGGER_APPROVED) return;
-    if (!MAKE_WEBHOOK_URL_PAID) { log.warn('MAKE_WEBHOOK_URL_PAID not configured; skipping'); return; }
-    if (!EPHEMERIS_API_KEY)     { log.warn('EPHEMERIS_API_KEY not configured; skipping'); return; }
+    if (!MAKE_WEBHOOK_URL_PAID) {
+      log.warn('MAKE_WEBHOOK_URL_PAID not configured; skipping');
+      return;
+    }
+    if (!EPHEMERIS_API_KEY) {
+      log.warn('EPHEMERIS_API_KEY not configured; skipping');
+      return;
+    }
 
     // 1) Idempotency
     const already = await repo.findSucceededJob(evt.requestId, PRODUCT_TYPE, TRIGGER_APPROVED);
-    if (already) { log.info({ jobId: already.job_id }, 'job already completed; skipping'); return; }
+    if (already) {
+      log.info({ jobId: already.job_id }, 'job already completed; skipping');
+      return;
+    }
 
     // 2) Start job
     const job = await repo.markJobStart(evt.requestId, PRODUCT_TYPE, TRIGGER_APPROVED);
@@ -152,7 +163,8 @@ async function onApprovedEvent(evt) {
 
     // 4) Ensure timezone (minutes) in DB
     let tzId = request.birth_timezone_id || null;
-    let offsetMin = (request.birth_utc_offset_min != null) ? Number(request.birth_utc_offset_min) : null;
+    let offsetMin =
+      request.birth_utc_offset_min != null ? Number(request.birth_utc_offset_min) : null;
 
     if (!tzId || !Number.isFinite(offsetMin)) {
       const res = await getTimezoneAtMoment({
@@ -160,7 +172,10 @@ async function onApprovedEvent(evt) {
         lng: request.birth_place_lng,
         birthDate: request.birth_date,
         birthTime: String(request.birth_time).slice(0, 5), // HH:MM
+        // NEW: enable Google fallback if GeoNames fails
+        apiKey: GOOGLE_MAPS_API_KEY || undefined,
       });
+
       tzId = res?.tzId ?? tzId ?? null;
       offsetMin = Number.isFinite(res?.offsetMin) ? res.offsetMin : offsetMin;
 
@@ -169,7 +184,7 @@ async function onApprovedEvent(evt) {
       }
     }
 
-    const timezoneHours = Number.isFinite(offsetMin) ? (offsetMin / 60) : null;
+    const timezoneHours = Number.isFinite(offsetMin) ? offsetMin / 60 : null;
     if (!Number.isFinite(timezoneHours)) {
       await repo.markJobFailed(job.job_id, 'timezone_unresolved');
       log.warn('timezone unresolved; aborting');
@@ -257,7 +272,7 @@ async function onApprovedEvent(evt) {
 // ---- Subscription ----
 // Importing this file wires the listener.
 orchestrator.events.on('payments:status-changed', (evt) => {
-  // evt shape (as emitted by orchestrator):
+  // evt shape:
   // { requestId, productType, provider, normalizedStatus, statusDetail,
   //   amountCents, currency, checkoutId, paymentId, authorizedAt, link }
   if (evt?.normalizedStatus === TRIGGER_APPROVED && evt?.productType === PRODUCT_TYPE) {
