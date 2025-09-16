@@ -1,4 +1,3 @@
-// utils/timezone.js
 'use strict';
 
 /**
@@ -29,7 +28,7 @@ const FALLBACK_OFF = toInt(process.env.TZ_FALLBACK_OFFSET_MIN, null); // minutes
 // GeoNames (preferred for historical offsets)
 const GEONAMES_USERNAME = orNull(process.env.GEONAMES_USERNAME);
 
-// ----------------------------- In-memory cache ------------------------------
+/* ----------------------------- In-memory cache ----------------------------- */
 
 /**
  * Simple LRU-ish cache with TTL.
@@ -56,7 +55,7 @@ function setCache(key, value) {
   CACHE.set(key, { value, expireAt: Date.now() + CACHE_TTL_MS });
 }
 
-// ----------------------------- Public API ------------------------------
+/* -------------------------------- Public API ------------------------------- */
 
 /**
  * Resolve the timezone at a given birth moment (historical).
@@ -124,7 +123,7 @@ function toHours(offsetMin) {
 
 module.exports = { getTimezoneAtMoment, toHours };
 
-// ----------------------------- Providers ------------------------------
+/* -------------------------------- Providers -------------------------------- */
 
 /**
  * GeoNames historical timezone.
@@ -148,11 +147,12 @@ async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
     finalHours = Number(data.dstOffset);
   }
 
-  if (!tzId || !isFiniteNum(finalHours)) return null;
+  // IMPORTANT: accept valid offsets even if timezoneId is missing
+  if (!isFiniteNum(finalHours)) return null;
 
   const offsetMin = Math.round(finalHours * 60);
   const offsetHours = toHours(offsetMin);
-  return { tzId, offsetMin, offsetHours };
+  return { tzId: tzId || null, offsetMin, offsetHours };
 }
 
 /**
@@ -172,14 +172,14 @@ async function googleTzLookup({ lat, lng, timestampSec, apiKey, timeoutMs }) {
 
   const tzId = orNull(data.timeZoneId);
   const totalOffsetSec = toNum(data.rawOffset, 0) + toNum(data.dstOffset, 0);
-  if (!tzId || !isFiniteNum(totalOffsetSec)) return null;
+  if (!isFiniteNum(totalOffsetSec)) return null;
 
   const offsetMin = Math.round(totalOffsetSec / 60);
   const offsetHours = toHours(offsetMin);
-  return { tzId, offsetMin, offsetHours };
+  return { tzId: tzId || null, offsetMin, offsetHours };
 }
 
-// ----------------------------- Utilities ------------------------------
+/* -------------------------------- Utilities -------------------------------- */
 
 function staticFallbackOrNull() {
   if (FALLBACK_TZ && isFiniteNum(FALLBACK_OFF)) {
