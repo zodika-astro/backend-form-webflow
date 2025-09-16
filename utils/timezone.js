@@ -95,38 +95,64 @@ module.exports = { getTimezoneAtMoment, toHours };
  * GeoNames historical timezone (FREE: http).
  * API: http://api.geonames.org/timezoneJSON?lat=..&lng=..&date=YYYY-MM-DD&username=...
  */
+// In geonamesLookup function, replace with detailed logging:
 async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
   const qs = new URLSearchParams({ lat: String(lat), lng: String(lng), date, username });
   const url = `https://api.geonames.org/timezoneJSON?${qs.toString()}`;
+  
+  console.log('GeoNames API call:', url.replace(username, 'REDACTED')); // Don't log username
 
   const data = await fetchJson(url, { timeoutMs });
-  if (!data) return null;
-  if (data.status && data.status.message) return null; // e.g., user not found / limits
-
-  // Try official fields first
-  const tzId = orNull(data.timezoneId);
-  const hasGmt = isFiniteNum(data.gmtOffset);
-  const hasRaw = isFiniteNum(data.rawOffset);
-  const hasDst = isFiniteNum(data.dstOffset);
-
-  let finalHours = null;
-  if (hasGmt) finalHours = Number(data.gmtOffset);
-  if (hasDst && hasGmt && data.dstOffset !== data.gmtOffset) finalHours = Number(data.dstOffset);
-  if (!hasGmt && hasRaw) finalHours = Number(data.rawOffset);
-
-  // Last-resort: parse dates[].offsetToGmt if present
-  if (!isFiniteNum(finalHours)) {
-    const offStr = Array.isArray(data.dates)
-      ? data.dates.find(d => typeof d?.offsetToGmt === 'string')?.offsetToGmt
-      : null;
-    const offNum = offStr != null ? Number.parseFloat(offStr) : NaN;
-    if (Number.isFinite(offNum)) finalHours = offNum;
+  
+  if (!data) {
+    console.warn('GeoNames: No data received');
+    return null;
+  }
+  
+  if (data.status && data.status.message) {
+    console.warn('GeoNames API error:', data.status.message);
+    return null;
   }
 
-  if (!isFiniteNum(finalHours)) return null;
+  console.log('GeoNames raw response:', JSON.stringify(data, null, 2));
+  
+  // ... rest of your existing code ...
+}
 
-  const offsetMin = Math.round(finalHours * 60);
-  return { tzId: tzId || null, offsetMin, offsetHours: toHours(offsetMin) };
+// Also add logging to fetchJson:
+async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body } = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    console.log(`Fetching: ${method} ${url}`);
+    const resp = await fetch(url, {
+      method,
+      headers: { Accept: 'application/json', ...(headers || {}) },
+      body,
+      signal: ctrl.signal,
+    });
+    
+    console.log(`Response status: ${resp.status} ${resp.statusText}`);
+    
+    if (!resp.ok) {
+      console.warn(`HTTP error: ${resp.status} ${resp.statusText}`);
+      return null;
+    }
+    
+    const ct = resp.headers.get('content-type') || '';
+    const data = ct.includes('application/json') ? await resp.json().catch(() => null) : null;
+    
+    if (!data) {
+      console.warn('No JSON data in response');
+    }
+    
+    return data || null;
+  } catch (error) {
+    console.warn('Fetch error:', error.message);
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 /**
