@@ -167,14 +167,14 @@ async function onApprovedEvent(evt) {
       request.birth_utc_offset_min != null ? Number(request.birth_utc_offset_min) : null;
 
     if (!tzId || !Number.isFinite(offsetMin)) {
-      const res = await getTimezoneAtMoment({
+        const res = await getTimezoneAtMoment({
         lat: request.birth_place_lat,
         lng: request.birth_place_lng,
         birthDate: request.birth_date,
-        birthTime: String(request.birth_time).slice(0, 5), // HH:MM
-        // NEW: enable Google fallback if GeoNames fails
-        apiKey: GOOGLE_MAPS_API_KEY || undefined,
+        birthTime: String(request.birth_time).slice(0, 5),
+        apiKey: GOOGLE_MAPS_API_KEY || undefined, // fallback Google
       });
+
 
       tzId = res?.tzId ?? tzId ?? null;
       offsetMin = Number.isFinite(res?.offsetMin) ? res.offsetMin : offsetMin;
