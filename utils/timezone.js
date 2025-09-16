@@ -29,11 +29,12 @@ function setCache(key, value) {
 
 async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
   const latNum = toNum(lat), lngNum = toNum(lng);
-  if (!isFiniteNum(latNum) || !isFiniteNum(lngNum) || !isIsoDate(birthDate) || !isHHmm(birthTime)) {
+  if (!isFiniteNum(latNum) || !isFiniteNum(lngNum) || !isIsoDate(birthDate) || !isValidTime(birthTime)) {
     return staticFallbackOrNull();
   }
 
-  const cacheKey = `${latNum},${lngNum},${birthDate},${birthTime}`;
+  const normalizedTime = normalizeTime(birthTime);
+  const cacheKey = `${latNum},${lngNum},${birthDate},${normalizedTime}`;
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
@@ -52,7 +53,7 @@ async function getTimezoneAtMoment({ lat, lng, birthDate, birthTime, apiKey }) {
 
   if (!result && apiKey) {
     try {
-      const tsSec = toUnixTimestampSec(birthDate, birthTime);
+      const tsSec = toUnixTimestampSec(birthDate, normalizedTime);
       result = await googleTzLookup({
         lat: latNum, lng: lngNum, timestampSec: tsSec, apiKey,
         timeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
@@ -80,31 +81,43 @@ async function geonamesLookup({ lat, lng, date, username, timeoutMs }) {
   }
 
   const qs = new URLSearchParams({ lat: String(lat), lng: String(lng), date, username });
-  const url = `https://api.geonames.org/timezoneJSON?${qs.toString()}`;
+  const url = `http://api.geonames.org/timezoneJSON?${qs.toString()}`;
 
   const data = await fetchJson(url, { timeoutMs });
-  if (!data) return null;
-  if (data.status && data.status.message) return null;
-
-  const tzId = orNull(data.timezoneId);
-  const hasGmt = isFiniteNum(data.gmtOffset);
-  const hasRaw = isFiniteNum(data.rawOffset);
-  const hasDst = isFiniteNum(data.dstOffset);
-
-  let finalHours = null;
-  if (hasGmt) finalHours = Number(data.gmtOffset);
-  if (hasDst && hasGmt && data.dstOffset !== data.gmtOffset) finalHours = Number(data.dstOffset);
-  if (!hasGmt && hasRaw) finalHours = Number(data.rawOffset);
-
-  if (!isFiniteNum(finalHours)) {
-    const offStr = Array.isArray(data.dates)
-      ? data.dates.find(d => d && d.offsetToGmt !== undefined)?.offsetToGmt
-      : null;
-    const offNum = offStr != null ? Number.parseFloat(offStr) : NaN;
-    if (Number.isFinite(offNum)) finalHours = offNum;
+  if (!data) {
+    console.warn('GeoNames: No data received');
+    return null;
+  }
+  
+  if (data.status && data.status.message) {
+    console.warn('GeoNames API error:', data.status.message);
+    return null;
   }
 
-  if (!isFiniteNum(finalHours)) return null;
+  const tzId = orNull(data.timezoneId);
+  
+  let finalHours = null;
+  
+  if (isFiniteNum(data.gmtOffset)) {
+    finalHours = Number(data.gmtOffset);
+  } else if (isFiniteNum(data.rawOffset)) {
+    finalHours = Number(data.rawOffset);
+  } else if (isFiniteNum(data.dstOffset)) {
+    finalHours = Number(data.dstOffset);
+  }
+
+  if (!isFiniteNum(finalHours) && Array.isArray(data.dates)) {
+    const offsetItem = data.dates.find(d => d && typeof d.offsetToGmt === 'string');
+    if (offsetItem) {
+      const offNum = Number.parseFloat(offsetItem.offsetToGmt);
+      if (isFiniteNum(offNum)) finalHours = offNum;
+    }
+  }
+
+  if (!isFiniteNum(finalHours)) {
+    console.warn('GeoNames: No valid offset found');
+    return null;
+  }
 
   const offsetMin = Math.round(finalHours * 60);
   return { tzId: tzId || null, offsetMin, offsetHours: toHours(offsetMin) };
@@ -143,31 +156,58 @@ async function fetchJson(url, { timeoutMs = 6000, method = 'GET', headers, body 
       body,
       signal: ctrl.signal,
     });
-    if (!resp.ok) return null;
+    
+    if (!resp.ok) {
+      console.warn(`HTTP ${resp.status} for ${url}`);
+      return null;
+    }
+    
     const ct = resp.headers.get('content-type') || '';
     const data = ct.includes('application/json') ? await resp.json().catch(() => null) : null;
+    
     return data || null;
   } catch (error) {
-    console.warn('Fetch error for', url, error.message);
+    console.warn('Fetch error:', error.message);
     return null;
   } finally {
     clearTimeout(t);
   }
 }
 
-function toUnixTimestampSec(yyyyMMdd, hhmm) {
-  const [h, m] = String(hhmm).split(':').map((n) => parseInt(n, 10));
+function toUnixTimestampSec(yyyyMMdd, timeStr) {
+  const normalized = normalizeTime(timeStr);
+  const [h, m] = normalized.split(':').map((n) => parseInt(n, 10));
   const d = new Date(`${yyyyMMdd}T${pad2(h)}:${pad2(m)}:00Z`);
   return Math.floor(d.getTime() / 1000);
 }
 
+function normalizeTime(timeStr) {
+  const str = String(timeStr || '').trim();
+  if (!str) return '00:00';
+  
+  const clean = str.replace(/[^0-9:]/g, '');
+  const parts = clean.split(':');
+  
+  if (parts.length === 1 && parts[0].length === 4) {
+    return `${parts[0].substring(0, 2)}:${parts[0].substring(2)}`;
+  }
+  
+  if (parts.length >= 2) {
+    const hours = Math.max(0, Math.min(23, parseInt(parts[0]) || 0));
+    const minutes = Math.max(0, Math.min(59, parseInt(parts[1]) || 0));
+    return `${pad2(hours)}:${pad2(minutes)}`;
+  }
+  
+  return '00:00';
+}
+
+function isValidTime(timeStr) {
+  const normalized = normalizeTime(timeStr);
+  return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(normalized);
+}
+
 function pad2(n) { return n.toString().padStart(2, '0'); }
 function isIsoDate(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
-function isHHmm(s) {
-  if (typeof s !== 'string' || !/^\d{2}:\d{2}$/.test(s)) return false;
-  const [h, m] = s.split(':').map((n) => parseInt(n, 10));
-  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
-}
 function toInt(v, def) { const n = Number.parseInt(String(v ?? ''), 10); return Number.isFinite(n) ? n : def; }
 function toNum(v, def = NaN) { const n = Number(v); return Number.isFinite(n) ? n : def; }
 function isFiniteNum(v) { return typeof v === 'number' && Number.isFinite(v); }
