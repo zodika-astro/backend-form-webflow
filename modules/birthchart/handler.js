@@ -6,24 +6,19 @@
  * --------------------------------------------------
  * Listens to payment status changes (emitted by payments/orchestrator) and,
  * for APPROVED on product_type = 'birth_chart':
- *   1) Ensures historical timezone on the request (if missing).
+ *   1) Loads request (expects timezone already persisted by controller async job).
  *   2) Calls Ephemeris API with X-API-KEY (and optional Basic Auth).
  *   3) Posts a consolidated payload (request + ephemeris + meta) to Make.
  *   4) Records an execution footprint into product_jobs (idempotent).
  *
- * Production hardening in this revision:
- * - Removes an out-of-scope duplicate error block that could throw ReferenceError after catch.
- * - Robust HH:MM normalization for birth_time (+ safe fallback to '12:00' when malformed).
- * - Timezone DB update when either tzId OR offsetMin is present (not strictly both).
- * - Detailed diagnostic logs when timezone remains unresolved.
- * - No functional changes to unrelated parts of the workflow.
+ * Responsibility removed:
+ * - Timezone resolution/calculation. This now happens in controller after form submit.
  */
 
 const baseLogger = require('../../utils/logger').child('birthchart.handler');
 const httpClient = require('../../utils/httpClient');
-const orchestrator = require('../../payments/orchestrator'); // singleton emitter/logic
+const orchestrator = require('../../payments/orchestrator');
 const repo = require('./repository');
-const { getTimezoneAtMoment } = require('../../utils/timezone');
 
 // Env
 const MAKE_WEBHOOK_URL_PAID = process.env.MAKE_WEBHOOK_URL_PAID;
@@ -34,9 +29,6 @@ const EPHEMERIS_API_KEY = process.env.EPHEMERIS_API_KEY;
 // Optional Basic Auth for Ephemeris
 const EPHEMERIS_BASIC_USER = process.env.EPHEMERIS_BASIC_USER || process.env.EPHEMERIS_USER;
 const EPHEMERIS_BASIC_PASS = process.env.EPHEMERIS_BASIC_PASS || process.env.EPHEMERIS_PASSWORD;
-
-// Optional Google fallback for timezone resolution
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || null;
 
 // Timeouts
 const EPHEMERIS_HTTP_TIMEOUT_MS = Number(process.env.EPHEMERIS_HTTP_TIMEOUT_MS || 12000);
@@ -56,7 +48,7 @@ function buildBasicAuthHeader() {
 /** Normalize time to strict HH:MM (24h). Returns null if cannot parse. */
 function toHHMM(raw) {
   const s = String(raw ?? '').trim();
-  const m = s.match(/^(\d{1,2}):(\d{1,2})(?::\d{1,2})?/); // accepts HH:M or HH:MM[:SS]
+  const m = s.match(/^(\d{1,2}):(\d{1,2})(?::\d{1,2})?/);
   if (!m) return null;
   const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
   const mi = Math.min(59, Math.max(0, parseInt(m[2], 10)));
@@ -66,14 +58,14 @@ function toHHMM(raw) {
 /** Convert "YYYY-MM-DD" + "HH:MM" into components expected by Ephemeris. */
 function toDateParts(birth_date, birth_time) {
   const [year, month, date] = String(birth_date).split('-').map((n) => parseInt(n, 10));
-  const hhmm = toHHMM(birth_time) || '12:00'; // safe default already logged earlier if malformed
+  const hhmm = toHHMM(birth_time) || '12:00';
   const [hStr, mStr] = hhmm.split(':');
   const hours = parseInt(hStr, 10);
   const minutes = parseInt(mStr, 10);
   return { year, month, date, hours, minutes };
 }
 
-/** Build Ephemeris POST body from request row and timezone info (hours). */
+/** Build Ephemeris POST body from request row and timezone (hours). */
 function buildEphemerisPayload(row, timezoneHours) {
   const { year, month, date, hours, minutes } = toDateParts(row.birth_date, row.birth_time);
   return {
@@ -96,7 +88,7 @@ function buildEphemerisPayload(row, timezoneHours) {
 
 /**
  * Build the Make webhook payload (PAID).
- * Includes "timezone" (hours). Does NOT include birth_timezone_id or *_offset_min.
+ * Includes "timezone" (hours) derived from birth_utc_offset_min.
  */
 function buildMakePayload({ requestRow, ephemeris, job, providerMeta }) {
   return {
@@ -127,7 +119,7 @@ function buildMakePayload({ requestRow, ephemeris, job, providerMeta }) {
         updated_at: requestRow.payment_updated_at,
       },
     },
-    ephemeris, // full response from Ephemeris API
+    ephemeris,
     meta: {
       job_id: job?.job_id || null,
       trigger_status: providerMeta.trigger_status,
@@ -171,77 +163,22 @@ async function onApprovedEvent(evt) {
     // 3) Load request
     const request = await repo.findByRequestId(evt.requestId);
     if (!request) {
-      await repo.markJobFailed(job.job_id, 'request not found');
+      await repo.markJobFailed(job.job_id, 'request_not_found');
       log.warn('request not found');
       return;
     }
 
-    // 4) Ensure timezone (minutes) in DB
-    let tzId = request.birth_timezone_id || null;
-    let offsetMin =
+    // 4) Expect timezone already computed and saved by controller async job
+    const offsetMin =
       request.birth_utc_offset_min != null ? Number(request.birth_utc_offset_min) : null;
 
-    // Try to resolve only if something is missing/invalid
-    if (!tzId || !Number.isFinite(offsetMin)) {
-      // Coordinates validation
-      const lat = Number(request.birth_place_lat);
-      const lng = Number(request.birth_place_lng);
-      const coordsOk = Number.isFinite(lat) && Number.isFinite(lng);
-
-      // Time normalization (prefer exact time; fallback to 12:00 for robustness)
-      const normalizedHHMM = toHHMM(request.birth_time);
-      const birthTimeForTz = normalizedHHMM || '12:00';
-      if (!normalizedHHMM) {
-        log.warn({ raw: request.birth_time }, 'birth_time malformed; falling back to 12:00 for timezone resolution');
-      }
-
-      if (!coordsOk || !request.birth_date) {
-        await repo.markJobFailed(job.job_id, 'invalid_coordinates_or_birth_date');
-        log.warn({ lat, lng, birthDate: request.birth_date }, 'invalid coordinates or birth_date; aborting');
-        return;
-      }
-
-      let tzRes = null;
-      try {
-        tzRes = await getTimezoneAtMoment({
-          lat,
-          lng,
-          birthDate: String(request.birth_date),
-          birthTime: birthTimeForTz,
-          apiKey: GOOGLE_MAPS_API_KEY || undefined, // optional Google fallback
-        });
-      } catch (e) {
-        log.warn({ err: e?.message }, 'getTimezoneAtMoment threw');
-      }
-
-      log.debug({ tzRes }, 'timezone resolver output');
-
-      tzId = tzRes?.tzId ?? tzId ?? null;
-      offsetMin = Number.isFinite(tzRes?.offsetMin) ? tzRes.offsetMin : offsetMin;
-
-      // Persist if any of the fields could be resolved (not necessarily both)
-      if (tzId || Number.isFinite(offsetMin)) {
-        await repo.updateTimezoneIfMissing(evt.requestId, { tzId: tzId ?? null, offsetMin });
-      }
-    }
-
-    const timezoneHours = Number.isFinite(offsetMin) ? offsetMin / 60 : null;
-    if (!Number.isFinite(timezoneHours)) {
-      log.warn({
-        inputs: {
-          lat: Number(request.birth_place_lat),
-          lng: Number(request.birth_place_lng),
-          birthDate: String(request.birth_date),
-          birthTime: toHHMM(request.birth_time) || '12:00',
-        },
-        envPresence: {
-          GEONAMES_USERNAME: !!process.env.GEONAMES_USERNAME,
-          GOOGLE_MAPS_API_KEY: !!process.env.GOOGLE_MAPS_API_KEY,
-        },
-      }, 'timezone unresolved; aborting');
-      await repo.markJobFailed(job.job_id, 'timezone_unresolved');
+    if (!Number.isFinite(offsetMin)) {
+      await repo.markJobFailed(job.job_id, 'timezone_missing');
+      log.warn('timezone missing on request; aborting handler flow');
       return;
     }
+
+    const timezoneHours = offsetMin / 60;
 
     // 5) Call Ephemeris (with X-API-KEY and optional Basic)
     const ephBody = buildEphemerisPayload(request, timezoneHours);
@@ -275,7 +212,7 @@ async function onApprovedEvent(evt) {
     }
 
     if (!ephemerisData) {
-      await repo.markJobFailed(job.job_id, `ephemeris empty response (status ${ephStatus})`);
+      await repo.markJobFailed(job.job_id, `ephemeris_empty:${ephStatus}`);
       log.warn({ ephStatus }, 'ephemeris returned empty body');
       return;
     }
@@ -322,11 +259,7 @@ async function onApprovedEvent(evt) {
 }
 
 // ---- Subscription ----
-// Importing this file wires the listener.
 orchestrator.events.on('payments:status-changed', (evt) => {
-  // evt shape:
-  // { requestId, productType, provider, normalizedStatus, statusDetail,
-  //   amountCents, currency, checkoutId, paymentId, authorizedAt, link }
   if (evt?.normalizedStatus === TRIGGER_APPROVED && evt?.productType === PRODUCT_TYPE) {
     onApprovedEvent(evt);
   }
