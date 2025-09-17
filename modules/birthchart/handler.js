@@ -11,6 +11,7 @@
  *   4) Record execution footprint into product_jobs (idempotent).
  *
  * This version adds:
+ *  - Strict input normalization before Ephemeris (numbers/ranges).
  *  - Ephemeris response normalization/validation (statusCode === 200).
  *  - Transient retries with exponential backoff (429/502/503/504).
  *  - Sanitized structured logs and richer meta for diagnostics.
@@ -50,6 +51,19 @@ function buildBasicAuthHeader() {
   return `Basic ${token}`;
 }
 
+/** Small helpers for numeric coercion/ranges. */
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function int(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
 /** Normalize time to strict HH:MM (24h). Returns null if cannot parse. */
 function toHHMM(raw) {
   const s = String(raw ?? '').trim();
@@ -60,19 +74,42 @@ function toHHMM(raw) {
   return `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
 }
 
-/** Convert "YYYY-MM-DD" + "HH:MM" into components expected by Ephemeris. */
+/** Convert "YYYY-MM-DD" + "HH:MM" into components expected by Ephemeris (validated). */
 function toDateParts(birth_date, birth_time) {
-  const [year, month, date] = String(birth_date).split('-').map((n) => parseInt(n, 10));
+  const [y, m, d] = String(birth_date || '').split('-').map((n) => int(n));
   const hhmm = toHHMM(birth_time) || '12:00';
   const [hStr, mStr] = hhmm.split(':');
-  const hours = parseInt(hStr, 10);
-  const minutes = parseInt(mStr, 10);
-  return { year, month, date, hours, minutes };
+  const h = int(hStr);
+  const mi = int(mStr);
+
+  if (y == null || m == null || d == null || h == null || mi == null) {
+    const e = new Error('invalid_date_or_time_parts');
+    e.detail = { birth_date, birth_time, parsed: { y, m, d, h, mi } };
+    throw e;
+  }
+  return {
+    year: y,
+    month: clamp(m, 1, 12),
+    date: clamp(d, 1, 31),
+    hours: clamp(h, 0, 23),
+    minutes: clamp(mi, 0, 59),
+  };
 }
 
-/** Build Ephemeris POST body from request row and timezone (hours). */
+/** Build Ephemeris POST body from request row and timezone (hours) with strict numeric validation. */
 function buildEphemerisPayload(row, timezoneHours) {
   const { year, month, date, hours, minutes } = toDateParts(row.birth_date, row.birth_time);
+
+  const lat = num(row.birth_place_lat);
+  const lng = num(row.birth_place_lng);
+  const tz  = num(timezoneHours);
+
+  if (lat == null || lng == null || tz == null) {
+    const e = new Error('invalid_coordinates_or_timezone');
+    e.detail = { lat: row.birth_place_lat, lng: row.birth_place_lng, timezoneHours };
+    throw e;
+  }
+
   return {
     year,
     month,
@@ -80,9 +117,9 @@ function buildEphemerisPayload(row, timezoneHours) {
     hours,
     minutes,
     seconds: 0,
-    latitude: Number(row.birth_place_lat),
-    longitude: Number(row.birth_place_lng),
-    timezone: timezoneHours, // decimal hours (e.g., -3)
+    latitude: clamp(lat, -90, 90),
+    longitude: clamp(lng, -180, 180),
+    timezone: tz, // decimal hours (e.g., -3)
     config: {
       observation_point: 'topocentric',
       ayanamsha: 'tropical',
@@ -189,7 +226,7 @@ function normalizeEphemerisData(raw) {
 
 /**
  * POST to Ephemeris with retries on transient failures.
- * Returns { status, data } where data is a validated object.
+ * Returns { status, data, dur } where data is a validated object.
  */
 async function callEphemerisWithRetry(url, body, headers, log) {
   let attempt = 0;
@@ -211,24 +248,14 @@ async function callEphemerisWithRetry(url, body, headers, log) {
       // Normalize/validate payload from ephemeris
       const normalized = normalizeEphemerisData(data);
 
-      // Success
-      log.info(
-        { url, status, durMs: dur, attempt },
-        'ephemeris call succeeded'
-      );
+      log.info({ url, status, durMs: dur, attempt }, 'ephemeris call succeeded');
       return { status, data: normalized, dur };
     } catch (e) {
       const status = e?.response?.status || e?.status || 0;
       const errBody = e?.response?.data || e?.errBody;
 
-      // Non-JSON string bodies are trimmed for logs
-      const safeErrBody = typeof errBody === 'string'
-        ? errBody.slice(0, 800)
-        : errBody;
-
+      const safeErrBody = typeof errBody === 'string' ? errBody.slice(0, 800) : errBody;
       const dur = Date.now() - t0;
-
-      // If the thrown error came from normalizeEphemerisData with non-200
       const non200 = e && e.message === 'ephemeris_non_200';
 
       log.warn(
@@ -252,10 +279,9 @@ async function callEphemerisWithRetry(url, body, headers, log) {
         url,
       });
 
-      if (!isTransientStatus(status)) break; // do not retry non-transient
-      if (attempt === EPHEMERIS_RETRY_ATTEMPTS) break;
+      if (!isTransientStatus(status)) break;              // do not retry non-transient
+      if (attempt === EPHEMERIS_RETRY_ATTEMPTS) break;    // reached attempts
 
-      // Backoff with jitter
       const backoff = Math.round(EPHEMERIS_RETRY_BASE_MS * Math.pow(2, attempt) * (1 + Math.random() * 0.3));
       await sleep(backoff);
       attempt += 1;
@@ -281,21 +307,12 @@ async function onApprovedEvent(evt) {
     // 0) Guards
     if (!evt?.requestId || evt.productType !== PRODUCT_TYPE) return;
     if (evt.normalizedStatus !== TRIGGER_APPROVED) return;
-    if (!MAKE_WEBHOOK_URL_PAID) {
-      log.warn('MAKE_WEBHOOK_URL_PAID not configured; skipping');
-      return;
-    }
-    if (!EPHEMERIS_API_KEY) {
-      log.warn('EPHEMERIS_API_KEY not configured; skipping');
-      return;
-    }
+    if (!MAKE_WEBHOOK_URL_PAID) { log.warn('MAKE_WEBHOOK_URL_PAID not configured; skipping'); return; }
+    if (!EPHEMERIS_API_KEY) { log.warn('EPHEMERIS_API_KEY not configured; skipping'); return; }
 
     // 1) Idempotency
     const already = await repo.findSucceededJob(evt.requestId, PRODUCT_TYPE, TRIGGER_APPROVED);
-    if (already) {
-      log.info({ jobId: already.job_id }, 'job already completed; skipping');
-      return;
-    }
+    if (already) { log.info({ jobId: already.job_id }, 'job already completed; skipping'); return; }
 
     // 2) Start job
     const job = await repo.markJobStart(evt.requestId, PRODUCT_TYPE, TRIGGER_APPROVED);
@@ -309,19 +326,25 @@ async function onApprovedEvent(evt) {
     }
 
     // 4) Expect timezone already computed and saved by controller async job
-    const offsetMin =
-      request.birth_utc_offset_min != null ? Number(request.birth_utc_offset_min) : null;
-
+    const offsetMin = request.birth_utc_offset_min != null ? Number(request.birth_utc_offset_min) : null;
     if (!Number.isFinite(offsetMin)) {
       await repo.markJobFailed(job.job_id, 'timezone_missing');
       log.warn('timezone missing on request; aborting handler flow');
       return;
     }
-
     const timezoneHours = offsetMin / 60;
 
-    // 5) Call Ephemeris (with X-API-KEY and optional Basic)
-    const ephBody = buildEphemerisPayload(request, timezoneHours);
+    // 5) Build Ephemeris payload (strict)
+    let ephBody;
+    try {
+      ephBody = buildEphemerisPayload(request, timezoneHours);
+    } catch (e) {
+      await repo.markJobFailed(job.job_id, e?.message || 'ephemeris_payload_error');
+      log.warn({ err: e?.message, detail: e?.detail }, 'invalid ephemeris payload; aborting');
+      return;
+    }
+
+    // 6) Call Ephemeris (with X-API-KEY and optional Basic)
     const ephHeaders = {
       Accept: 'application/json',
       'Content-Type': 'application/json',
@@ -343,17 +366,13 @@ async function onApprovedEvent(evt) {
       const ephStatusErr = e?.status || 0;
       await repo.markJobFailed(job.job_id, `ephemeris_error:${ephStatusErr}`);
       log.warn(
-        {
-          ephStatus: ephStatusErr,
-          url: e?.url || EPHEMERIS_API_URL,
-          errBody: e?.errBody,
-        },
+        { ephStatus: ephStatusErr, url: e?.url || EPHEMERIS_API_URL, errBody: e?.errBody },
         'ephemeris request failed (final)'
       );
       return;
     }
 
-    // 6) Post to Make (PAID)
+    // 7) Post to Make (PAID)
     const makePayload = buildMakePayload({
       requestRow: { ...request, birth_utc_offset_min: offsetMin },
       ephemeris: ephemerisData,
@@ -381,7 +400,7 @@ async function onApprovedEvent(evt) {
       return;
     }
 
-    // 7) Finish job
+    // 8) Finish job
     await repo.markJobSucceeded(job.job_id, {
       ephemeris_http_status: ephStatus,
       webhook_http_status: makeStatus,
@@ -403,3 +422,4 @@ orchestrator.events.on('payments:status-changed', (evt) => {
 });
 
 module.exports = { onApprovedEvent };
+
