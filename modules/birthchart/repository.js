@@ -10,7 +10,7 @@
  *  - Persist validated requests into `public.zodika_requests`.
  *  - Fetch requests by id.
  *  - Post-payment job footprints in `public.product_jobs`.
- *  - Update timezone fields on the request (if missing).
+ *  - Update timezone fields on the request (async write from controller).
  *
  * Notes
  *  - Inputs are expected to be validated at the controller level (Zod).
@@ -61,12 +61,16 @@ function toJsonOrNull(v, maxBytes = 10_000) {
 
 /* ------------------------------- Requests ---------------------------------- */
 
+/**
+ * Insert a new birthchart request.
+ * Timezone columns are accepted to allow placeholders (usually null at submit).
+ */
 async function createBirthchartRequest(data) {
   const {
     name, social_name, email, birth_date, birth_time, birth_place, product_type,
     birth_place_place_id, birth_place_full, birth_place_country, birth_place_admin1,
     birth_place_admin2, birth_place_lat, birth_place_lng, birth_place_json,
-    birth_timezone_id, birth_utc_offset_min,
+    birth_timezone_id, birth_utc_offset_min, birth_utc_offset_hours,
   } = data;
 
   const v_name             = toTrimmedOrNull(name, 120);
@@ -76,26 +80,27 @@ async function createBirthchartRequest(data) {
   const v_product_type     = toTrimmedOrNull(product_type, 64); // e.g. 'birth_chart'
   const v_place_id         = toTrimmedOrNull(birth_place_place_id, 128);
   const v_place_full       = toTrimmedOrNull(birth_place_full, 200);
-  const v_place_country    = toTrimmedOrNull(birth_place_country, 2);
+  const v_place_country    = toTrimmedOrNull(birth_place_country, 120); // country full name OK
   const v_place_admin1     = toTrimmedOrNull(birth_place_admin1, 120);
   const v_place_admin2     = toTrimmedOrNull(birth_place_admin2, 120);
   const v_lat              = toNumberOrNull(birth_place_lat);
   const v_lng              = toNumberOrNull(birth_place_lng);
   const v_place_json       = toJsonOrNull(birth_place_json);
   const v_birth_tz_id      = toTrimmedOrNull(birth_timezone_id, 128);
-  const v_birth_utc_offset = toNumberOrNull(birth_utc_offset_min);
+  const v_birth_utc_min    = toNumberOrNull(birth_utc_offset_min);
+  const v_birth_utc_hours  = toNumberOrNull(birth_utc_offset_hours);
 
   const sql = `
     INSERT INTO public.zodika_requests (
       name, social_name, email, birth_date, birth_time, birth_place, product_type,
       birth_place_place_id, birth_place_full, birth_place_country, birth_place_admin1,
       birth_place_admin2, birth_place_lat, birth_place_lng, birth_place_json,
-      birth_timezone_id, birth_utc_offset_min
+      birth_timezone_id, birth_utc_offset_min, birth_utc_offset_hours
     ) VALUES (
       $1, $2, $3, $4::date, $5::time, $6, $7,
       $8, $9, $10, $11,
       $12, $13::float8, $14::float8, $15::jsonb,
-      $16, $17::int
+      $16, $17::int, $18::numeric
     )
     RETURNING *;
   `;
@@ -103,7 +108,7 @@ async function createBirthchartRequest(data) {
     v_name, v_social_name, v_email, birth_date, birth_time, v_birth_place, v_product_type,
     v_place_id, v_place_full, v_place_country, v_place_admin1,
     v_place_admin2, v_lat, v_lng, v_place_json,
-    v_birth_tz_id, v_birth_utc_offset,
+    v_birth_tz_id, v_birth_utc_min, v_birth_utc_hours,
   ];
   const { rows } = await db.query(sql, params);
   return rows[0];
@@ -121,8 +126,37 @@ async function findByRequestId(requestId) {
 }
 
 /**
- * Update timezone fields only if currently missing/empty.
- * Stores offset in MINUTES and HOURS (derived) in DB.
+ * Update timezone fields unconditionally (authoritative async write from controller).
+ * Stores offset in MINUTES and HOURS in DB.
+ *
+ * NOTE: This is the canonical writer for timezone after the form submit.
+ */
+async function updateBirthTimezone(requestId, {
+  birth_timezone_id,
+  birth_utc_offset_min,
+  birth_utc_offset_hours,
+}) {
+  const v_tz_id     = toTrimmedOrNull(birth_timezone_id, 128);
+  const v_off_min   = toNumberOrNull(birth_utc_offset_min);
+  const v_off_hours = toNumberOrNull(birth_utc_offset_hours);
+
+  const sql = `
+    UPDATE public.zodika_requests
+       SET birth_timezone_id      = $2,
+           birth_utc_offset_min   = $3::int,
+           birth_utc_offset_hours = ROUND($4::numeric, 3),
+           updated_at             = NOW()
+     WHERE request_id = $1
+    RETURNING *;
+  `;
+  const params = [requestId, v_tz_id, v_off_min, v_off_hours];
+  const { rows } = await db.query(sql, params);
+  return rows[0] || null;
+}
+
+/**
+ * DEPRECATED: kept for backward compatibility with older flows.
+ * Prefer `updateBirthTimezone`.
  */
 async function updateTimezoneIfMissing(requestId, { tzId, offsetMin }) {
   const sql = `
@@ -243,7 +277,8 @@ module.exports = {
   // Requests
   createBirthchartRequest,
   findByRequestId,
-  updateTimezoneIfMissing,
+  updateBirthTimezone,       // <- new canonical writer
+  updateTimezoneIfMissing,   // <- deprecated (kept for backward compatibility)
 
   // Jobs
   findSucceededJob,
