@@ -4,15 +4,16 @@
 /**
  * Birthchart Handler (post-payment, product-specific)
  * --------------------------------------------------
- * Listens to payment status changes (emitted by payments/orchestrator) and,
- * for APPROVED on product_type = 'birth_chart':
- *   1) Loads request (expects timezone already persisted by controller async job).
- *   2) Calls Ephemeris API with X-API-KEY (and optional Basic Auth).
- *   3) Posts a consolidated payload (request + ephemeris + meta) to Make.
- *   4) Records an execution footprint into product_jobs (idempotent).
+ * APPROVED on product_type = 'birth_chart':
+ *   1) Load request (timezone already persisted by controller async job).
+ *   2) Call Ephemeris API with X-API-KEY (+ optional Basic).
+ *   3) Post consolidated payload (request + ephemeris + meta) to Make.
+ *   4) Record execution footprint into product_jobs (idempotent).
  *
- * Responsibility removed:
- * - Timezone resolution/calculation. This now happens in controller after form submit.
+ * This version adds:
+ *  - Ephemeris response normalization/validation (statusCode === 200).
+ *  - Transient retries with exponential backoff (429/502/503/504).
+ *  - Sanitized structured logs and richer meta for diagnostics.
  */
 
 const baseLogger = require('../../utils/logger').child('birthchart.handler');
@@ -33,6 +34,10 @@ const EPHEMERIS_BASIC_PASS = process.env.EPHEMERIS_BASIC_PASS || process.env.EPH
 // Timeouts
 const EPHEMERIS_HTTP_TIMEOUT_MS = Number(process.env.EPHEMERIS_HTTP_TIMEOUT_MS || 12000);
 const MAKE_HTTP_TIMEOUT_MS = Number(process.env.MAKE_HTTP_TIMEOUT_MS || 10000);
+
+// Retry knobs (transient errors)
+const EPHEMERIS_RETRY_ATTEMPTS = Math.max(0, Number(process.env.EPHEMERIS_RETRY_ATTEMPTS || 2));
+const EPHEMERIS_RETRY_BASE_MS = Math.max(100, Number(process.env.EPHEMERIS_RETRY_BASE_MS || 400));
 
 // Defensive constants
 const PRODUCT_TYPE = 'birth_chart';
@@ -90,7 +95,7 @@ function buildEphemerisPayload(row, timezoneHours) {
  * Build the Make webhook payload (PAID).
  * Includes "timezone" (hours) derived from birth_utc_offset_min.
  */
-function buildMakePayload({ requestRow, ephemeris, job, providerMeta }) {
+function buildMakePayload({ requestRow, ephemeris, job, providerMeta, ephemerisStatus }) {
   return {
     request: {
       request_id: requestRow.request_id,
@@ -119,16 +124,151 @@ function buildMakePayload({ requestRow, ephemeris, job, providerMeta }) {
         updated_at: requestRow.payment_updated_at,
       },
     },
-    ephemeris,
+    ephemeris, // full response from Ephemeris API (validated)
     meta: {
       job_id: job?.job_id || null,
       trigger_status: providerMeta.trigger_status,
       source: 'birthchart/handler',
       provider: providerMeta.provider,
+      ephemeris_status_code: ephemerisStatus ?? null,
       timestamp: new Date().toISOString(),
     },
   };
 }
+
+/* ----------------------- Ephemeris client helpers -------------------------- */
+
+function sanitizeForLogHeaders(h) {
+  if (!h) return undefined;
+  const copy = { ...h };
+  delete copy['X-API-KEY'];
+  delete copy['x-api-key'];
+  delete copy['Authorization'];
+  delete copy['authorization'];
+  return copy;
+}
+
+function isTransientStatus(s) {
+  return s === 429 || s === 502 || s === 503 || s === 504;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Normalize ephemeris payload:
+ * - Accepts object or JSON string.
+ * - Requires { statusCode: 200, ... }.
+ * - Returns normalized object or throws.
+ */
+function normalizeEphemerisData(raw) {
+  const obj = typeof raw === 'string'
+    ? JSON.parse(raw)
+    : (raw && typeof raw === 'object' ? raw : null);
+
+  if (!obj || typeof obj !== 'object') {
+    const e = new Error('invalid_ephemeris_payload');
+    e.detail = 'Response is not a JSON object';
+    throw e;
+  }
+  if (typeof obj.statusCode !== 'number') {
+    const e = new Error('invalid_ephemeris_statusCode');
+    e.detail = 'Missing statusCode';
+    throw e;
+  }
+  if (obj.statusCode !== 200) {
+    const e = new Error('ephemeris_non_200');
+    e.statusCode = obj.statusCode;
+    e.detail = obj.message || 'Ephemeris returned non-200';
+    e.body = obj;
+    throw e;
+  }
+  return obj;
+}
+
+/**
+ * POST to Ephemeris with retries on transient failures.
+ * Returns { status, data } where data is a validated object.
+ */
+async function callEphemerisWithRetry(url, body, headers, log) {
+  let attempt = 0;
+  let lastErr = null;
+
+  while (attempt <= EPHEMERIS_RETRY_ATTEMPTS) {
+    const t0 = Date.now();
+    try {
+      const res = await httpClient.post(url, body, {
+        headers,
+        timeout: EPHEMERIS_HTTP_TIMEOUT_MS,
+        retries: 0, // we handle retries here
+      });
+      const dur = Date.now() - t0;
+
+      const status = res?.status || 0;
+      const data = res?.data;
+
+      // Normalize/validate payload from ephemeris
+      const normalized = normalizeEphemerisData(data);
+
+      // Success
+      log.info(
+        { url, status, durMs: dur, attempt },
+        'ephemeris call succeeded'
+      );
+      return { status, data: normalized, dur };
+    } catch (e) {
+      const status = e?.response?.status || e?.status || 0;
+      const errBody = e?.response?.data || e?.errBody;
+
+      // Non-JSON string bodies are trimmed for logs
+      const safeErrBody = typeof errBody === 'string'
+        ? errBody.slice(0, 800)
+        : errBody;
+
+      const dur = Date.now() - t0;
+
+      // If the thrown error came from normalizeEphemerisData with non-200
+      const non200 = e && e.message === 'ephemeris_non_200';
+
+      log.warn(
+        {
+          url,
+          status,
+          durMs: dur,
+          attempt,
+          transient: isTransientStatus(status),
+          non200,
+          errDetail: e?.detail,
+          errBody: non200 ? e.body : safeErrBody,
+          req: { headers: sanitizeForLogHeaders(headers), body },
+        },
+        'ephemeris call failed'
+      );
+
+      lastErr = Object.assign(new Error('ephemeris_call_failed'), {
+        status,
+        errBody: safeErrBody,
+        url,
+      });
+
+      if (!isTransientStatus(status)) break; // do not retry non-transient
+      if (attempt === EPHEMERIS_RETRY_ATTEMPTS) break;
+
+      // Backoff with jitter
+      const backoff = Math.round(EPHEMERIS_RETRY_BASE_MS * Math.pow(2, attempt) * (1 + Math.random() * 0.3));
+      await sleep(backoff);
+      attempt += 1;
+      continue;
+    }
+  }
+
+  throw lastErr || new Error('ephemeris_call_failed');
+}
+
+/* -------------------------------------------------------------------------- */
+/* Main Worker                                                                */
+/* -------------------------------------------------------------------------- */
 
 /**
  * Main worker for APPROVED events on birth_chart.
@@ -190,30 +330,26 @@ async function onApprovedEvent(evt) {
     const basic = buildBasicAuthHeader();
     if (basic) ephHeaders.Authorization = basic;
 
+    let ephemerisData = null;
     let ephStatus = 0;
     let ephDur = 0;
-    let ephemerisData = null;
 
     try {
-      const tEph = Date.now();
-      const ephRes = await httpClient.post(EPHEMERIS_API_URL, ephBody, {
-        headers: ephHeaders,
-        timeout: EPHEMERIS_HTTP_TIMEOUT_MS,
-        retries: 0,
-      });
-      ephDur = Date.now() - tEph;
-      ephStatus = ephRes?.status || 0;
-      ephemerisData = ephRes?.data || null;
+      const res = await callEphemerisWithRetry(EPHEMERIS_API_URL, ephBody, ephHeaders, log);
+      ephemerisData = res.data;   // validated object
+      ephStatus = res.status;
+      ephDur = res.dur;
     } catch (e) {
-      ephStatus = e?.response?.status || 0;
-      await repo.markJobFailed(job.job_id, `ephemeris_error:${ephStatus}`);
-      log.warn({ ephStatus }, 'ephemeris request failed');
-      return;
-    }
-
-    if (!ephemerisData) {
-      await repo.markJobFailed(job.job_id, `ephemeris_empty:${ephStatus}`);
-      log.warn({ ephStatus }, 'ephemeris returned empty body');
+      const ephStatusErr = e?.status || 0;
+      await repo.markJobFailed(job.job_id, `ephemeris_error:${ephStatusErr}`);
+      log.warn(
+        {
+          ephStatus: ephStatusErr,
+          url: e?.url || EPHEMERIS_API_URL,
+          errBody: e?.errBody,
+        },
+        'ephemeris request failed (final)'
+      );
       return;
     }
 
@@ -223,6 +359,7 @@ async function onApprovedEvent(evt) {
       ephemeris: ephemerisData,
       job,
       providerMeta: { provider: evt.provider, trigger_status: evt.normalizedStatus },
+      ephemerisStatus: ephStatus,
     });
 
     let makeStatus = 0;
