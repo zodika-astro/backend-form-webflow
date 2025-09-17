@@ -4,46 +4,33 @@
 /**
  * Birthchart Controller
  * ---------------------
- * Responsibilities (fast path)
- *  - Validate and normalize public form input.
- *  - Persist the request record (with timezone placeholders).
- *  - Create a checkout on the selected PSP (PagBank or Mercado Pago).
- *  - Return the checkout URL immediately (do not block on timezone).
+ * Fast path
+ *  - Validate/normalize form.
+ *  - Persist request (placeholders for timezone).
+ *  - Create PSP checkout and return URL immediately (NON-BLOCKING).
  *
- * Deferred work
- *  - Timezone resolution is deferred to the post-payment workflow (e.g., payment-approved webhook).
- *    This keeps form submission fast and avoids long upstream waits on external providers.
+ * Deferred work (now moved here)
+ *  - Resolve historical timezone via Google Time Zone API using birth_date/time.
+ *  - Persist birth_timezone_id, birth_utc_offset_min and birth_utc_offset_hours asynchronously.
  *
  * Non-functional
- *  - Structured logging with request correlation (no PII).
- *  - Standardized error codes (AppError) for upstream and internal failures.
- *  - Never trust raw req.body: filter/whitelist allowed fields before validation.
- *
- * Business rule
- *  - Product-specific success URLs live in the product module (here).
- *  - PSP back_urls/redirects always point back to our backend return controllers.
- *    The return controller decides final redirects (success/fail/pending).
+ *  - Structured logging; no PII in logs.
+ *  - AppError for consistent error handling.
  */
 
 const { validateBirthchartPayload } = require('./validators');
-const { createBirthchartRequest } = require('./repository');
-
-// Note: timezone resolution is now deferred. Imports are kept to avoid breaking other flows
-// that may still rely on these modules elsewhere in the app.
-const { getTimezoneAtMoment } = require('../../utils/timezone'); // intentionally unused here (deferred)
-const { get: getSecret } = require('../../config/secretProvider'); // intentionally unused here (deferred)
+const repo = require('./repository'); // will need updateTimezone writer (see notes below)
+const { getTimezoneAtMoment, toHours } = require('../../utils/timezone');
 
 const { env } = require('../../config/env');
 const { AppError } = require('../../utils/appError');
-
-// Logger (namespaced); request-scoped logger comes from middleware (req.log)
 const baseLogger = require('../../utils/logger').child('form.birthchart');
 
-// PSP services
 const mpService = require('../../payments/mercadoPago/service');
 const pagbankService = require('../../payments/pagBank/service');
 
 const PRODUCT_IMAGE_URL = 'https://backend-form-webflow-production.up.railway.app/assets/birthchart-productimage.png';
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || null;
 
 /** Safe host extraction for logs (prevents leaking full URLs with query params/PII). */
 function safeHost(u) {
@@ -60,28 +47,17 @@ function pick(input, allowedKeys) {
   return out;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Normalizers                                                                */
-/* -------------------------------------------------------------------------- */
 /**
- * Accept consent field variants and map to boolean.
- * Supports: boolean, number (1), "on"/"yes"/"1"/"true"/"checked".
+ * Normalize to strict HH:MM; returns null if invalid.
+ * Keeps consistent with utils/timezone normalization expectations.
  */
-function normalizeConsent(body = {}) {
-  const raw =
-    body.privacyConsent ??
-    body.privacy_agreed ??
-    body.privacy ??
-    body.privacy_policy ??
-    body.policy ??
-    body.terms;
-
-  if (raw == null) return false;
-  if (typeof raw === 'boolean') return raw;
-  if (typeof raw === 'number') return raw === 1;
-
-  const s = String(raw).trim().toLowerCase();
-  return s === 'true' || s === 'on' || s === 'yes' || s === '1' || s === 'checked';
+function toHHMM(raw) {
+  const s = String(raw ?? '').trim();
+  const m = s.match(/^(\d{1,2}):(\d{1,2})(?::\d{1,2})?/);
+  if (!m) return null;
+  const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+  const mi = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+  return `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
 }
 
 /** Allowed public form fields (whitelist). */
@@ -108,11 +84,6 @@ const ALLOWED_FORM_KEYS = [
 ];
 
 /* --------------------------- Payment provider select ------------------------------ */
-/**
- * Select payment provider from env.
- * Accepted values (case-insensitive): "MERCADO_PAGO" | "PAGBANK"
- * Default: "MERCADO_PAGO"
- */
 function getPaymentProvider() {
   const raw =
     (typeof process !== 'undefined' && process.env && process.env.PAYMENT_PROVIDER)
@@ -125,6 +96,58 @@ function getPaymentProvider() {
 }
 
 /**
+ * Fire-and-forget timezone computation.
+ * Uses Google Time Zone API exclusively and persists results if successful.
+ */
+function triggerAsyncTimezoneCompute({ requestId, birth }) {
+  // Detach from the request lifecycle; do not await.
+  // Use setImmediate to avoid holding the event loop of the controller handler.
+  setImmediate(async () => {
+    const log = baseLogger.child('tz.async', { requestId });
+    try {
+      // Basic guards
+      const lat = Number(birth.lat);
+      const lng = Number(birth.lng);
+      const coordsOk = Number.isFinite(lat) && Number.isFinite(lng);
+      const dateStr = String(birth.date || '').slice(0, 10);
+      const hhmm = toHHMM(birth.time) || '12:00'; // defensive default
+
+      if (!coordsOk || !dateStr) {
+        log.warn({ coordsOk, dateStr }, 'skipping timezone compute: invalid inputs');
+        return;
+      }
+      if (!GOOGLE_MAPS_API_KEY) {
+        log.warn('GOOGLE_MAPS_API_KEY not configured; skipping timezone compute');
+        return;
+      }
+
+      const tz = await getTimezoneAtMoment({
+        lat, lng, birthDate: dateStr, birthTime: hhmm, apiKey: GOOGLE_MAPS_API_KEY,
+      });
+
+      if (!tz || tz.offsetMin == null) {
+        log.warn({ tz }, 'timezone unresolved; not updating DB');
+        return;
+      }
+
+      const offsetHours = toHours(tz.offsetMin);
+      await repo.updateBirthTimezone(requestId, {
+        birth_timezone_id: tz.tzId || null,
+        birth_utc_offset_min: tz.offsetMin,
+        birth_utc_offset_hours: offsetHours,
+      });
+
+      log.info(
+        { tzId: tz.tzId || null, offsetMin: tz.offsetMin, offsetHours },
+        'timezone persisted asynchronously'
+      );
+    } catch (err) {
+      log.error({ msg: err?.message }, 'async timezone compute failed');
+    }
+  });
+}
+
+/**
  * POST /birthchart/birthchartsubmit-form (public)
  * Body: validated by Zod in validateBirthchartPayload (normalized on return)
  */
@@ -133,7 +156,21 @@ async function processForm(req, res, next) {
 
   try {
     /* ----------------------- consent & input guards ------------------------ */
-    const privacyConsent = normalizeConsent(req.body);
+    const privacyConsent = (() => {
+      const raw =
+        req.body?.privacyConsent ??
+        req.body?.privacy_agreed ??
+        req.body?.privacy ??
+        req.body?.privacy_policy ??
+        req.body?.policy ??
+        req.body?.terms;
+      if (raw == null) return false;
+      if (typeof raw === 'boolean') return raw;
+      if (typeof raw === 'number') return raw === 1;
+      const s = String(raw).trim().toLowerCase();
+      return s === 'true' || s === 'on' || s === 'yes' || s === '1' || s === 'checked';
+    })();
+
     if (!privacyConsent) {
       throw new AppError(
         'privacy_consent_required',
@@ -166,12 +203,8 @@ async function processForm(req, res, next) {
     // Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
 
-    /* ---------------- time zone resolution deferred (placeholder) --------- */
-    const tz = { tzId: null, offsetMin: null, deferred: true };
-    logger.info({ deferred: true }, 'timezone resolution deferred');
-
     /* ------------------- persist request (PII kept out of logs) ----------- */
-    const newRequest = await createBirthchartRequest({
+    const newRequest = await repo.createBirthchartRequest({
       name:                 input.name,
       social_name:          input.social_name,
       email:                input.email,
@@ -189,14 +222,26 @@ async function processForm(req, res, next) {
       birth_place_lng:      input.birth_place_lng,
       birth_place_json:     input.birth_place_json,
 
-      // placeholders (to be filled after payment approval)
-      birth_timezone_id:    tz.tzId,
-      birth_utc_offset_min: tz.offsetMin,
+      // placeholders (to be filled asynchronously right after submit)
+      birth_timezone_id:    null,
+      birth_utc_offset_min: null,
+      birth_utc_offset_hours: null,
     }).catch((e) => {
       throw AppError.fromUpstream('db_persist_failed', 'Could not persist birthchart request', e, { entity: 'birthchart_request' });
     });
 
     logger.info({ requestId: newRequest.request_id, productType: newRequest.product_type }, 'request persisted');
+
+    /* --------- trigger async timezone compute (does NOT block response) --- */
+    triggerAsyncTimezoneCompute({
+      requestId: newRequest.request_id,
+      birth: {
+        date: input.birth_date,
+        time: input.birth_time,
+        lat:  input.birth_place_lat,
+        lng:  input.birth_place_lng,
+      },
+    });
 
     /* ----------------------- compose product for checkout ------------------ */
     const product = {
@@ -209,7 +254,6 @@ async function processForm(req, res, next) {
         allow_card: true,
         max_installments: 1,
       },
-      // Product-specific success URL (used by return controllers).
       successUrl: `https://www.zodika.com.br/birthchart-payment-success?ref=${encodeURIComponent(newRequest.request_id)}`,
       metadata: {
         source: 'webflow',
@@ -246,7 +290,6 @@ async function processForm(req, res, next) {
         'pagbank checkout created'
       );
     } else {
-      // Default: MERCADO_PAGO
       paymentResponse = await mpService.createCheckout({
         requestId:    newRequest.request_id,
         name:         newRequest.name,
@@ -261,7 +304,6 @@ async function processForm(req, res, next) {
         },
         productImageUrl: PRODUCT_IMAGE_URL,
         currency:   product.currency,
-        // Intentionally DO NOT pass successUrl/returnUrl to the provider.
         metadata:   product.metadata,
       }, ctx);
 
@@ -274,7 +316,6 @@ async function processForm(req, res, next) {
     /* ------------------- contract expected by the frontend ----------------- */
     return res.status(200).json({ url: paymentResponse.url });
   } catch (err) {
-    // Normalize non-AppError validation failures (e.g., Zod)
     if (err && err.name === 'ValidationError' && !err.code) {
       const wrapped = AppError.validation('validation_error', 'Validation Error', {
         details: err.details || undefined,
@@ -283,7 +324,6 @@ async function processForm(req, res, next) {
       return next(wrapped);
     }
 
-    // Pass through known AppErrors; wrap unknown as internal
     if (err instanceof AppError) {
       (req.log || baseLogger).error({ code: err.code, status: err.status }, 'request failed');
       return next(err);
