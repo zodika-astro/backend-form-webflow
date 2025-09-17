@@ -11,11 +11,11 @@
  *   4) Record execution footprint into product_jobs (idempotent).
  *
  * Hardenings:
- *  - Strict numeric coercion and range checks (lat/lng/tz).
- *  - Timezone normalized to number with up to 3 decimals.
- *  - Detailed logs when payload is invalid (values + typeof).
- *  - Retries with backoff on transient ephemeris errors.
- *  - Validated ephemeris response (statusCode === 200).
+ *  - Accept DATE as string 'YYYY-MM-DD' **ou** JavaScript Date (UTC) ao montar payload.
+ *  - Strict numeric coercion e range checks (lat/lng/tz).
+ *  - Timezone normalizado como número com até 3 casas (mas serializa como -3 se inteiro).
+ *  - Logs detalhados de payload inválido (tipos + valores).
+ *  - Retries com backoff (429/502/503/504) e validação do retorno da Ephemeris.
  */
 
 const baseLogger = require('../../utils/logger').child('birthchart.handler');
@@ -62,16 +62,32 @@ function round3(n) { return Math.round(n * 1000) / 1000; }
 /** Normalize time to strict HH:MM (24h). Returns null if cannot parse. */
 function toHHMM(raw) {
   const s = String(raw ?? '').trim();
-  const m = s.match(/^(\d{1,2}):(\d{1,2})(?::\d{1,2})?/);
+  const m = s.match(/^(\d{1,2}):(\d{1,2})(?::\d{1,2})?/); // accepts HH:MM or HH:MM:SS
   if (!m) return null;
   const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
   const mi = Math.min(59, Math.max(0, parseInt(m[2], 10)));
   return `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
 }
 
-/** Convert "YYYY-MM-DD" + "HH:MM" into components expected by Ephemeris (validated). */
+/** Extract Y-M-D in UTC from string 'YYYY-MM-DD' or Date. */
+function extractYMDUTC(birth_date) {
+  if (birth_date instanceof Date && !isNaN(birth_date)) {
+    return {
+      y: birth_date.getUTCFullYear(),
+      m: birth_date.getUTCMonth() + 1,
+      d: birth_date.getUTCDate(),
+    };
+  }
+  const s = String(birth_date || '').trim();
+  // Strict YYYY-MM-DD
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return { y: null, m: null, d: null };
+  return { y: int(m[1]), m: int(m[2]), d: int(m[3]) };
+}
+
+/** Convert birth_date (+ possibly Date) + birth_time into parts expected by Ephemeris. */
 function toDateParts(birth_date, birth_time) {
-  const [y, m, d] = String(birth_date || '').split('-').map((n) => int(n));
+  const { y, m, d } = extractYMDUTC(birth_date);
   const hhmm = toHHMM(birth_time) || '12:00';
   const [hStr, mStr] = hhmm.split(':');
   const h = int(hStr);
@@ -79,7 +95,13 @@ function toDateParts(birth_date, birth_time) {
 
   if (y == null || m == null || d == null || h == null || mi == null) {
     const e = new Error('invalid_date_or_time_parts');
-    e.detail = { birth_date, birth_time, parsed: { y, m, d, h, mi } };
+    e.detail = {
+      birth_date_value: birth_date,
+      birth_date_type: birth_date instanceof Date ? 'Date' : typeof birth_date,
+      birth_time_value: birth_time,
+      birth_time_type: typeof birth_time,
+      parsed: { y, m, d, h, mi },
+    };
     throw e;
   }
   return {
@@ -93,13 +115,11 @@ function toDateParts(birth_date, birth_time) {
 
 /** Derive timezone hours from DB row with strict numeric normalization. */
 function deriveTimezoneHours(row) {
-  // Primary: minutes -> hours
   const offMin = row && row.birth_utc_offset_min != null ? Number(row.birth_utc_offset_min) : null;
   if (Number.isFinite(offMin)) {
     const tz = round3(offMin / 60);
     if (tz >= -14 && tz <= 14) return tz;
   }
-  // Secondary: use hours column if present
   const offHours = row && row.birth_utc_offset_hours != null ? Number(row.birth_utc_offset_hours) : null;
   if (Number.isFinite(offHours)) {
     const tz = round3(offHours);
@@ -108,7 +128,7 @@ function deriveTimezoneHours(row) {
   return null;
 }
 
-/** Build Ephemeris POST body from request row and timezone (hours) with strict numeric validation. */
+/** Build Ephemeris POST body from request row and timezone (hours). */
 function buildEphemerisPayload(row, timezoneHours) {
   const { year, month, date, hours, minutes } = toDateParts(row.birth_date, row.birth_time);
 
@@ -135,7 +155,7 @@ function buildEphemerisPayload(row, timezoneHours) {
     seconds: 0,
     latitude: clamp(lat, -90, 90),
     longitude: clamp(lng, -180, 180),
-    timezone: round3(tz), // hours, up to 3 decimals (e.g., -3, -3.5)
+    timezone: round3(tz), // e.g. -3, -3.5, -3.75
     config: {
       observation_point: 'topocentric',
       ayanamsha: 'tropical',
@@ -143,7 +163,6 @@ function buildEphemerisPayload(row, timezoneHours) {
     },
   };
 
-  // Final defensive range checks
   if (body.timezone < -14 || body.timezone > 14) {
     const e = new Error('invalid_timezone_range');
     e.detail = { timezone: body.timezone };
@@ -154,7 +173,6 @@ function buildEphemerisPayload(row, timezoneHours) {
 
 /**
  * Build the Make webhook payload (PAID).
- * Includes "timezone" (hours) derived from birth_utc_offset_min.
  */
 function buildMakePayload({ requestRow, ephemeris, job, providerMeta, ephemerisStatus }) {
   return {
@@ -185,7 +203,7 @@ function buildMakePayload({ requestRow, ephemeris, job, providerMeta, ephemerisS
         updated_at: requestRow.payment_updated_at,
       },
     },
-    ephemeris, // full response from Ephemeris API (validated)
+    ephemeris, // full validated response from Ephemeris API
     meta: {
       job_id: job?.job_id || null,
       trigger_status: providerMeta.trigger_status,
@@ -208,49 +226,19 @@ function sanitizeForLogHeaders(h) {
   delete copy['authorization'];
   return copy;
 }
+function isTransientStatus(s) { return s === 429 || s === 502 || s === 503 || s === 504; }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-function isTransientStatus(s) {
-  return s === 429 || s === 502 || s === 503 || s === 504;
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * Normalize ephemeris payload:
- * - Accepts object or JSON string.
- * - Requires { statusCode: 200, ... }.
- */
+/** Normalize ephemeris JSON and require { statusCode: 200 }. */
 function normalizeEphemerisData(raw) {
-  const obj = typeof raw === 'string'
-    ? JSON.parse(raw)
-    : (raw && typeof raw === 'object' ? raw : null);
-
-  if (!obj || typeof obj !== 'object') {
-    const e = new Error('invalid_ephemeris_payload');
-    e.detail = 'Response is not a JSON object';
-    throw e;
-  }
-  if (typeof obj.statusCode !== 'number') {
-    const e = new Error('invalid_ephemeris_statusCode');
-    e.detail = 'Missing statusCode';
-    throw e;
-  }
-  if (obj.statusCode !== 200) {
-    const e = new Error('ephemeris_non_200');
-    e.statusCode = obj.statusCode;
-    e.detail = obj.message || 'Ephemeris returned non-200';
-    e.body = obj;
-    throw e;
-  }
+  const obj = typeof raw === 'string' ? JSON.parse(raw) : (raw && typeof raw === 'object' ? raw : null);
+  if (!obj || typeof obj !== 'object') { const e = new Error('invalid_ephemeris_payload'); e.detail='Response is not a JSON object'; throw e; }
+  if (typeof obj.statusCode !== 'number') { const e = new Error('invalid_ephemeris_statusCode'); e.detail='Missing statusCode'; throw e; }
+  if (obj.statusCode !== 200) { const e = new Error('ephemeris_non_200'); e.statusCode=obj.statusCode; e.detail=obj.message||'Ephemeris returned non-200'; e.body=obj; throw e; }
   return obj;
 }
 
-/**
- * POST to Ephemeris with retries on transient failures.
- * Returns { status, data, dur } where data is a validated object.
- */
+/** POST to Ephemeris with retries on transient failures. */
 async function callEphemerisWithRetry(url, body, headers, log) {
   let attempt = 0;
   let lastErr = null;
@@ -258,18 +246,18 @@ async function callEphemerisWithRetry(url, body, headers, log) {
   while (attempt <= EPHEMERIS_RETRY_ATTEMPTS) {
     const t0 = Date.now();
     try {
-      log.info({ url, attempt, preview: JSON.stringify({ ...body, config: body?.config || undefined }) }, 'ephemeris request preview');
+      log.info(
+        { url, attempt, preview: { ...body, config: body?.config }, types: Object.fromEntries(Object.entries(body).map(([k,v])=>[k, typeof v])) },
+        'ephemeris request preview'
+      );
       const res = await httpClient.post(url, body, {
         headers,
         timeout: EPHEMERIS_HTTP_TIMEOUT_MS,
-        retries: 0, // we handle retries here
+        retries: 0,
       });
       const dur = Date.now() - t0;
-
       const status = res?.status || 0;
-      const data = res?.data;
-
-      const normalized = normalizeEphemerisData(data);
+      const normalized = normalizeEphemerisData(res?.data);
 
       log.info({ url, status, durMs: dur, attempt }, 'ephemeris call succeeded');
       return { status, data: normalized, dur };
@@ -282,29 +270,17 @@ async function callEphemerisWithRetry(url, body, headers, log) {
 
       log.warn(
         {
-          url,
-          status,
-          durMs: dur,
-          attempt,
-          transient: isTransientStatus(status),
-          non200,
-          errDetail: e?.detail,
-          errBody: non200 ? e.body : safeErrBody,
+          url, status, durMs: dur, attempt,
+          transient: isTransientStatus(status), non200,
+          errDetail: e?.detail, errBody: non200 ? e.body : safeErrBody,
           reqHeaders: sanitizeForLogHeaders(headers),
-          reqBodyTypes: typeof body === 'object' ? Object.fromEntries(Object.entries(body).map(([k, v]) => [k, typeof v])) : typeof body,
           reqBody: body,
         },
         'ephemeris call failed'
       );
 
-      lastErr = Object.assign(new Error('ephemeris_call_failed'), {
-        status,
-        errBody: safeErrBody,
-        url,
-      });
-
-      if (!isTransientStatus(status)) break;              // do not retry non-transient
-      if (attempt === EPHEMERIS_RETRY_ATTEMPTS) break;    // reached attempts
+      lastErr = Object.assign(new Error('ephemeris_call_failed'), { status, errBody: safeErrBody, url });
+      if (!isTransientStatus(status) || attempt === EPHEMERIS_RETRY_ATTEMPTS) break;
 
       const backoff = Math.round(EPHEMERIS_RETRY_BASE_MS * Math.pow(2, attempt) * (1 + Math.random() * 0.3));
       await sleep(backoff);
@@ -312,7 +288,6 @@ async function callEphemerisWithRetry(url, body, headers, log) {
       continue;
     }
   }
-
   throw lastErr || new Error('ephemeris_call_failed');
 }
 
@@ -353,7 +328,7 @@ async function onApprovedEvent(evt) {
       return;
     }
 
-    // 5) Build Ephemeris payload (strict)
+    // 5) Build Ephemeris payload (strict, aceita Date ou string no birth_date)
     let ephBody;
     try {
       ephBody = buildEphemerisPayload(request, tzHours);
