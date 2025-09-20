@@ -58,6 +58,20 @@ function normalizeReturnStatus(qs = {}) {
 }
 
 /**
+ * Server-side email masking (never expose raw PII on redirects).
+ * Keeps first 1–2 characters of the user, masks the rest;
+ * masks domain parts except TLD boundary (e.g., g****@g****.com).
+ */
+function maskEmail(email) {
+  if (!email || typeof email !== 'string' || !email.includes('@')) return '';
+  const [user, domain] = email.split('@');
+  const head = user.length <= 2 ? (user[0] || '') : user.slice(0, 2);
+  const maskedUser = head + '*'.repeat(Math.max(0, user.length - head.length));
+  const maskedDomain = domain.replace(/.(?=.*\.)/g, '*');
+  return `${maskedUser}@${maskedDomain}`;
+}
+
+/**
  * POST /mercadoPago/checkout
  * Creates a Mercado Pago checkout preference.
  */
@@ -111,6 +125,14 @@ async function createCheckout(req, res) {
 /**
  * GET /mercadoPago/return[/*]
  * Customer browser return after checkout.
+ *
+ * Behavior:
+ * - Resolve requestId (from QS or repository).
+ * - Map return status to a stable set.
+ * - Redirect to product-specific success on APPROVED/PAID, appending:
+ *   * Query:   ?ref=<requestId>
+ *   * Fragment: #em=<maskedEmail>  (optional, best-effort; not logged by servers)
+ * - Redirect to generic pending/fail otherwise.
  */
 async function handleReturn(req, res) {
   const rid = echoRequestId(req, res);
@@ -124,19 +146,24 @@ async function handleReturn(req, res) {
   let retStatus = normalizeReturnStatus(req.query);
 
   try {
+    // If requestId missing, try to recover from preference record
     if (!requestId && preferenceId && typeof mpRepository.findByPreferenceId === 'function') {
       const rec = await mpRepository.findByPreferenceId(preferenceId);
       requestId = rec?.request_id || requestId;
 
+      // If we persisted APPROVED already, trust it to avoid UI flicker
       if (rec?.status && typeof rec.status === 'string' && rec.status.toUpperCase() === 'APPROVED') {
         retStatus = 'APPROVED';
       }
     }
 
+    // Optional: derive product type and masked email for hinting
     let productType = null;
+    let emailMasked = '';
     if (requestId && typeof birthchartRepository.findByRequestId === 'function') {
       const r = await birthchartRepository.findByRequestId(requestId);
       productType = r?.product_type || null;
+      if (r?.email) emailMasked = maskEmail(String(r.email));
     }
 
     const successUrlByProduct = {
@@ -147,10 +174,15 @@ async function handleReturn(req, res) {
     const pendingUrl = 'https://www.zodika.com.br/payment-pending';
 
     if (retStatus === 'APPROVED' || retStatus === 'PAID') {
+      // If we cannot assert the id, send to a generic success (rare)
       if (!requestId) return res.redirect('https://www.zodika.com.br/payment-success');
 
       const resolver = successUrlByProduct[productType] || successUrlByProduct.birth_chart;
-      return res.redirect(resolver(requestId));
+      const base = resolver(requestId);
+
+      // Attach masked email as URL fragment (not included in HTTP logs)
+      const withHint = emailMasked ? `${base}#em=${encodeURIComponent(emailMasked)}` : base;
+      return res.redirect(withHint);
     }
 
     if (retStatus === 'PENDING') {
