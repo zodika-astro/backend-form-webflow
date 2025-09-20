@@ -140,24 +140,34 @@ async function handleReturn(req, res) {
 
   log.info('customer returned from Mercado Pago checkout');
 
-  const preferenceId = req.query.preference_id || req.query.preferenceId || null;
-  let requestId = req.query.external_reference || req.query.request_id || req.query.requestId || null;
+  const preferenceId =
+    req.query.preference_id || req.query.preferenceId || null;
+
+  // try several ids Mercado Pago may send back
+  let requestId =
+    req.query.external_reference ||
+    req.query.request_id ||
+    req.query.requestId ||
+    req.query.merchant_order_id ||
+    req.query.collection_id ||
+    req.query.payment_id ||
+    null;
 
   let retStatus = normalizeReturnStatus(req.query);
 
   try {
-    // If requestId missing, try to recover from preference record
+    // Try to recover by preference id if still missing
     if (!requestId && preferenceId && typeof mpRepository.findByPreferenceId === 'function') {
       const rec = await mpRepository.findByPreferenceId(preferenceId);
       requestId = rec?.request_id || requestId;
 
-      // If we persisted APPROVED already, trust it to avoid UI flicker
-      if (rec?.status && typeof rec.status === 'string' && rec.status.toUpperCase() === 'APPROVED') {
+      // If DB already says APPROVED, trust it to avoid flicker
+      if (rec?.status && String(rec.status).toUpperCase() === 'APPROVED') {
         retStatus = 'APPROVED';
       }
     }
 
-    // Optional: derive product type and masked email for hinting
+    // Optional hints
     let productType = null;
     let emailMasked = '';
     if (requestId && typeof birthchartRepository.findByRequestId === 'function') {
@@ -174,19 +184,22 @@ async function handleReturn(req, res) {
     const pendingUrl = 'https://www.zodika.com.br/payment-pending';
 
     if (retStatus === 'APPROVED' || retStatus === 'PAID') {
-      // If we cannot assert the id, send to a generic success (rare)
       if (!requestId) return res.redirect('https://www.zodika.com.br/payment-success');
-
       const resolver = successUrlByProduct[productType] || successUrlByProduct.birth_chart;
       const base = resolver(requestId);
-
-      // Attach masked email as URL fragment (not included in HTTP logs)
       const withHint = emailMasked ? `${base}#em=${encodeURIComponent(emailMasked)}` : base;
       return res.redirect(withHint);
     }
 
     if (retStatus === 'PENDING') {
-      return res.redirect(pendingUrl);
+      // carry the order ref to the pending page (+ optional masked email as fragment)
+      let target = pendingUrl;
+      if (requestId) {
+        const qs = new URLSearchParams({ ref: String(requestId) });
+        target += `?${qs.toString()}`;
+      }
+      if (emailMasked) target += `#em=${encodeURIComponent(emailMasked)}`;
+      return res.redirect(target);
     }
 
     return res.redirect(failUrl);
