@@ -126,15 +126,15 @@ const env = cleanEnv(
     }),
 
     WEBHOOK_URL_PAID: url({
-      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_PAID/',
+      default: isProd ? undefined : '',
       desc: 'n8n webhook URL for PAID flow (required when PAID flow enabled)',
     }),
     WEBHOOK_URL_PENDING: url({
-      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_PENDING/',
+      default: isProd ? undefined : '',
       desc: 'n8n webhook URL for PENDING flow (required when PENDING flow enabled)',
     }),
     WEBHOOK_URL_FAIL: url({
-      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_FAIL/',
+      default: isProd ? undefined : '',
       desc: 'n8n webhook URL for REJECTED/FAIL flow (required when FAIL flow enabled)',
     }),
 
