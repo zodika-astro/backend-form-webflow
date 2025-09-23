@@ -125,17 +125,17 @@ const env = cleanEnv(
       desc: 'Optional Basic Auth password for Ephemeris (if required).',
     }),
 
-    MAKE_WEBHOOK_URL_PAID: url({
-      default: isProd ? undefined : 'https://hook.us1.make.com/your-dev-paid',
-      desc: 'Make webhook URL for PAID flow (required when PAID flow enabled)',
+    WEBHOOK_URL_PAID: url({
+      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_PAID/',
+      desc: 'n8n webhook URL for PAID flow (required when PAID flow enabled)',
     }),
-    MAKE_WEBHOOK_URL_PENDING: url({
-      default: isProd ? undefined : 'https://hook.us1.make.com/your-dev-pending',
-      desc: 'Make webhook URL for PENDING flow (required when PENDING flow enabled)',
+    WEBHOOK_URL_PENDING: url({
+      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_PENDING/',
+      desc: 'n8n webhook URL for PENDING flow (required when PENDING flow enabled)',
     }),
-    MAKE_WEBHOOK_URL_FAIL: url({
-      default: isProd ? undefined : 'https://hook.us1.make.com/your-dev-fail',
-      desc: 'Make webhook URL for REJECTED/FAIL flow (required when FAIL flow enabled)',
+    WEBHOOK_URL_FAIL: url({
+      default: isProd ? undefined : 'webhook-test/WEBHOOK_URL_FAIL/',
+      desc: 'n8n webhook URL for REJECTED/FAIL flow (required when FAIL flow enabled)',
     }),
 
     /* ----------------------------- Timezone sources ------------------------ */
