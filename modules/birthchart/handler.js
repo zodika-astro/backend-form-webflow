@@ -7,15 +7,15 @@
  * APPROVED on product_type = 'birth_chart':
  *   1) Load request (timezone already persisted by controller async job).
  *   2) Call Ephemeris API with X-API-KEY (+ optional Basic).
- *   3) Post consolidated payload (request + ephemeris + meta) to Make.
+ *   3) Post consolidated payload (request + ephemeris + meta) to **n8n webhook**.
  *   4) Record execution footprint into product_jobs (idempotent).
  *
  * Hardenings:
- *  - Accept DATE as string 'YYYY-MM-DD' **ou** JavaScript Date (UTC) ao montar payload.
- *  - Strict numeric coercion e range checks (lat/lng/tz).
- *  - Timezone normalizado como número com até 3 casas (mas serializa como -3 se inteiro).
- *  - Logs detalhados de payload inválido (tipos + valores).
- *  - Retries com backoff (429/502/503/504) e validação do retorno da Ephemeris.
+ *  - Accept DATE as string 'YYYY-MM-DD' **or** JavaScript Date (UTC) when building payload.
+ *  - Strict numeric coercion and range checks (lat/lng/tz).
+ *  - Timezone normalized as number with up to 3 decimals (serializes as -3 if integer).
+ *  - Detailed logs for invalid payload (types + values).
+ *  - Retries with backoff (429/502/503/504) and strict Ephemeris response validation.
  */
 
 const baseLogger = require('../../utils/logger').child('birthchart.handler');
@@ -24,7 +24,8 @@ const orchestrator = require('../../payments/orchestrator');
 const repo = require('./repository');
 
 // Env
-const MAKE_WEBHOOK_URL_PAID = process.env.MAKE_WEBHOOK_URL_PAID;
+// NOTE: replaced MAKE_WEBHOOK_URL_PAID -> WEBHOOK_URL_PAID (full n8n Production URL)
+const WEBHOOK_URL_PAID = process.env.WEBHOOK_URL_PAID;
 const EPHEMERIS_API_URL =
   process.env.EPHEMERIS_API_URL || 'https://ephemeris-api-production.up.railway.app/api/v1/ephemeris';
 const EPHEMERIS_API_KEY = process.env.EPHEMERIS_API_KEY;
@@ -35,7 +36,7 @@ const EPHEMERIS_BASIC_PASS = process.env.EPHEMERIS_BASIC_PASS || process.env.EPH
 
 // Timeouts
 const EPHEMERIS_HTTP_TIMEOUT_MS = Number(process.env.EPHEMERIS_HTTP_TIMEOUT_MS || 12000);
-const MAKE_HTTP_TIMEOUT_MS = Number(process.env.MAKE_HTTP_TIMEOUT_MS || 10000);
+const N8N_HTTP_TIMEOUT_MS = Number(process.env.N8N_HTTP_TIMEOUT_MS || 10000); // renamed from MAKE_HTTP_TIMEOUT_MS
 
 // Retry knobs (transient errors)
 const EPHEMERIS_RETRY_ATTEMPTS = Math.max(0, Number(process.env.EPHEMERIS_RETRY_ATTEMPTS || 2));
@@ -172,9 +173,10 @@ function buildEphemerisPayload(row, timezoneHours) {
 }
 
 /**
- * Build the Make webhook payload (PAID).
+ * Build the **n8n** webhook payload (PAID).
+ * (kept shape for downstream compatibility)
  */
-function buildMakePayload({ requestRow, ephemeris, job, providerMeta, ephemerisStatus }) {
+function buildN8nPayload({ requestRow, ephemeris, job, providerMeta, ephemerisStatus }) {
   return {
     request: {
       request_id: requestRow.request_id,
@@ -302,7 +304,7 @@ async function onApprovedEvent(evt) {
     // 0) Guards
     if (!evt?.requestId || evt.productType !== PRODUCT_TYPE) return;
     if (evt.normalizedStatus !== TRIGGER_APPROVED) return;
-    if (!MAKE_WEBHOOK_URL_PAID) { log.warn('MAKE_WEBHOOK_URL_PAID not configured; skipping'); return; }
+    if (!WEBHOOK_URL_PAID) { log.warn('WEBHOOK_URL_PAID not configured; skipping'); return; }
     if (!EPHEMERIS_API_KEY) { log.warn('EPHEMERIS_API_KEY not configured; skipping'); return; }
 
     // 1) Idempotency
@@ -328,7 +330,7 @@ async function onApprovedEvent(evt) {
       return;
     }
 
-    // 5) Build Ephemeris payload (strict, aceita Date ou string no birth_date)
+    // 5) Build Ephemeris payload (strict)
     let ephBody;
     try {
       ephBody = buildEphemerisPayload(request, tzHours);
@@ -365,8 +367,8 @@ async function onApprovedEvent(evt) {
       return;
     }
 
-    // 7) Post to Make (PAID)
-    const makePayload = buildMakePayload({
+    // 7) Post to **n8n** (PAID)
+    const n8nPayload = buildN8nPayload({
       requestRow: { ...request, birth_utc_offset_min: request.birth_utc_offset_min },
       ephemeris: ephemerisData,
       job,
@@ -374,34 +376,34 @@ async function onApprovedEvent(evt) {
       ephemerisStatus: ephStatus,
     });
 
-    let makeStatus = 0;
-    let makeDur = 0;
+    let n8nStatus = 0;
+    let n8nDur = 0;
 
     try {
-      const tMake = Date.now();
-      const makeRes = await httpClient.post(MAKE_WEBHOOK_URL_PAID, makePayload, {
+      const t = Date.now();
+      const n8nRes = await httpClient.post(WEBHOOK_URL_PAID, n8nPayload, {
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        timeout: MAKE_HTTP_TIMEOUT_MS,
+        timeout: N8N_HTTP_TIMEOUT_MS,
         retries: 0,
       });
-      makeDur = Date.now() - tMake;
-      makeStatus = makeRes?.status || 0;
+      n8nDur = Date.now() - t;
+      n8nStatus = n8nRes?.status || 0;
     } catch (e) {
-      makeStatus = e?.response?.status || 0;
-      await repo.markJobFailed(job.job_id, `make_webhook_error:${makeStatus}`);
-      log.warn({ makeStatus }, 'make webhook failed');
+      n8nStatus = e?.response?.status || 0;
+      await repo.markJobFailed(job.job_id, `n8n_webhook_error:${n8nStatus}`);
+      log.warn({ n8nStatus }, 'n8n webhook failed');
       return;
     }
 
     // 8) Finish job
     await repo.markJobSucceeded(job.job_id, {
       ephemeris_http_status: ephStatus,
-      webhook_http_status: makeStatus,
+      webhook_http_status: n8nStatus,
       ephemeris_duration_ms: ephDur,
-      webhook_duration_ms: makeDur,
+      webhook_duration_ms: n8nDur,
     });
 
-    log.info({ jobId: job.job_id, ephStatus, makeStatus }, 'birthchart flow completed');
+    log.info({ jobId: job.job_id, ephStatus, n8nStatus }, 'birthchart flow completed');
   } catch (err) {
     baseLogger.error({ msg: err?.message }, 'birthchart handler failed');
   }
@@ -413,5 +415,6 @@ orchestrator.events.on('payments:status-changed', (evt) => {
     onApprovedEvent(evt);
   }
 });
+
 
 module.exports = { onApprovedEvent };
