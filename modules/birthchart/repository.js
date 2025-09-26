@@ -67,14 +67,16 @@ function toJsonOrNull(v, maxBytes = 10_000) {
  */
 async function createBirthchartRequest(data) {
   const {
-    name, social_name, email, birth_date, birth_time, birth_place, product_type,
+    name, social_name, gender_identity, email, birth_date, birth_time, birth_place, product_type,
     birth_place_place_id, birth_place_full, birth_place_country, birth_place_admin1,
     birth_place_admin2, birth_place_lat, birth_place_lng, birth_place_json,
     birth_timezone_id, birth_utc_offset_min, birth_utc_offset_hours,
   } = data;
 
+
   const v_name             = toTrimmedOrNull(name, 120);
   const v_social_name      = toTrimmedOrNull(social_name, 60);
+  const v_gender_identity  = toTrimmedOrNull(gender_identity, 20);
   const v_email            = toEmail(email);
   const v_birth_place      = toTrimmedOrNull(birth_place, 120);
   const v_product_type     = toTrimmedOrNull(product_type, 64); // e.g. 'birth_chart'
@@ -91,21 +93,22 @@ async function createBirthchartRequest(data) {
   const v_birth_utc_hours  = toNumberOrNull(birth_utc_offset_hours);
 
   const sql = `
-    INSERT INTO public.zodika_requests (
-      name, social_name, email, birth_date, birth_time, birth_place, product_type,
+  INSERT INTO public.zodika_requests (
+      name, social_name, gender_identity, email, birth_date, birth_time, birth_place, product_type,
       birth_place_place_id, birth_place_full, birth_place_country, birth_place_admin1,
       birth_place_admin2, birth_place_lat, birth_place_lng, birth_place_json,
       birth_timezone_id, birth_utc_offset_min, birth_utc_offset_hours
     ) VALUES (
-      $1, $2, $3, $4::date, $5::time, $6, $7,
-      $8, $9, $10, $11,
-      $12, $13::float8, $14::float8, $15::jsonb,
-      $16, $17::int, $18::numeric
+      $1, $2, $3, $4, $5::date, $6::time, $7, $8,
+      $9, $10, $11, $12,
+      $13, $14::float8, $15::float8, $16::jsonb,
+      $17, $18::int, $19::numeric
     )
     RETURNING *;
   `;
+
   const params = [
-    v_name, v_social_name, v_email, birth_date, birth_time, v_birth_place, v_product_type,
+    v_name, v_social_name, v_gender_identity, v_email, birth_date, birth_time, v_birth_place, v_product_type,
     v_place_id, v_place_full, v_place_country, v_place_admin1,
     v_place_admin2, v_lat, v_lng, v_place_json,
     v_birth_tz_id, v_birth_utc_min, v_birth_utc_hours,
