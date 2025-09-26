@@ -182,6 +182,8 @@ function buildN8nPayload({ requestRow, ephemeris, job, providerMeta, ephemerisSt
       request_id: requestRow.request_id,
       product_type: requestRow.product_type,
       name: requestRow.name,
+      social_name: requestRow.social_name || null,
+      gender_identity: requestRow.gender_identity,
       email: requestRow.email,
       birth_date: requestRow.birth_date,
       birth_time: requestRow.birth_time,
