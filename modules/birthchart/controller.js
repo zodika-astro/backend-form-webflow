@@ -204,7 +204,7 @@ async function processForm(req, res, next) {
     {
     const raw = (filtered.gender_identity || '').toString().trim().toLowerCase();
     const allowed = new Set(['female','male','not_informed']);
-    filtered.gender_identity = allowed.has(raw) ? raw : 'nao_informar';
+    filtered.gender_identity = allowed.has(raw) ? raw : 'not_informed';
     }
 
     // Validate/normalize via schema (may throw)
