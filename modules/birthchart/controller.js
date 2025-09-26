@@ -203,7 +203,7 @@ async function processForm(req, res, next) {
 
     {
     const raw = (filtered.gender_identity || '').toString().trim().toLowerCase();
-    const allowed = new Set(['feminino','masculino','nao_informar']);
+    const allowed = new Set(['female','male','not_informed']);
     filtered.gender_identity = allowed.has(raw) ? raw : 'nao_informar';
     }
 
