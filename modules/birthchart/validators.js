@@ -89,9 +89,9 @@ const OptionalSocialNameSchema = z
 
 const GenderIdentitySchema = z.preprocess(
   (v) => {
-    if (v == null) return 'nao_informar';
+    if (v == null) return 'not_informed';
     const s = String(v).trim();
-    return s === '' ? 'nao_informar' : s.toLowerCase();
+    return s === '' ? 'not_informed' : s.toLowerCase();
   },
   z.enum(['female', 'male', 'not_informed'], { invalid_type_error: 'invalid gender_identity' })
 );
