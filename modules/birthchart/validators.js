@@ -93,7 +93,7 @@ const GenderIdentitySchema = z.preprocess(
     const s = String(v).trim();
     return s === '' ? 'nao_informar' : s.toLowerCase();
   },
-  z.enum(['feminino', 'masculino', 'nao_informar'], { invalid_type_error: 'invalid gender_identity' })
+  z.enum(['female', 'male', 'not_informed'], { invalid_type_error: 'invalid gender_identity' })
 );
 
 
