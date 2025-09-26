@@ -64,6 +64,7 @@ function toHHMM(raw) {
 const ALLOWED_FORM_KEYS = [
   'name',
   'social_name',
+  'gender_identity',
   'email',
   'birth_date',
   'birth_time',
@@ -200,6 +201,12 @@ async function processForm(req, res, next) {
       if (!Number.isNaN(n)) filtered.birth_place_lng = n;
     }
 
+    {
+    const raw = (filtered.gender_identity || '').toString().trim().toLowerCase();
+    const allowed = new Set(['feminino','masculino','nao_informar']);
+    filtered.gender_identity = allowed.has(raw) ? raw : 'nao_informar';
+    }
+
     // Validate/normalize via schema (may throw)
     const input = validateBirthchartPayload(filtered);
 
@@ -207,6 +214,7 @@ async function processForm(req, res, next) {
     const newRequest = await repo.createBirthchartRequest({
       name:                 input.name,
       social_name:          input.social_name,
+      gender_identity:      input.gender_identity,
       email:                input.email,
       birth_date:           input.birth_date,
       birth_time:           input.birth_time,
