@@ -87,6 +87,16 @@ const OptionalSocialNameSchema = z
     message: 'social_name must have at most 40 characters',
   });
 
+const GenderIdentitySchema = z.preprocess(
+  (v) => {
+    if (v == null) return 'nao_informar';
+    const s = String(v).trim();
+    return s === '' ? 'nao_informar' : s.toLowerCase();
+  },
+  z.enum(['feminino', 'masculino', 'nao_informar'], { invalid_type_error: 'invalid gender_identity' })
+);
+
+
 const EmailSchema = z
   .string({ required_error: 'email is required', invalid_type_error: 'email must be a string' })
   .trim()
@@ -229,6 +239,7 @@ const birthchartSchema = z.preprocess(
     .object({
       name: NameSchema,
       social_name: OptionalSocialNameSchema,
+      gender_identity: GenderIdentitySchema,
       email: EmailSchema,
       birth_date: DateYMD,
       birth_time: TimeHHmm,
