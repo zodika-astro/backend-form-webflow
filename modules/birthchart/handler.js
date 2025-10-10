@@ -158,8 +158,6 @@ function buildEphemerisPayload(row, timezoneHours) {
     longitude: clamp(lng, -180, 180),
     timezone: round3(tz), // e.g. -3, -3.5, -3.75
     config: {
-      observation_point: 'topocentric',
-      ayanamsha: 'tropical',
       language: 'pt',
     },
   };
