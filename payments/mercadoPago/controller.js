@@ -143,6 +143,13 @@ async function handleReturn(req, res) {
   const preferenceId =
     req.query.preference_id || req.query.preferenceId || null;
 
+  // novo: pegue o id do pagamento (varia por conta/legado)
+  const paymentId =
+    req.query.payment_id ||
+    req.query.collection_id ||
+    req.query.collectionId ||
+    null;
+
   // try several ids Mercado Pago may send back
   let requestId =
     req.query.external_reference ||
@@ -156,18 +163,14 @@ async function handleReturn(req, res) {
   let retStatus = normalizeReturnStatus(req.query);
 
   try {
-    // Try to recover by preference id if still missing
     if (!requestId && preferenceId && typeof mpRepository.findByPreferenceId === 'function') {
       const rec = await mpRepository.findByPreferenceId(preferenceId);
       requestId = rec?.request_id || requestId;
-
-      // If DB already says APPROVED, trust it to avoid flicker
       if (rec?.status && String(rec.status).toUpperCase() === 'APPROVED') {
         retStatus = 'APPROVED';
       }
     }
 
-    // Optional hints
     let productType = null;
     let emailMasked = '';
     if (requestId && typeof birthchartRepository.findByRequestId === 'function') {
@@ -185,21 +188,26 @@ async function handleReturn(req, res) {
 
     if (retStatus === 'APPROVED' || retStatus === 'PAID') {
       if (!requestId) return res.redirect('https://www.zodika.com.br/payment-success');
+
       const resolver = successUrlByProduct[productType] || successUrlByProduct.birth_chart;
-      const base = resolver(requestId);
-      const withHint = emailMasked ? `${base}#em=${encodeURIComponent(emailMasked)}` : base;
-      return res.redirect(withHint);
+
+      // use URL para anexar payment_id antes do fragment
+      const u = new URL(resolver(requestId));
+      if (paymentId) u.searchParams.set('payment_id', String(paymentId));
+
+      const finalUrl = emailMasked
+        ? `${u.toString()}#em=${encodeURIComponent(emailMasked)}`
+        : u.toString();
+
+      return res.redirect(finalUrl);
     }
 
     if (retStatus === 'PENDING') {
-      // carry the order ref to the pending page (+ optional masked email as fragment)
-      let target = pendingUrl;
-      if (requestId) {
-        const qs = new URLSearchParams({ ref: String(requestId) });
-        target += `?${qs.toString()}`;
-      }
-      if (emailMasked) target += `#em=${encodeURIComponent(emailMasked)}`;
-      return res.redirect(target);
+      let target = new URL(pendingUrl);
+      if (requestId) target.searchParams.set('ref', String(requestId));
+      if (paymentId) target.searchParams.set('payment_id', String(paymentId));
+      if (emailMasked) target.hash = `em=${encodeURIComponent(emailMasked)}`;
+      return res.redirect(target.toString());
     }
 
     return res.redirect(failUrl);
@@ -208,6 +216,7 @@ async function handleReturn(req, res) {
     return res.redirect('https://www.zodika.com.br/payment-fail');
   }
 }
+
 
 module.exports = {
   createCheckout,
