@@ -268,6 +268,7 @@ async function processForm(req, res, next) {
         product_version: 'v1',
       },
     };
+    const descriptionProduct = 'mapa natal';
 
     /* ----------------------- route to the chosen PSP ---------------------- */
     const provider = getPaymentProvider();
@@ -313,6 +314,7 @@ async function processForm(req, res, next) {
         productImageUrl: PRODUCT_IMAGE_URL,
         currency:   product.currency,
         metadata:   product.metadata,
+        descriptionProduct,
       }, ctx);
 
       logger.info(
