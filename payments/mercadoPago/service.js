@@ -20,7 +20,7 @@
  *       input fields:
  *         - requestId (required)
  *         - externalReference (optional; defaults to requestId)
- *         - name, email, productType, productValue, productName, paymentOptions,
+ *         - name, email, Type, Value, Name, paymentOptions,
  *           currency, productImageUrl, returnUrl, metadata
  *   - processWebhook(body, meta, ctx?) -> { ok, ... }
  *   - events (EventEmitter)
@@ -108,6 +108,35 @@ function buildIdempotencyKey(requestId) {
   return `mp-pref-${String(requestId).slice(0, 64)}`;
 }
 
+/** Build a safe statement descriptor like "zodika + product". */
+
+function buildStatementDescriptor(raw) {
+  const BASE = 'zodika';
+
+  const safe = (v) => {
+    if (!v) return '';
+    let s = String(v)
+      .normalize('NFD').replace(/\p{Diacritic}/gu, '')
+      .replace(/[^A-Za-z0-9 ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+    return s;
+  };
+
+  const MAX_TOTAL = 22;
+
+  const suffixFull = safe(raw) || '';
+  const sep = suffixFull ? ' ' : '';
+
+  const maxSuffixLen = Math.max(0, MAX_TOTAL - (BASE.length + sep.length));
+  const suffix = suffixFull.slice(0, maxSuffixLen);
+
+  const out = (BASE + sep + suffix).trim();
+  return out || BASE;
+}
+
+
 /* --------------------------------- createCheckout ---------------------------------- */
 
 /**
@@ -122,7 +151,7 @@ async function createCheckout(input, ctx = {}) {
     requestId, name, email, productType,
     productValue, productName, paymentOptions,
     currency, productImageUrl, returnUrl, metadata = {},
-    externalReference, // optional external reference; falls back to requestId
+    externalReference, descriptionProduct, // optional external reference; falls back to requestId
   } = input || {};
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
@@ -193,6 +222,12 @@ async function createCheckout(input, ctx = {}) {
   // External reference we send to MP and persist locally
   const extRef = externalReference != null ? String(externalReference) : String(requestId);
 
+  // Statement descriptor
+  const statementDescriptor = buildStatementDescriptor(
+    descriptionProduct || productName || productType || 'ebook'
+  );
+
+  
   const preferencePayload = {
     external_reference: extRef,
     items: [{
@@ -207,7 +242,8 @@ async function createCheckout(input, ctx = {}) {
     auto_return: 'approved',
     notification_url: notification_url || undefined,
     metadata: { source: 'webflow', ...metadata },
-    // binary_mode: true, // optional: skip "pending" intermediate state
+    binary_mode: true,
+    statement_descriptor: statementDescriptor,
     payment_methods,
   };
 
