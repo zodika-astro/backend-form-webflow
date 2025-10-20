@@ -152,6 +152,8 @@ async function createCheckout(input, ctx = {}) {
     productValue, productName, paymentOptions,
     currency, productImageUrl, returnUrl, metadata = {},
     externalReference, descriptionProduct, // optional external reference; falls back to requestId
+    payerTaxId, payerTaxIdType,
+    itemId, itemCategoryId, itemDescription,
   } = input || {};
 
   const log = (ctx.log || baseLogger).child('create', { rid: ctx.requestId });
@@ -227,17 +229,38 @@ async function createCheckout(input, ctx = {}) {
     descriptionProduct || productName || productType || 'ebook'
   );
 
+  const safeItemId = (itemId || `bc_${String(requestId).slice(0, 50)}`).toString();
+  const safeCategoryId = (itemCategoryId || 'services').toString(); // ex.: services
+
+  const safeItemDescription = (itemDescription
+    || descriptionProduct
+    || productName
+    || productType
+    || 'produto digital'
+  ).toString().slice(0, 600);
+
+  const payerIdentification =
+    (payerTaxId && payerTaxIdType)
+      ? { type: String(payerTaxIdType).toUpperCase(), number: String(payerTaxId) }
+      : undefined;
+
   
   const preferencePayload = {
     external_reference: extRef,
     items: [{
+      id: safeItemId,
+      category_id: safeCategoryId,
+      description: safeItemDescription,
       title: (productName || productType || 'Produto').toString().slice(0, 150),
       quantity: 1,
       unit_price: amount,
       currency_id: currency || 'BRL',
       ...(picture_url ? { picture_url } : {}),
     }],
-    payer,
+    payer: payer ? {
+      ...payer,
+      ...(payerIdentification ? { identification: payerIdentification } : {}),
+    } : undefined,
     back_urls: { success, failure, pending },
     auto_return: 'approved',
     notification_url: notification_url || undefined,
