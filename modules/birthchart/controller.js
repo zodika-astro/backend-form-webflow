@@ -269,6 +269,9 @@ async function processForm(req, res, next) {
       },
     };
     const descriptionProduct = 'mapa natal';
+    const itemId = `bc${newRequest.request_id}`;
+    const itemCategoryId = 'services';
+    const itemDescription = 'astrologia mapa natal ebook digital';
 
     /* ----------------------- route to the chosen PSP ---------------------- */
     const provider = getPaymentProvider();
@@ -315,6 +318,9 @@ async function processForm(req, res, next) {
         currency:   product.currency,
         metadata:   product.metadata,
         descriptionProduct,
+        itemId,
+        itemCategoryId,
+        itemDescription,
       }, ctx);
 
       logger.info(
