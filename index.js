@@ -128,6 +128,9 @@ app.use('/', mpWebhookRouter);
 // Birthchart handler wires its event/listener setup on require().
 require('./modules/birthchart/handler');
 
+// DB-backed scheduler for delayed PENDING triggers (auto-starts unless disabled by env)
+require('./utils/scheduler');
+
 /* --------------------------- Central error handler --------------------------- */
 app.use(errorHandlerMiddleware);
 
