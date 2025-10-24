@@ -51,6 +51,9 @@ router.head('/return/success', asyncHandler(mpController.handleReturn));
 router.head('/return/failure', asyncHandler(mpController.handleReturn));
 router.head('/return/pending', asyncHandler(mpController.handleReturn));
 
+router.get('/mercadoPago/status', controller.getPaymentStatus);
+router.get('/mercadoPago/stream', controller.streamStatus);
+
 /** 405 for unsupported methods under this mount. */
 router.all('*', (req, res) => res.status(405).json({ error: 'method_not_allowed' }));
 
