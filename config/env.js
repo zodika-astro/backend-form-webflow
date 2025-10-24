@@ -129,14 +129,19 @@ const env = cleanEnv(
       default: isProd ? undefined : '',
       desc: 'n8n webhook URL for PAID flow (required when PAID flow enabled)',
     }),
-    WEBHOOK_URL_PENDING: url({
+    WEBHOOK_URL_REJECTED: url({
       default: isProd ? undefined : '',
-      desc: 'n8n webhook URL for PENDING flow (required when PENDING flow enabled)',
+      desc: 'n8n webhook URL for REJECTED flow (immediate).',
     }),
-    WEBHOOK_URL_FAIL: url({
+    WEBHOOK_URL_PENDING_10M: url({
       default: isProd ? undefined : '',
-      desc: 'n8n webhook URL for REJECTED/FAIL flow (required when FAIL flow enabled)',
+      desc: 'n8n webhook URL for PENDING after 10 minutes.',
     }),
+    WEBHOOK_URL_PENDING_24H: url({
+      default: isProd ? undefined : '',
+      desc: 'n8n webhook URL for PENDING after 24 hours.',
+    }),
+
 
     /* ----------------------------- Timezone sources ------------------------ */
     GEONAMES_USERNAME: str({
