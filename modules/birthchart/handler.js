@@ -46,6 +46,16 @@ const EPHEMERIS_RETRY_BASE_MS = Math.max(100, Number(process.env.EPHEMERIS_RETRY
 const PRODUCT_TYPE = 'birth_chart';
 const TRIGGER_APPROVED = 'APPROVED';
 
+// New constants for slim pending/rejected flows
+const TRIGGER_REJECTED = 'REJECTED';
+const TRIGGER_PENDING = 'PENDING';
+const TRIGGER_PENDING_10M = 'PENDING_10M';
+const TRIGGER_PENDING_24H = 'PENDING_24H';
+
+const WEBHOOK_URL_REJECTED = process.env.WEBHOOK_URL_REJECTED;
+const WEBHOOK_URL_PENDING_10M = process.env.WEBHOOK_URL_PENDING_10M;
+const WEBHOOK_URL_PENDING_24H = process.env.WEBHOOK_URL_PENDING_24H;
+
 /** Build Basic Authorization header value if creds are present. */
 function buildBasicAuthHeader() {
   if (!EPHEMERIS_BASIC_USER || !EPHEMERIS_BASIC_PASS) return null;
@@ -214,6 +224,52 @@ function buildN8nPayload({ requestRow, ephemeris, job, providerMeta, ephemerisSt
       source: 'birthchart/handler',
       provider: providerMeta.provider,
       ephemeris_status_code: ephemerisStatus ?? null,
+      timestamp: new Date().toISOString(),
+    },
+  };
+}
+
+/* ----------------------- Slim payload helpers (no ephemeris) --------------- */
+
+/** Build a minimal n8n payload (no Ephemeris), including request and jobs snapshot. */
+function buildSlimN8nPayload({ requestRow, jobs, job, providerMeta }) {
+  return {
+    request: {
+      request_id: requestRow.request_id,
+      product_type: requestRow.product_type,
+      name: requestRow.name,
+      social_name: requestRow.social_name || null,
+      gender_identity: requestRow.gender_identity,
+      email: requestRow.email,
+      birth_date: requestRow.birth_date,
+      birth_time: requestRow.birth_time,
+      birth_place: requestRow.birth_place,
+      birth_place_lat: requestRow.birth_place_lat,
+      birth_place_lng: requestRow.birth_place_lng,
+      timezone:
+        requestRow.birth_utc_offset_min != null ? Number(requestRow.birth_utc_offset_min) / 60 : null,
+      created_at: requestRow.created_at,
+      updated_at: requestRow.updated_at,
+      payment: {
+        provider: requestRow.payment_provider,
+        status: requestRow.payment_status,
+        status_detail: requestRow.payment_status_detail,
+        amount_cents: requestRow.payment_amount_cents,
+        currency: requestRow.payment_currency,
+        checkout_id: requestRow.payment_checkout_id,
+        payment_id: requestRow.payment_payment_id,
+        link: requestRow.payment_link,
+        authorized_at: requestRow.payment_authorized_at,
+        updated_at: requestRow.payment_updated_at,
+      },
+    },
+    jobs: Array.isArray(jobs) ? jobs : [],
+    meta: {
+      job_id: job?.job_id || null,
+      trigger_status: providerMeta.trigger_status,
+      source: 'birthchart/handler',
+      provider: providerMeta.provider,
+      ephemeris_status_code: null,
       timestamp: new Date().toISOString(),
     },
   };
@@ -411,12 +467,126 @@ async function onApprovedEvent(evt) {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* New flows: REJECTED (immediate) and PENDING (schedule only)                */
+/* -------------------------------------------------------------------------- */
+
+async function onRejectedEvent(evt) {
+  const log = baseLogger.child('rejected', { requestId: evt?.requestId, provider: evt?.provider });
+
+  try {
+    // 0) Guards
+    if (!evt?.requestId || evt.productType !== PRODUCT_TYPE) return;
+    if (evt.normalizedStatus !== TRIGGER_REJECTED) return;
+    if (!WEBHOOK_URL_REJECTED) { log.warn('WEBHOOK_URL_REJECTED not configured; skipping'); return; }
+
+    // 1) Idempotency
+    const already = await repo.findSucceededJob(evt.requestId, PRODUCT_TYPE, TRIGGER_REJECTED);
+    if (already) { log.info({ jobId: already.job_id }, 'job already completed; skipping'); return; }
+
+    // 2) Start job
+    const job = await repo.markJobStart(evt.requestId, PRODUCT_TYPE, TRIGGER_REJECTED);
+
+    // 3) Load request
+    const request = await repo.findByRequestId(evt.requestId);
+    if (!request) {
+      await repo.markJobFailed(job.job_id, 'request_not_found');
+      log.warn('request not found');
+      return;
+    }
+
+    // 4) Cancel any scheduled pending triggers (defensive)
+    try {
+      await repo.cancelPendingSchedules(evt.requestId, PRODUCT_TYPE);
+    } catch (e) {
+      log.warn({ err: e?.message }, 'cancelPendingSchedules failed');
+    }
+
+    // 5) Snapshot jobs for this request
+    let jobs = [];
+    try {
+      jobs = await repo.listJobsForRequest(evt.requestId, PRODUCT_TYPE);
+    } catch (e) {
+      log.warn({ err: e?.message }, 'listJobsForRequest failed');
+      jobs = [];
+    }
+
+    // 6) Post to **n8n** (REJECTED) with slim payload
+    const n8nPayload = buildSlimN8nPayload({
+      requestRow: request,
+      jobs,
+      job,
+      providerMeta: { provider: evt.provider, trigger_status: TRIGGER_REJECTED },
+    });
+
+    let n8nStatus = 0;
+    let n8nDur = 0;
+
+    try {
+      const t = Date.now();
+      const n8nRes = await httpClient.post(WEBHOOK_URL_REJECTED, n8nPayload, {
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        timeout: N8N_HTTP_TIMEOUT_MS,
+        retries: 0,
+      });
+      n8nDur = Date.now() - t;
+      n8nStatus = n8nRes?.status || 0;
+    } catch (e) {
+      n8nStatus = e?.response?.status || 0;
+      await repo.markJobFailed(job.job_id, `n8n_webhook_error:${n8nStatus}`);
+      log.warn({ n8nStatus }, 'n8n webhook (rejected) failed');
+      return;
+    }
+
+    // 7) Finish job
+    await repo.markJobSucceeded(job.job_id, {
+      ephemeris_http_status: null,
+      webhook_http_status: n8nStatus,
+      ephemeris_duration_ms: null,
+      webhook_duration_ms: n8nDur,
+    });
+
+    log.info({ jobId: job.job_id, n8nStatus }, 'rejected flow completed');
+  } catch (err) {
+    baseLogger.error({ msg: err?.message }, 'birthchart rejected handler failed');
+  }
+}
+
+async function onPendingEvent(evt) {
+  const log = baseLogger.child('pending', { requestId: evt?.requestId, provider: evt?.provider });
+
+  try {
+    // 0) Guards
+    if (!evt?.requestId || evt.productType !== PRODUCT_TYPE) return;
+    if (evt.normalizedStatus !== TRIGGER_PENDING) return;
+
+    // 1) Upsert schedules (10m and 24h)
+    try {
+      await repo.upsertPendingSchedules(evt.requestId, PRODUCT_TYPE, evt.provider);
+      log.info('pending schedules upserted');
+    } catch (e) {
+      log.warn({ err: e?.message }, 'upsertPendingSchedules failed');
+    }
+  } catch (err) {
+    baseLogger.error({ msg: err?.message }, 'birthchart pending handler failed');
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Main Worker: subscription                                                  */
+/* -------------------------------------------------------------------------- */
+
 // ---- Subscription ----
 orchestrator.events.on('payments:status-changed', (evt) => {
   if (evt?.normalizedStatus === TRIGGER_APPROVED && evt?.productType === PRODUCT_TYPE) {
     onApprovedEvent(evt);
   }
+  if (evt?.normalizedStatus === TRIGGER_REJECTED && evt?.productType === PRODUCT_TYPE) {
+    onRejectedEvent(evt);
+  }
+  if (evt?.normalizedStatus === TRIGGER_PENDING && evt?.productType === PRODUCT_TYPE) {
+    onPendingEvent(evt);
+  }
 });
 
-
-module.exports = { onApprovedEvent };
+module.exports = { onApprovedEvent, onRejectedEvent, onPendingEvent };
