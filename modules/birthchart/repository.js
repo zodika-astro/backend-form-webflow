@@ -276,6 +276,115 @@ async function markJobFailed(jobId, errorMessage) {
   return rows[0] || null;
 }
 
+/* ------------------------- Jobs listing (for slim payload) ------------------ */
+
+/**
+ * List jobs snapshot for a given request/product (for slim webhook payloads).
+ * Returns a compact set of columns ordered by creation time.
+ */
+async function listJobsForRequest(requestId, productType) {
+  const sql = `
+    SELECT job_id, trigger_status, status, attempt,
+           webhook_http_status, created_at, updated_at
+      FROM public.product_jobs
+     WHERE request_id = $1
+       AND product_type = $2
+     ORDER BY created_at ASC, job_id ASC;
+  `;
+  const { rows } = await db.query(sql, [requestId, productType]);
+  return rows || [];
+}
+
+/* ----------------------------- Scheduled Triggers --------------------------- */
+
+/**
+ * Upsert two pending schedules (10 minutes, 24 hours) for a given request.
+ * Uses the unique(request_id, product_type, kind) constraint to avoid duplicates.
+ */
+async function upsertPendingSchedules(requestId, productType, provider) {
+  const v_provider = toTrimmedOrNull(provider, 32) || 'unknown';
+
+  // PENDING_10M
+  const sql10 = `
+    INSERT INTO public.scheduled_triggers
+      (request_id, product_type, kind, provider, due_at, status)
+    VALUES
+      ($1, $2, 'PENDING_10M', $3, NOW() + INTERVAL '10 minutes', 'queued')
+    ON CONFLICT (request_id, product_type, kind) DO NOTHING;
+  `;
+  // PENDING_24H
+  const sql24 = `
+    INSERT INTO public.scheduled_triggers
+      (request_id, product_type, kind, provider, due_at, status)
+    VALUES
+      ($1, $2, 'PENDING_24H', $3, NOW() + INTERVAL '24 hours', 'queued')
+    ON CONFLICT (request_id, product_type, kind) DO NOTHING;
+  `;
+
+  await db.query(sql10, [requestId, productType, v_provider]);
+  await db.query(sql24, [requestId, productType, v_provider]);
+  return true;
+}
+
+/**
+ * Cancel queued pending schedules for a given request/product.
+ * No-op if none found. Returns the number of affected rows.
+ */
+async function cancelPendingSchedules(requestId, productType) {
+  const sql = `
+    UPDATE public.scheduled_triggers
+       SET status = 'canceled',
+           updated_at = NOW()
+     WHERE request_id = $1
+       AND product_type = $2
+       AND status = 'queued';
+  `;
+  const { rowCount } = await db.query(sql, [requestId, productType]);
+  return rowCount || 0;
+}
+
+/**
+ * Pick due schedules (status='queued' and due_at <= NOW()).
+ * The scheduler will revalidate current payment status before firing.
+ */
+async function pickDueSchedules(limit = 50) {
+  const lim = Math.max(1, Math.min(Number(limit) || 50, 500));
+  const sql = `
+    SELECT sched_id, request_id, product_type, kind, provider, due_at, status, created_at, updated_at
+      FROM public.scheduled_triggers
+     WHERE status = 'queued'
+       AND due_at <= NOW()
+     ORDER BY due_at ASC, sched_id ASC
+     LIMIT $1;
+  `;
+  const { rows } = await db.query(sql, [lim]);
+  return rows || [];
+}
+
+async function markScheduleFired(schedId) {
+  const sql = `
+    UPDATE public.scheduled_triggers
+       SET status = 'fired',
+           updated_at = NOW()
+     WHERE sched_id = $1
+    RETURNING *;
+  `;
+  const { rows } = await db.query(sql, [schedId]);
+  return rows[0] || null;
+}
+
+async function markScheduleCanceled(schedId) {
+  const sql = `
+    UPDATE public.scheduled_triggers
+       SET status = 'canceled',
+           updated_at = NOW()
+     WHERE sched_id = $1
+    RETURNING *;
+  `;
+  const { rows } = await db.query(sql, [schedId]);
+  return rows[0] || null;
+}
+
 module.exports = {
   // Requests
   createBirthchartRequest,
@@ -289,4 +398,14 @@ module.exports = {
   markJobPartialMetrics,
   markJobSucceeded,
   markJobFailed,
+
+  // Jobs snapshot (for slim payloads)
+  listJobsForRequest,
+
+  // Scheduled triggers
+  upsertPendingSchedules,
+  cancelPendingSchedules,
+  pickDueSchedules,
+  markScheduleFired,
+  markScheduleCanceled,
 };
