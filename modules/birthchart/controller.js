@@ -255,7 +255,7 @@ async function processForm(req, res, next) {
     const product = {
       productType:  newRequest.product_type,
       productName:  'MAPA NATAL ZODIKA',
-      priceCents:   500,
+      priceCents:   3500,
       currency:     'BRL',
       payment: {
         allow_pix: true,
