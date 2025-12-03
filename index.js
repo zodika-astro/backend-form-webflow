@@ -49,8 +49,8 @@ const pagbankWebhookRouter = require('./payments/pagBank/router.webhook');
 const pagbankReturnRouter  = require('./payments/pagBank/router.return.js');
 const mpWebhookRouter      = require('./payments/mercadoPago/router.webhook');
 const mpReturnRouter       = require('./payments/mercadoPago/router.return');
-const paypalReturnRouter   = require('./payments/paypal/router.return');
-const paypalWebhookRouter  = require('./payments/paypal/router.webhook');
+const paypalReturnRouter   = require('./payments/payPal/router.return');
+const paypalWebhookRouter  = require('./payments/payPal/router.webhook');
 
 /* ----------------------- Raw body for webhook signatures ---------------------- */
 function rawBodySaver(req, res, buf) {
@@ -127,8 +127,8 @@ app.use('/mercadoPago', mpReturnRouter);
 app.use('/', mpWebhookRouter);
 
 /* ------------------------------ Payments: PayPal ----------------------------- */
-app.use('/paypal', paypalReturnRouter);
-app.use('/webhook/paypal', webhookLimiter);
+app.use('/payPal', paypalReturnRouter);
+app.use('/webhook/payPal', webhookLimiter);
 app.use('/', paypalWebhookRouter);
 
 /* -------------------------- Product handlers (boot) -------------------------- */
